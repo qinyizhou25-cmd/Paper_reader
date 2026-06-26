@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper Reader Brief</title>
+  <link rel="stylesheet" href="side_panel.css">
+</head>
+<body>
+  <header class="app-header">
+    <div>
+      <strong>Paper Brief</strong>
+      <span id="connectionState">Checking local server...</span>
+    </div>
+    <button id="openOptions" type="button" title="Options">Settings</button>
+  </header>
+
+  <main>
+    <section class="panel-section current-paper">
+      <label for="pdfUrl">PDF URL</label>
+      <textarea id="pdfUrl" rows="3" placeholder="Open a PDF tab or paste a PDF URL"></textarea>
+      <div class="button-row">
+        <button id="useCurrentTab" type="button">Use current tab</button>
+        <label class="file-button">
+          Upload PDF
+          <input id="pdfFile" type="file" accept="application/pdf,.pdf" hidden>
+        </label>
+      </div>
+    </section>
+
+    <section class="panel-section">
+      <label for="promptOverride">Prompt override</label>
+      <textarea id="promptOverride" rows="6" placeholder="Optional. Leave empty to use backend default prompt."></textarea>
+      <div class="button-row primary-row">
+        <button id="generateBrief" class="primary" type="button">Generate Paper Brief</button>
+        <button id="refreshCandidate" type="button" disabled>Reload Candidate</button>
+      </div>
+      <p id="statusText" class="status-text"></p>
+    </section>
+
+    <section id="briefSection" class="panel-section brief-section" hidden>
+      <div class="brief-header">
+        <div>
+          <span class="kicker">Candidate</span>
+          <h1 id="candidateTitle">Untitled paper</h1>
+        </div>
+        <span id="candidateStatus" class="status-pill">ready</span>
+      </div>
+      <article id="briefContent" class="brief-content" tabindex="0"></article>
+      <div class="annotation-box">
+        <label for="noteText">Note on selected brief text</label>
+        <textarea id="noteText" rows="3" placeholder="Select text in the brief, then write why it matters..."></textarea>
+        <div class="button-row">
+          <button id="highlightSelection" type="button">Highlight</button>
+          <button id="addNote" type="button">Add Note</button>
+          <span id="selectionHint" class="muted">No text selected</span>
+        </div>
+      </div>
+      <section class="notes-list">
+        <h2>Brief Notes</h2>
+        <div id="notesList" class="notes-list-body muted">No notes yet.</div>
+      </section>
+    </section>
+
+    <section id="saveSection" class="panel-section save-section" hidden>
+      <label for="paperTags">Paper types / tags</label>
+      <div id="selectedPaperTags" class="tag-chip-row" aria-label="Selected paper tags"></div>
+      <div class="tag-picker">
+        <input id="paperTags" type="search" autocomplete="off" placeholder="Search existing paper types or create a new tag">
+        <div id="paperTagOptions" class="tag-options" hidden></div>
+      </div>
+      <label for="projectName">Project</label>
+      <select id="projectName"></select>
+      <div class="button-row">
+        <input id="customProjectName" type="text" placeholder="New project name">
+        <button id="addProject" type="button">Create project</button>
+      </div>
+      <div class="importance-row">
+        <span>Importance</span>
+        <div id="importanceStars" class="stars" aria-label="Importance stars"></div>
+      </div>
+      <button id="saveToLibrary" class="primary" type="button">Save to Library</button>
+      <p class="muted small">Saved papers use read_status: unread unless changed later in Library.</p>
+    </section>
+  </main>
+
+  <template id="noteTemplate">
+    <article class="note-card">
+      <blockquote></blockquote>
+      <p></p>
+    </article>
+  </template>
+
+  <script src="side_panel.js"></script>
+</body>
+</html>

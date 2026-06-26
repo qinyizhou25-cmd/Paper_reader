@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Paper Reader Brief Options</title>
+  <link rel="stylesheet" href="side_panel.css">
+  <style>
+    body { max-width: 760px; margin: 0 auto; }
+    main { padding: 20px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="panel-section">
+      <h1>Paper Reader Brief Options</h1>
+      <label for="backendUrl">Local Paper Reader Agent URL</label>
+      <input id="backendUrl" type="url" placeholder="http://127.0.0.1:8765">
+      <label for="promptOverride">Default prompt override</label>
+      <textarea id="promptOverride" rows="12" placeholder="Leave empty to use backend default prompt."></textarea>
+      <div class="button-row">
+        <button id="saveOptions" class="primary" type="button">Save Options</button>
+        <button id="testBackend" type="button">Test Backend</button>
+      </div>
+      <p id="statusText" class="status-text"></p>
+    </section>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

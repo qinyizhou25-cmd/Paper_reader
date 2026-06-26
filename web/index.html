@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Paper Reader Agent</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body data-active-view="reader">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">P</span>
+        <div>
+          <strong>Paper Reader Agent</strong>
+          <span id="workspaceLabel">Local workspace</span>
+        </div>
+      </div>
+      <nav class="tabs" aria-label="Views">
+        <button class="tab active" data-view="reader">Workspace</button>
+        <button class="tab" data-view="notes">All Notes</button>
+        <button class="tab" data-view="library">Library</button>
+        <button class="tab" data-view="mindmap">Mindmap</button>
+      </nav>
+      <select id="paperSelect" class="paper-select" aria-label="Select paper"></select>
+    </header>
+
+    <button id="paperMapRail" class="paper-map-rail" type="button" aria-label="Open Paper Map" title="Open Paper Map">Map</button>
+    <button id="takeawayReportRail" class="takeaway-report-rail" type="button" aria-label="Open Takeaway Report" title="Open Takeaway Report">Report</button>
+
+    <main class="app-shell">
+      <aside class="sidebar" id="sidebar">
+        <section id="outlinePane">
+          <div class="sidebar-heading-row">
+            <h2>Paper Map</h2>
+            <button id="togglePaperMap" class="icon-button sidebar-toggle-button" type="button" title="Collapse Paper Map" aria-label="Collapse Paper Map">×</button>
+          </div>
+          <div id="outlineList" class="outline-list"></div>
+        </section>
+      </aside>
+
+      <div id="sidebarResizeHandle" class="sidebar-resize-handle" title="Drag to resize sidebar" aria-hidden="true"></div>
+
+      <section class="content">
+        <div id="readerView" class="view active">
+          <div id="annotationToolbar" class="annotation-toolbar" aria-label="Annotation toolbar">
+            <div class="toolbar-group" aria-label="Highlight colors">
+              <button class="toolbar-color swatch-yellow" data-toolbar-color="yellow" title="Highlight yellow"></button>
+              <button class="toolbar-color swatch-green" data-toolbar-color="green" title="Highlight green"></button>
+              <button class="toolbar-color swatch-blue" data-toolbar-color="blue" title="Highlight blue"></button>
+              <button class="toolbar-color swatch-purple" data-toolbar-color="purple" title="Highlight purple"></button>
+              <button class="toolbar-color swatch-rose" data-toolbar-color="rose" title="Highlight rose"></button>
+            </div>
+            <button id="toolbarNote" class="secondary-button" title="Add note to selection">Note</button>
+            <button id="toolbarAskAi" class="secondary-button" title="Ask AI about selection">Ask AI</button>
+            <span id="toolbarStatus" class="toolbar-status">Select text to annotate</span>
+          </div>
+          <div id="paperMeta" class="paper-meta"></div>
+          <div id="workspaceToolbar" class="workspace-toolbar" aria-label="Paper workspace controls">
+            <div class="workspace-mode-tabs" aria-label="Workspace mode">
+              <button class="workspace-mode" data-workspace-mode="read">Read</button>
+              <button class="workspace-mode active" data-workspace-mode="split">Split</button>
+              <button class="workspace-mode" data-workspace-mode="think">Think</button>
+            </div>
+            <button id="togglePaperMapMain" class="secondary-button" type="button">Paper Map</button>
+            <button id="translateCurrentPaper" class="secondary-button" type="button">Translate Full Text</button>
+            <button id="openPresentationReport" class="primary-button" type="button">Open Takeaway Report</button>
+          </div>
+          <div class="reader-workspace" data-workspace-mode="split">
+            <div id="documentRoot" class="document-root"></div>
+            <div id="sensemakingResizeHandle" class="sensemaking-resize-handle" title="Drag to resize sensemaking panel" aria-hidden="true"></div>
+            <aside id="sensemakingPanel" class="sensemaking-panel" aria-label="Paper sensemaking">
+              <div class="sensemaking-header">
+                <div>
+                  <h2>Sensemaking</h2>
+                  <p>Chronological AI outputs and your reading thoughts.</p>
+                </div>
+                <span id="thinkingSaveState" class="thinking-save-state">Ready</span>
+              </div>
+              <section id="explainPane" class="thinking-pane thinking-pane-hidden"></section>
+              <section id="writingPane" class="thinking-pane"></section>
+            </aside>
+          </div>
+        </div>
+        <div id="notesView" class="view">
+          <div class="view-heading">
+            <h1>Notes</h1>
+            <p>All papers' highlights and notes are collected here.</p>
+          </div>
+          <div class="notes-workspace">
+            <section class="notes-list-panel" aria-label="All notes">
+              <div id="notesProjectFilters" class="tag-filter-bar notes-project-filter-bar" aria-label="Filter notes by project"></div>
+              <div id="notesTagFilters" class="tag-filter-bar" aria-label="Filter notes by tag"></div>
+              <div id="notesRoot" class="notes-root"></div>
+            </section>
+            <aside id="notesSourcePanel" class="notes-source-panel" aria-label="Source context">
+              <div class="notes-source-empty">
+                <h2>Source Context</h2>
+                <p>Select a note's paper link to review the original passage without leaving Notes.</p>
+              </div>
+            </aside>
+          </div>
+        </div>
+        <div id="libraryView" class="view">
+          <div class="view-heading">
+            <h1>Library</h1>
+            <p>Add PDFs to automatically convert them to Markdown and generate a Paper Brief. Translate full text when a paper is worth deep reading.</p>
+          </div>
+          <div class="library-intake">
+            <input id="addPdfPath" type="text" value="~/Downloads" placeholder="~/Downloads/paper.pdf" />
+            <input id="addPaperTitle" type="text" placeholder="Optional title" />
+            <input id="addPaperTags" type="text" placeholder="Paper type tags, comma-separated" />
+            <button id="addPaperButton" class="primary-button" type="button">Add + Parse</button>
+          </div>
+          <div id="libraryDropZone" class="library-drop-zone" tabindex="0">
+            <input id="pdfFilePicker" type="file" accept="application/pdf,.pdf" multiple hidden />
+            <strong>Drop PDFs here</strong>
+            <span>or choose multiple PDF files from your computer.</span>
+            <button id="choosePdfFiles" class="secondary-button" type="button">Choose PDFs</button>
+            <div id="libraryUploadStatus" class="library-upload-status" aria-live="polite" hidden></div>
+          </div>
+          <div id="libraryRoot" class="library-root"></div>
+        </div>
+        <div id="canvasView" class="view">
+          <div class="view-heading canvas-heading">
+            <div>
+              <h1>Canvas</h1>
+              <p>Free spatial sensemaking with Library papers, notes, tables, and draft tag clusters.</p>
+            </div>
+            <button id="canvasSyncReview" class="primary-button" type="button">Sync Review</button>
+          </div>
+          <div class="canvas-workspace">
+            <aside class="canvas-sidebar" aria-label="Canvas boards">
+              <div class="canvas-control-group">
+                <label for="canvasProject">Project</label>
+                <select id="canvasProject"></select>
+              </div>
+              <div class="canvas-board-actions">
+                <button id="createCanvasBoard" class="secondary-button" type="button">+ Board</button>
+                <button id="deleteCanvasBoard" class="danger-button" type="button">Delete</button>
+              </div>
+              <div id="canvasBoardList" class="canvas-board-list"></div>
+            </aside>
+            <section class="canvas-stage-shell" aria-label="Canvas board workspace">
+              <div class="canvas-toolbar" aria-label="Canvas controls">
+                <input id="canvasBoardTitle" class="canvas-title-input" placeholder="Board title" aria-label="Board title" />
+                <button id="canvasZoomOut" class="secondary-button mini-button" type="button">-</button>
+                <span id="canvasZoomLabel" class="canvas-zoom-label">100%</span>
+                <button id="canvasZoomIn" class="secondary-button mini-button" type="button">+</button>
+                <button id="canvasResetView" class="secondary-button mini-button" type="button">Reset</button>
+                <span id="canvasSaveState" class="thinking-save-state">Ready</span>
+              </div>
+              <div id="canvasStage" class="canvas-stage" tabindex="0" aria-label="Canvas surface">
+                <div id="canvasWorld" class="canvas-world"></div>
+              </div>
+              <div class="canvas-shape-palette" aria-label="Canvas shape palette">
+                <button class="canvas-tool" draggable="true" data-canvas-tool="text" type="button">Text</button>
+                <button class="canvas-tool" draggable="true" data-canvas-tool="paper" type="button">Paper</button>
+                <button class="canvas-tool" draggable="true" data-canvas-tool="note" type="button">Note</button>
+                <button class="canvas-tool" draggable="true" data-canvas-tool="table" type="button">Table</button>
+                <button class="canvas-tool" draggable="true" data-canvas-tool="cluster" type="button">Cluster</button>
+              </div>
+            </section>
+            <aside class="canvas-inspector" aria-label="Canvas inspector">
+              <div id="canvasInspector" class="canvas-inspector-empty">
+                <h2>Selection</h2>
+                <p>Select a card or cluster to inspect source links and sync state.</p>
+              </div>
+            </aside>
+          </div>
+        </div>
+        <div id="mindmapView" class="view">
+          <div class="view-heading">
+            <h1>Mindmap</h1>
+            <p>A source-aware tree sandbox for organizing notes, evidence, and related-work arguments.</p>
+          </div>
+          <div class="mindmap-workspace">
+            <aside class="mindmap-sidebar mindmap-source-panel" aria-label="All Notes source pool">
+              <div class="mindmap-control-group">
+                <label for="mindmapProject">Project</label>
+                <select id="mindmapProject"></select>
+              </div>
+              <div class="mindmap-control-group">
+                <div class="mindmap-section-title">
+                  <label>Sensemaking Views</label>
+                  <button id="createMindmap" class="secondary-button mini-button" type="button">+ View</button>
+                </div>
+                <div class="mindmap-board-actions">
+                  <button id="duplicateMindmap" class="secondary-button mini-button" type="button">Duplicate</button>
+                  <button id="deleteMindmap" class="danger-button mini-button" type="button">Delete</button>
+                </div>
+                <div id="mindmapList" class="mindmap-board-list"></div>
+              </div>
+              <div class="mindmap-control-group">
+                <label for="mindmapSourceSearch">All Notes</label>
+                <input id="mindmapSourceSearch" type="search" placeholder="Search notes, quotes, papers..." />
+                <div id="mindmapSourceProjectFilters" class="tag-filter-bar compact-filter-bar"></div>
+                <div id="mindmapSourceTagFilters" class="tag-filter-bar compact-filter-bar"></div>
+                <div id="mindmapSourceNotes" class="mindmap-source-notes"></div>
+              </div>
+            </aside>
+            <section class="mindmap-stage-shell" aria-label="Mindmap tree workspace">
+              <div class="mindmap-toolbar" aria-label="Mindmap controls">
+                <input id="mindmapTitle" class="mindmap-title-input" placeholder="Mindmap title" aria-label="Mindmap title" />
+                <button id="mindmapZoomOut" class="secondary-button mini-button" type="button">-</button>
+                <span id="mindmapZoomLabel" class="canvas-zoom-label">100%</span>
+                <button id="mindmapZoomIn" class="secondary-button mini-button" type="button">+</button>
+                <button id="mindmapResetView" class="secondary-button mini-button" type="button">Reset</button>
+                <button id="mindmapAddText" class="secondary-button mini-button" type="button">Text</button>
+                <button id="mindmapAddTable" class="secondary-button mini-button" type="button">Table</button>
+                <span id="mindmapSelectionLabel" class="mindmap-selection-label">1 selected</span>
+                <span id="mindmapSaveState" class="thinking-save-state">Ready</span>
+              </div>
+              <div id="mindmapStage" class="mindmap-stage" tabindex="0" aria-label="Zoomable mindmap surface">
+                <div id="mindmapWorld" class="mindmap-world">
+                  <div id="mindmapRoot" class="mindmap-root muted">Loading mindmap...</div>
+                </div>
+                <div id="mindmapSelectionBox" class="mindmap-selection-box" hidden></div>
+              </div>
+            </section>
+            <aside class="mindmap-inspector" aria-label="Selected mindmap node">
+              <div id="mindmapInspector" class="mindmap-inspector-empty">
+                <h2>Node Details</h2>
+                <p>Select a category, paper, or note in the mindmap.</p>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <aside class="presentation-report-drawer" id="presentationReportDrawer" aria-hidden="true">
+      <div id="presentationReportResizeHandle" class="presentation-report-resize-handle" title="Drag to resize Takeaway Report" aria-hidden="true"></div>
+      <div class="presentation-report-panel" role="dialog" aria-modal="false" aria-labelledby="presentationReportTitle">
+        <div class="presentation-report-header">
+          <div>
+            <span class="sense-kicker">Reading Synthesis</span>
+            <h2 id="presentationReportTitle">Takeaway Report</h2>
+          </div>
+          <button id="closePresentationReport" class="icon-button" title="Close">x</button>
+        </div>
+        <div id="presentationReportRoot" class="presentation-root muted">Waiting for agent analysis.</div>
+      </div>
+    </aside>
+
+    <aside class="library-preview-drawer" id="libraryPreviewDrawer" aria-hidden="true">
+      <div class="library-preview-panel" role="dialog" aria-modal="false" aria-labelledby="libraryPreviewTitle">
+        <div class="library-preview-header">
+          <div>
+            <span class="sense-kicker">Paper Preview</span>
+            <h2 id="libraryPreviewTitle">Library Preview</h2>
+          </div>
+          <button id="closeLibraryPreview" class="icon-button" title="Close">x</button>
+        </div>
+        <div id="libraryPreviewRoot" class="library-preview-root muted">Select Preview from Library.</div>
+      </div>
+    </aside>
+
+    <aside class="note-drawer" id="noteDrawer" aria-hidden="true">
+      <div class="drawer-header">
+        <div>
+          <strong>Add Note</strong>
+          <span id="drawerAnchor"></span>
+        </div>
+        <button id="closeDrawer" class="icon-button" title="Close">x</button>
+      </div>
+      <label>Highlighted text</label>
+      <blockquote id="drawerQuote"></blockquote>
+      <label for="noteText">Your note</label>
+      <textarea id="noteText" rows="8" placeholder="Write why this passage matters..."></textarea>
+      <label>Tags</label>
+      <div id="noteTagOptions" class="tag-options" aria-label="Note tags"></div>
+      <div class="custom-tag-row">
+        <input id="customTagText" type="text" placeholder="Add custom tag" />
+        <button id="addCustomTag" class="secondary-button" type="button">Add</button>
+      </div>
+      <div class="drawer-actions">
+        <button id="deleteDrawerNote" class="danger-button" type="button" hidden>Delete Note</button>
+        <button id="saveNote" class="primary-button">Send Note</button>
+        <button id="saveHighlightOnly" class="secondary-button">Keep Highlight</button>
+      </div>
+    </aside>
+
+    <aside class="canvas-picker-modal" id="canvasPickerModal" aria-hidden="true">
+      <div class="canvas-picker-panel" role="dialog" aria-modal="true" aria-labelledby="canvasPickerTitle">
+        <div class="canvas-picker-header">
+          <div>
+            <span class="sense-kicker">Canvas Picker</span>
+            <h2 id="canvasPickerTitle">Choose source</h2>
+          </div>
+          <button id="closeCanvasPicker" class="icon-button" type="button" title="Close">x</button>
+        </div>
+        <input id="canvasPickerSearch" class="canvas-picker-search" type="search" placeholder="Search..." />
+        <div id="canvasPickerResults" class="canvas-picker-results"></div>
+      </div>
+    </aside>
+
+    <aside class="canvas-sync-modal" id="canvasSyncModal" aria-hidden="true">
+      <div class="canvas-sync-panel" role="dialog" aria-modal="true" aria-labelledby="canvasSyncTitle">
+        <div class="canvas-picker-header">
+          <div>
+            <span class="sense-kicker">Canvas Sync</span>
+            <h2 id="canvasSyncTitle">Review Library tag changes</h2>
+          </div>
+          <button id="closeCanvasSync" class="icon-button" type="button" title="Close">x</button>
+        </div>
+        <div id="canvasSyncResults" class="canvas-sync-results"></div>
+        <div class="canvas-sync-actions">
+          <button id="applyCanvasSync" class="primary-button" type="button">Apply selected</button>
+        </div>
+      </div>
+    </aside>
+
+    <div id="toast" class="toast" role="status"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>

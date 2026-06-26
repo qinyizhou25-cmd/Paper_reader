@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256" role="img" aria-label="Paper Reader Agent logo">
+  <rect width="256" height="256" rx="48" fill="#2f6f68"/>
+  <path d="M54 66c0-12 10-22 22-22h45c13 0 24 6 32 16 8-10 19-16 32-16h17c12 0 22 10 22 22v126c0 6-5 11-11 11h-30c-13 0-25 5-34 14-9-9-21-14-34-14H65c-6 0-11-5-11-11V66z" fill="#f6f7f4"/>
+  <path d="M128 70v120" stroke="#b8d4cc" stroke-width="8" stroke-linecap="round"/>
+  <path d="M77 83h34M77 108h34M77 133h24M150 83h51M150 108h42M150 133h51" stroke="#2f6f68" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="190" cy="180" r="26" fill="#fff2a8"/>
+  <text x="190" y="190" text-anchor="middle" font-family="Segoe UI, Arial, sans-serif" font-size="32" font-weight="800" fill="#174c47">P</text>
+</svg>

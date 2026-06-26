@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments and secrets
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+env/
+
+# Local Paper Reader workspaces and generated research data
+/paper_reading_workspace/
+/papers/
+/assets/
+/paper_candidates/
+/mindmaps/
+/canvas_boards/
+/library.json
+/.paper-reader-agent.json
+*.pdf
+*.epub
+*.mobi
+
+# Generated parser/cache outputs
+/output/
+/outputs/
+/mineru-output/
+/mineru_output/
+*.log
+*.tmp
+*.temp
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
