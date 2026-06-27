@@ -10,6 +10,7 @@ const state = {
   library: { papers: [] },
   tagDictionary: { paper_tags: [] },
   candidates: [],
+  tagOptionsOpen: false,
 };
 
 function qs(selector) { return document.querySelector(selector); }
@@ -61,6 +62,30 @@ function applyWorkspaceData(data) {
   if (data?.library) state.library = data.library;
   if (data?.tag_dictionary) state.tagDictionary = data.tag_dictionary;
   if (Array.isArray(data?.candidates)) state.candidates = data.candidates;
+  syncCurrentCandidateFromLibrary();
+}
+
+let workspaceRefreshPromise = null;
+let workspaceRefreshAt = 0;
+
+async function refreshWorkspaceData(options = {}) {
+  const now = Date.now();
+  if (!options.force && workspaceRefreshPromise) return workspaceRefreshPromise;
+  if (!options.force && now - workspaceRefreshAt < 1500) return null;
+  workspaceRefreshAt = now;
+  workspaceRefreshPromise = api("/api/candidates")
+    .then(data => {
+      applyWorkspaceData(data);
+      if (options.render) {
+        renderTagPicker();
+        renderProjectSelect();
+        renderStars();
+        updateSaveButtonState();
+      }
+      return data;
+    })
+    .finally(() => { workspaceRefreshPromise = null; });
+  return workspaceRefreshPromise;
 }
 
 async function checkBackend() {
@@ -103,6 +128,22 @@ function normalizeProjectName(value) {
 
 function paperProjects(paper = {}) {
   return uniqueValues([...normalizeTagList(paper.projects), normalizeProjectName(paper.project || "")].map(normalizeProjectName));
+}
+
+function syncCurrentCandidateFromLibrary() {
+  const paperId = state.candidate?.saved_paper_id;
+  if (!paperId) return;
+  const paper = (state.library?.papers || []).find(item => item.id === paperId);
+  if (!paper) return;
+  const projects = paperProjects(paper);
+  state.candidate = {
+    ...state.candidate,
+    tags: normalizeTagList(paper.tags || state.candidate.tags),
+    project: projects[0] || normalizeProjectName(state.candidate.project || ""),
+    importance: String(paper.importance || state.candidate.importance || ""),
+  };
+  state.selectedTags = normalizeTagList(state.candidate.tags || []);
+  state.importance = String(state.candidate.importance || "");
 }
 
 function allPaperTagOptions() {
@@ -439,7 +480,9 @@ function renderTagOptions() {
   const query = input.value.trim().toLowerCase();
   const options = allPaperTagOptions().filter(tag => !state.selectedTags.includes(tag) && (!query || tag.toLowerCase().includes(query))).slice(0, 18);
   const canCreate = input.value.trim() && !state.selectedTags.some(tag => tag.toLowerCase() === input.value.trim().toLowerCase()) && !options.some(tag => tag.toLowerCase() === input.value.trim().toLowerCase());
-  menu.hidden = !input.matches(":focus") && !query;
+  const picker = qs(".tag-picker");
+  const pickerActive = Boolean(input.matches(":focus") || picker?.contains(document.activeElement));
+  menu.hidden = !(state.tagOptionsOpen && pickerActive);
   menu.innerHTML = [
     ...options.map(tag => `<button class="tag-option" data-add-tag="${escapeHtml(tag)}" type="button">${escapeHtml(tag)}</button>`),
     canCreate ? `<button class="tag-option tag-create" data-create-tag="${escapeHtml(input.value.trim())}" type="button">Create "${escapeHtml(input.value.trim())}"</button>` : "",
@@ -453,6 +496,12 @@ function renderTagOptions() {
   });
 }
 
+function hideTagOptions() {
+  state.tagOptionsOpen = false;
+  const menu = qs("#paperTagOptions");
+  if (menu) menu.hidden = true;
+}
+
 function renderTagPicker() {
   renderSelectedTags();
   renderTagOptions();
@@ -464,6 +513,7 @@ async function addSelectedTag(value) {
   state.selectedTags = uniqueValues([...state.selectedTags, tag]);
   qs("#paperTags").value = "";
   renderTagPicker();
+  hideTagOptions();
   await saveCandidateMetadata({ silent: true });
 }
 
@@ -521,6 +571,7 @@ function renderCandidate(candidate) {
   renderTagPicker();
   renderStars();
   renderNotes();
+  updateSaveButtonState();
 }
 
 function renderNotes() {
@@ -540,6 +591,18 @@ function renderNotes() {
     if (!note.note) node.querySelector("p").classList.add("muted");
     root.appendChild(node);
   }
+}
+
+function updateSaveButtonState(mode = "auto", paperId = "") {
+  const button = qs("#saveToLibrary");
+  if (!button) return;
+  const savedPaperId = paperId || state.candidate?.saved_paper_id || "";
+  const saved = mode === "saved" || (mode === "auto" && (savedPaperId || state.candidate?.decision === "saved"));
+  const saving = mode === "saving";
+  button.classList.toggle("success", saved);
+  button.disabled = saved || saving;
+  button.textContent = saving ? "Saving..." : saved ? "Uploaded to Library" : "Save to Library";
+  button.title = saved ? `Saved as ${savedPaperId || "a Library paper"}` : "Save this Paper Brief to Library";
 }
 
 function selectedBriefText() {
@@ -707,7 +770,8 @@ async function saveToLibrary() {
   if (!state.candidate?.id) return;
   await saveCandidateMetadata({ silent: true });
   setStatus("Saving candidate to Library...");
-  qs("#saveToLibrary").disabled = true;
+  updateSaveButtonState("saving");
+  let saved = false;
   try {
     const data = await api(`/api/candidates/${encodeURIComponent(state.candidate.id)}/save-to-library`, {
       method: "POST",
@@ -718,11 +782,16 @@ async function saveToLibrary() {
       setStatus("This paper may already exist in Library. Open Paper Reader Agent to resolve duplicate.", "error");
       return;
     }
-    setStatus(`Saved to Library: ${data.paper_id}`);
+    saved = true;
+    state.candidate = { ...state.candidate, decision: "saved", saved_paper_id: data.paper_id || state.candidate.saved_paper_id || "" };
+    updateSaveButtonState("saved", data.paper_id || "");
+    const background = data.processing_background ? " Paper Brief is ready; Markdown parsing continues in the background." : "";
+    setStatus(`Saved to Library: ${data.paper_id}.${background}`);
+    refreshWorkspaceData({ force: true }).catch(() => {});
   } catch (error) {
     setStatus(error.message || String(error), "error");
   } finally {
-    qs("#saveToLibrary").disabled = false;
+    if (!saved) updateSaveButtonState("auto");
   }
 }
 
@@ -739,15 +808,34 @@ async function init() {
   qs("#briefContent").addEventListener("keyup", updateSelectionHint);
   qs("#highlightSelection").addEventListener("click", addHighlight);
   qs("#addNote").addEventListener("click", addNote);
-  qs("#paperTags").addEventListener("input", renderTagOptions);
-  qs("#paperTags").addEventListener("focus", renderTagOptions);
-  qs("#paperTags").addEventListener("blur", () => setTimeout(() => { qs("#paperTagOptions").hidden = true; }, 160));
+  qs("#paperTags").addEventListener("input", () => {
+    state.tagOptionsOpen = true;
+    renderTagOptions();
+  });
+  qs("#paperTags").addEventListener("focus", () => {
+    state.tagOptionsOpen = true;
+    renderTagOptions();
+    refreshWorkspaceData({ force: true, render: true }).catch(() => {});
+  });
+  qs("#paperTags").addEventListener("blur", () => setTimeout(hideTagOptions, 160));
   qs("#paperTags").addEventListener("keydown", event => {
+    if (event.key === "Escape") {
+      hideTagOptions();
+      qs("#paperTags").blur();
+      return;
+    }
     if (event.key === "Enter") {
       event.preventDefault();
       addSelectedTag(qs("#paperTags").value).catch(error => setStatus(error.message, "error"));
     }
   });
+  document.addEventListener("pointerdown", event => {
+    const picker = qs(".tag-picker");
+    if (picker && !picker.contains(event.target)) hideTagOptions();
+  });
+  window.addEventListener("focus", () => refreshWorkspaceData({ render: true }).catch(() => {}));
+  qs("#projectName").addEventListener("focus", () => refreshWorkspaceData({ force: true, render: true }).catch(() => {}));
+  qs("#projectName").addEventListener("pointerdown", () => refreshWorkspaceData({ force: true, render: true }).catch(() => {}));
   qs("#projectName").addEventListener("change", () => saveCandidateMetadata().catch(error => setStatus(error.message, "error")));
   qs("#addProject").addEventListener("click", () => addProjectFromInput().catch(error => setStatus(error.message, "error")));
   qs("#customProjectName").addEventListener("keydown", event => {

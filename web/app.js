@@ -32,6 +32,8 @@ const state = {
   libraryPreviewThumbnailsVisible: false,
   libraryPreview: { open: false, paperId: "", payload: null, loading: false, error: "" },
   libraryCustomProjects: [],
+  libraryIntakeTags: [],
+  libraryIntakeProjects: [],
   canvasBoards: [],
   currentCanvasProject: "collaborative",
   currentCanvasBoardId: "",
@@ -128,7 +130,7 @@ const libraryScrollStorageKey = "paperReader.libraryScrollSnapshots";
 const defaultNoteTags = [];
 const paperBriefBlockId = "paper-brief";
 const defaultLibraryProjects = ["collaborative", "memories"];
-const defaultPdfLibraryPath = "~/Downloads";
+const defaultPdfLibraryPath = "E:\\论文库\\";
 const readingSkimmedMs = 2500;
 const readingCarefulMs = 20000;
 const maxImportanceStars = 3;
@@ -340,6 +342,169 @@ function allLibraryProjects() {
     for (const project of paperProjects(paper)) projects.add(project);
   }
   return Array.from(projects).sort((a, b) => a.localeCompare(b));
+}
+
+function selectedLibraryIntakeTags() {
+  return uniqueTags(state.libraryIntakeTags || []);
+}
+
+function selectedLibraryIntakeProjects() {
+  return uniqueTags((state.libraryIntakeProjects || []).map(normalizeProjectName)).filter(Boolean);
+}
+
+function libraryIntakePayload() {
+  const tags = selectedLibraryIntakeTags();
+  const projects = selectedLibraryIntakeProjects();
+  return {
+    tags,
+    projects,
+    tag_colors: Object.fromEntries(tags.map(tag => [tag, tagColor(tag)])),
+    project_colors: Object.fromEntries(projects.map(project => [project, projectColor(project)])),
+  };
+}
+
+function clearLibraryIntakeSelection() {
+  state.libraryIntakeTags = [];
+  state.libraryIntakeProjects = [];
+  renderLibraryIntakePickers();
+}
+
+function renderLibraryIntakePickers() {
+  const projectRoot = qs("#libraryIntakeProjectPicker");
+  const tagRoot = qs("#libraryIntakeTagPicker");
+  if (!projectRoot || !tagRoot) return;
+  const selectedProjects = selectedLibraryIntakeProjects();
+  const selectedTags = selectedLibraryIntakeTags();
+  const projectSet = new Set(selectedProjects);
+  const tagSet = new Set(selectedTags);
+  const projectOptions = allLibraryProjects();
+  const tagOptions = allLibraryTags(selectedTags).filter(tag => tagSet.has(tag) || !String(tag).startsWith("__"));
+  const projectColors = projectColorMap();
+  const tagColors = tagColorMap();
+  projectRoot.innerHTML = `
+    <div class="library-intake-picker-header">
+      <span>Paper project</span>
+      <button class="secondary-button mini-button" data-clear-intake-projects type="button">Clear</button>
+    </div>
+    <div class="library-tags library-intake-selected" aria-label="Selected paper projects">
+      ${selectedProjects.map(project => `<button class="library-tag library-project-tag" style="--tag-color: ${escapeHtml(projectColor(project, projectColors))}" data-remove-intake-project="${escapeHtml(project)}" type="button">${escapeHtml(project)} ×</button>`).join("") || '<span class="muted small-text">No project selected</span>'}
+    </div>
+    <div class="library-intake-option-panel" data-filter-tag-scope>
+      ${tagMenuSearchHtml("Search projects")}
+      <div class="library-intake-option-list">
+        ${projectOptions.map(project => `<button class="library-tag-option ${projectSet.has(project) ? "active" : ""}" style="--tag-color: ${escapeHtml(projectColor(project, projectColors))}" data-toggle-intake-project="${escapeHtml(project)}" ${filterableTagOptionAttrs(project)} type="button"><span></span>${escapeHtml(project)}</button>`).join("") || '<span class="muted small-text">No existing projects</span>'}
+        <span class="muted small-text" data-filter-empty hidden>No matching projects</span>
+      </div>
+    </div>
+    <div class="library-intake-custom-row">
+      <input id="libraryIntakeProjectCustom" type="text" placeholder="New project" />
+      <button class="secondary-button mini-button" data-add-intake-project type="button">Add</button>
+    </div>`;
+  tagRoot.innerHTML = `
+    <div class="library-intake-picker-header">
+      <span>Paper tag</span>
+      <button class="secondary-button mini-button" data-clear-intake-tags type="button">Clear</button>
+    </div>
+    <div class="library-tags library-intake-selected" aria-label="Selected paper tags">
+      ${selectedTags.map(tag => `<button class="library-tag" style="--tag-color: ${escapeHtml(tagColor(tag, tagColors))}" data-remove-intake-tag="${escapeHtml(tag)}" title="${escapeHtml(tag)}" type="button">${escapeHtml(libraryTagLabel(tag))} ×</button>`).join("") || '<span class="muted small-text">No paper tag selected</span>'}
+    </div>
+    <div class="library-intake-option-panel" data-filter-tag-scope>
+      ${tagMenuSearchHtml("Search paper tags")}
+      <div class="library-intake-option-list">
+        ${tagOptions.map(tag => `<button class="library-tag-option ${tagSet.has(tag) ? "active" : ""}" style="--tag-color: ${escapeHtml(tagColor(tag, tagColors))}" data-toggle-intake-tag="${escapeHtml(tag)}" ${filterableTagOptionAttrs(`${tag} ${libraryTagLabel(tag)}`)} type="button"><span></span>${escapeHtml(libraryTagLabel(tag))}</button>`).join("") || '<span class="muted small-text">No existing tags</span>'}
+        <span class="muted small-text" data-filter-empty hidden>No matching tags</span>
+      </div>
+    </div>
+    <div class="library-intake-custom-row">
+      <input id="libraryIntakeTagCustom" type="text" placeholder="New tag or alias" />
+      <button class="secondary-button mini-button" data-add-intake-tag type="button">Add</button>
+    </div>`;
+  initTagOptionFilters(projectRoot);
+  initTagOptionFilters(tagRoot);
+}
+
+function addLibraryIntakeProjectFromInput() {
+  const input = qs("#libraryIntakeProjectCustom");
+  const value = normalizeProjectName(input?.value || "");
+  if (!value) return;
+  state.libraryIntakeProjects = uniqueTags([...selectedLibraryIntakeProjects(), value]);
+  if (!allLibraryProjects().includes(value)) {
+    state.libraryCustomProjects = uniqueTags([...state.libraryCustomProjects, value]);
+    saveCustomLibraryProjects();
+  }
+  if (input) input.value = "";
+  renderLibraryIntakePickers();
+}
+
+function addLibraryIntakeTagFromInput() {
+  const input = qs("#libraryIntakeTagCustom");
+  const values = canonicalTagIdsForInput(input?.value || "");
+  if (!values.length) return;
+  state.libraryIntakeTags = uniqueTags([...selectedLibraryIntakeTags(), ...values]);
+  if (input) input.value = "";
+  renderLibraryIntakePickers();
+}
+
+function handleLibraryIntakeClick(event) {
+  const projectToggle = event.target.closest?.("[data-toggle-intake-project]");
+  if (projectToggle) {
+    event.preventDefault();
+    const value = normalizeProjectName(projectToggle.dataset.toggleIntakeProject || "");
+    const selected = new Set(selectedLibraryIntakeProjects());
+    if (selected.has(value)) selected.delete(value);
+    else if (value) selected.add(value);
+    state.libraryIntakeProjects = Array.from(selected);
+    renderLibraryIntakePickers();
+    return true;
+  }
+  const tagToggle = event.target.closest?.("[data-toggle-intake-tag]");
+  if (tagToggle) {
+    event.preventDefault();
+    const value = tagToggle.dataset.toggleIntakeTag || "";
+    const selected = new Set(selectedLibraryIntakeTags());
+    if (selected.has(value)) selected.delete(value);
+    else if (value) selected.add(value);
+    state.libraryIntakeTags = Array.from(selected);
+    renderLibraryIntakePickers();
+    return true;
+  }
+  const projectRemove = event.target.closest?.("[data-remove-intake-project]");
+  if (projectRemove) {
+    event.preventDefault();
+    state.libraryIntakeProjects = selectedLibraryIntakeProjects().filter(project => project !== projectRemove.dataset.removeIntakeProject);
+    renderLibraryIntakePickers();
+    return true;
+  }
+  const tagRemove = event.target.closest?.("[data-remove-intake-tag]");
+  if (tagRemove) {
+    event.preventDefault();
+    state.libraryIntakeTags = selectedLibraryIntakeTags().filter(tag => tag !== tagRemove.dataset.removeIntakeTag);
+    renderLibraryIntakePickers();
+    return true;
+  }
+  if (event.target.closest?.("[data-clear-intake-projects]")) {
+    event.preventDefault();
+    state.libraryIntakeProjects = [];
+    renderLibraryIntakePickers();
+    return true;
+  }
+  if (event.target.closest?.("[data-clear-intake-tags]")) {
+    event.preventDefault();
+    state.libraryIntakeTags = [];
+    renderLibraryIntakePickers();
+    return true;
+  }
+  if (event.target.closest?.("[data-add-intake-project]")) {
+    event.preventDefault();
+    addLibraryIntakeProjectFromInput();
+    return true;
+  }
+  if (event.target.closest?.("[data-add-intake-tag]")) {
+    event.preventDefault();
+    addLibraryIntakeTagFromInput();
+    return true;
+  }
+  return false;
 }
 
 function saveCustomLibraryProjects() {
@@ -1744,14 +1909,18 @@ function noteFromCurrentPaperAnnotation(annotation, paperId = state.currentPaper
   };
 }
 
-function syncCurrentPaperNotesLocally() {
+function syncCurrentPaperNotesLocally(options = {}) {
   if (!state.currentPaperId) return;
   const paperId = state.currentPaperId;
   const paperNotes = (state.annotations || []).map(annotation => noteFromCurrentPaperAnnotation(annotation, paperId));
   const otherNotes = (state.allNotes || []).filter(note => !(note.paper_id === paperId && (note.source_scope || "paper") === "paper"));
   state.allNotes = [...paperNotes, ...otherNotes].sort((a, b) => String(noteSortTimestamp(b)).localeCompare(String(noteSortTimestamp(a))));
-  renderNotes();
-  renderSidebar();
+  if (options.renderNotes !== false) renderNotes();
+  if (options.renderSidebar !== false) renderSidebar();
+}
+
+function shouldRenderNotesImmediately() {
+  return document.body.dataset.activeView === "notes";
 }
 
 function refreshAllNotesInBackground(delay = 250) {
@@ -6663,7 +6832,10 @@ async function deleteThinkingAnnotationFromPaper(paperId, annotationId) {
   if (state.notesPreview.paperId === paperId && state.notesPreview.annotationId === annotationId) {
     state.notesPreview = { paperId: "", annotationId: "", segmentId: "", note: null, payload: null, loading: false, error: "" };
   }
-  await loadAllNotes();
+  state.allNotes = (state.allNotes || []).filter(note => !(note.paper_id === paperId && note.id === annotationId));
+  renderNotes();
+  renderSidebar();
+  refreshAllNotesInBackground();
   toast("Note deleted");
 }
 
@@ -6759,18 +6931,29 @@ function renderReader() {
   }
   root.innerHTML = `${paperBriefCardHtml()}${paragraphs.map(paragraphHtml).join("")}`;
   bindPaperBriefCard();
-  qsa(".citation-link").forEach(button => {
+  bindReaderDynamicEvents(root);
+  updateToolbarStatus();
+  initReadingProgressTracker();
+  renderSensemakingPanel();
+}
+
+function readerScoped(root, selector) {
+  return Array.from((root || document).querySelectorAll?.(selector) || []);
+}
+
+function bindReaderDynamicEvents(root = document) {
+  readerScoped(root, ".citation-link").forEach(button => {
     if (!button.dataset.refList) return;
     button.addEventListener("click", () => openReferenceModal(button.dataset.refList.split(",").filter(Boolean)));
   });
-  bindParagraphRefLinks(document);
-  qsa(".figure-ref").forEach(button => {
+  bindParagraphRefLinks(root);
+  readerScoped(root, ".figure-ref").forEach(button => {
     button.addEventListener("click", () => openFigureModal(button.dataset.figureNumber));
   });
-  qsa(".paper-figure-image").forEach(button => {
+  readerScoped(root, ".paper-figure-image").forEach(button => {
     button.addEventListener("click", () => openFigureModalBySrc(button.dataset.figureSrc));
   });
-  qsa("#documentRoot [data-jump-annotation]").forEach(button => {
+  readerScoped(root, "[data-jump-annotation]").forEach(button => {
     button.addEventListener("click", event => {
       if (event.target.closest("[data-delete-annotation], [data-edit-annotation]")) return;
       focusAnnotation(button.dataset.jumpAnnotation);
@@ -6782,28 +6965,54 @@ function renderReader() {
       }
     });
   });
-  qsa("#documentRoot [data-delete-annotation]").forEach(button => {
+  readerScoped(root, "[data-delete-annotation]").forEach(button => {
     button.addEventListener("click", event => {
       event.stopPropagation();
       deleteAnnotation(button.dataset.deleteAnnotation, button.dataset.paperId || state.currentPaperId);
     });
   });
-  qsa("#documentRoot [data-edit-annotation]").forEach(button => {
+  readerScoped(root, "[data-edit-annotation]").forEach(button => {
     button.addEventListener("click", event => {
       event.stopPropagation();
       openExistingAnnotationDrawer(button.dataset.editAnnotation);
     });
   });
-  qsa("#documentRoot [data-media-note]").forEach(button => {
+  readerScoped(root, "[data-media-note]").forEach(button => {
     button.addEventListener("click", event => {
       event.preventDefault();
       event.stopPropagation();
       openMediaAnnotationDrawer(button.dataset.mediaNote, button.dataset.mediaKind);
     });
   });
-  updateToolbarStatus();
-  initReadingProgressTracker();
-  renderSensemakingPanel();
+}
+
+function refreshReaderSegments(segmentIds = []) {
+  if (!state.payload || processingMode(state.payload.metadata || {}) !== "deep") return false;
+  const ids = [...new Set(segmentIds.filter(Boolean))];
+  if (!ids.length) return false;
+  let refreshed = false;
+  for (const segmentId of ids) {
+    const segment = (state.payload.segments || []).find(item => item.id === segmentId);
+    const existing = document.getElementById(segmentId);
+    if (!segment || !existing) return false;
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = paragraphHtml(segment).trim();
+    const next = wrapper.firstElementChild;
+    if (!next) return false;
+    existing.replaceWith(next);
+    bindReaderDynamicEvents(next);
+    if (state.readingObserver) state.readingObserver.observe(next);
+    refreshed = true;
+  }
+  if (refreshed) {
+    updateToolbarStatus();
+    applyReadingProgressDecorations();
+  }
+  return refreshed;
+}
+
+function refreshReaderSegmentsOrRender(segmentIds = []) {
+  if (!refreshReaderSegments(segmentIds)) renderReader();
 }
 
 function ensureFigureModal() {
@@ -7421,8 +7630,8 @@ async function persistCurrentPaperAnnotations(toastMessage = "", options = {}) {
   if (optimistic) {
     if (state.payload?.annotations) state.payload.annotations.annotations = state.annotations;
     state.notesPreviewCache.delete(state.currentPaperId);
-    syncCurrentPaperNotesLocally();
-    renderReader();
+    syncCurrentPaperNotesLocally({ renderNotes: shouldRenderNotesImmediately(), renderSidebar: false });
+    refreshReaderSegmentsOrRender(options.segmentIds || []);
     markReadingProgressDirtyFromAnnotations();
     if (toastMessage) toast(toastMessage);
   }
@@ -7433,8 +7642,8 @@ async function persistCurrentPaperAnnotations(toastMessage = "", options = {}) {
   if (!optimistic) {
     if (state.payload?.annotations) state.payload.annotations.annotations = state.annotations;
     state.notesPreviewCache.delete(state.currentPaperId);
-    syncCurrentPaperNotesLocally();
-    renderReader();
+    syncCurrentPaperNotesLocally({ renderNotes: shouldRenderNotesImmediately(), renderSidebar: false });
+    refreshReaderSegmentsOrRender(options.segmentIds || []);
     markReadingProgressDirtyFromAnnotations();
     if (toastMessage) toast(toastMessage);
   }
@@ -7464,9 +7673,10 @@ async function savePendingAnnotation(includeNote) {
     annotation.note = includeNote ? qs("#noteText").value.trim() : annotation.note || "";
     annotation.tags = selectedDrawerTags();
     annotation.updated_at = new Date().toISOString();
+    const segmentIds = [annotation.segment_id].filter(Boolean);
     closeDrawer();
     await waitForNextFrame();
-    void persistCurrentPaperAnnotations("Note updated").catch(error => toast(`Save failed: ${error.message}`));
+    void persistCurrentPaperAnnotations("Note updated", { segmentIds }).catch(error => toast(`Save failed: ${error.message}`));
     return;
   }
   const now = new Date().toISOString();
@@ -7489,9 +7699,10 @@ async function savePendingAnnotation(includeNote) {
       updated_at: now,
     }));
     state.annotations.push(...groupItems);
+    const segmentIds = groupItems.map(item => item.segment_id).filter(Boolean);
     closeDrawer();
     await waitForNextFrame();
-    void persistCurrentPaperAnnotations("Saved multi-segment note").catch(error => toast(`Save failed: ${error.message}`));
+    void persistCurrentPaperAnnotations("Saved multi-segment note", { segmentIds }).catch(error => toast(`Save failed: ${error.message}`));
     return;
   }
   const item = {
@@ -7506,7 +7717,7 @@ async function savePendingAnnotation(includeNote) {
   state.annotations.push(item);
   closeDrawer();
   await waitForNextFrame();
-  void persistCurrentPaperAnnotations("Saved locally").catch(error => toast(`Save failed: ${error.message}`));
+  void persistCurrentPaperAnnotations("Saved locally", { segmentIds: [item.segment_id].filter(Boolean) }).catch(error => toast(`Save failed: ${error.message}`));
   } catch (error) {
     toast(`Save failed: ${error.message}`);
   } finally {
@@ -7526,6 +7737,7 @@ async function deleteAnnotation(annotationId, paperId = state.currentPaperId) {
   const annotations = payload?.annotations?.annotations || [];
   const target = annotations.find(item => item.id === annotationId);
   const groupId = annotationGroupId(target);
+  const changedSegmentIds = annotations.filter(item => groupId ? annotationGroupId(item) === groupId : item.id === annotationId).map(item => item.segment_id).filter(Boolean);
   const nextAnnotations = annotations.filter(item => groupId ? annotationGroupId(item) !== groupId : item.id !== annotationId);
   await api(`/api/papers/${encodeURIComponent(paperId)}/annotations`, {
     method: "POST",
@@ -7538,10 +7750,12 @@ async function deleteAnnotation(annotationId, paperId = state.currentPaperId) {
   if (paperId === state.currentPaperId) {
     state.annotations = nextAnnotations;
     if (state.payload?.annotations) state.payload.annotations.annotations = nextAnnotations;
-    renderReader();
+    refreshReaderSegmentsOrRender(changedSegmentIds);
     markReadingProgressDirtyFromAnnotations();
+    syncCurrentPaperNotesLocally({ renderNotes: shouldRenderNotesImmediately(), renderSidebar: false });
+  } else {
+    refreshAllNotesInBackground();
   }
-  await loadAllNotes();
   toast("Note deleted");
 }
 
@@ -7560,9 +7774,11 @@ async function mutateAnnotationTags(paperId, annotationId, updater) {
   if (paperId === state.currentPaperId) {
     state.annotations = annotations;
     if (state.payload?.annotations) state.payload.annotations.annotations = annotations;
-    renderReader();
+    refreshReaderSegmentsOrRender([annotation.segment_id].filter(Boolean));
+    syncCurrentPaperNotesLocally({ renderNotes: shouldRenderNotesImmediately(), renderSidebar: false });
+  } else {
+    refreshAllNotesInBackground();
   }
-  await loadAllNotes();
 }
 
 async function addTagToAnnotation(annotationId, paperId = state.currentPaperId) {
@@ -8030,9 +8246,16 @@ async function uploadPdfFilesRaw(files, paperId = "", duplicateOptions = {}) {
   const formData = new FormData();
   for (const file of files) formData.append("files", file, file.name);
   let endpoint = paperId ? `/api/papers/${encodeURIComponent(paperId)}/pdf` : "/api/library/papers/upload";
-  if (!paperId && duplicateOptions.duplicate_policy) {
-    const query = new URLSearchParams({ duplicate_policy: duplicateOptions.duplicate_policy, replace_paper_id: duplicateOptions.replace_paper_id || "" });
-    endpoint += `?${query.toString()}`;
+  if (!paperId) {
+    const intake = libraryIntakePayload();
+    const query = new URLSearchParams();
+    if (duplicateOptions.duplicate_policy) {
+      query.set("duplicate_policy", duplicateOptions.duplicate_policy);
+      query.set("replace_paper_id", duplicateOptions.replace_paper_id || "");
+    }
+    if (intake.tags.length) query.set("tags", intake.tags.join(","));
+    if (intake.projects.length) query.set("projects", intake.projects.join(","));
+    if (Array.from(query.keys()).length) endpoint += `?${query.toString()}`;
   }
   const response = await fetch(endpoint, { method: "POST", body: formData });
   if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
@@ -8123,6 +8346,7 @@ function finishLibraryUpload(result, files, paperId = "") {
     message: paperId ? "PDF 附加解析完成" : `批量上传完成：${parts.join("，") || "无变化"}`,
     error: "",
   };
+  if (!paperId) clearLibraryIntakeSelection();
   renderLibraryUploadStatus();
 }
 
@@ -8251,12 +8475,12 @@ async function submitAddPaperRequest(body) {
   return api("/api/library/papers", { method: "POST", body: JSON.stringify(body) });
 }
 
-async function completeAddPaperResult(result, pathInput, titleInput, tagsInput) {
+async function completeAddPaperResult(result, pathInput, titleInput) {
   toast(result.processing_error ? "Added, but Parse + Brief failed" : result.replaced ? "Existing paper replaced and parsed" : "Added and parsed");
   state.currentPaperId = result.paper_id;
   if (pathInput) pathInput.value = defaultPdfLibraryPath;
   if (titleInput) titleInput.value = "";
-  if (tagsInput) tagsInput.value = "";
+  clearLibraryIntakeSelection();
   await loadLibrary();
   activateView("library");
 }
@@ -8264,7 +8488,6 @@ async function completeAddPaperResult(result, pathInput, titleInput, tagsInput) 
 async function addPaperFromForm() {
   const pathInput = qs("#addPdfPath");
   const titleInput = qs("#addPaperTitle");
-  const tagsInput = qs("#addPaperTags");
   const path = pathInput?.value?.trim();
   const title = titleInput?.value?.trim() || "";
   const hasPdfPath = Boolean(path && path !== defaultPdfLibraryPath);
@@ -8278,7 +8501,7 @@ async function addPaperFromForm() {
     button.textContent = hasPdfPath ? "Adding + parsing..." : "Adding metadata...";
   }
   try {
-    const body = { path: hasPdfPath ? path : "", title, tags: normalizeTagsInput(tagsInput?.value || "") };
+    const body = { path: hasPdfPath ? path : "", title, ...libraryIntakePayload() };
     let result = await submitAddPaperRequest(body);
     if (result.duplicate) {
       const choice = await openDuplicatePaperDialog(result);
@@ -8292,7 +8515,7 @@ async function addPaperFromForm() {
       toast("Duplicate paper was not replaced");
       return;
     }
-    await completeAddPaperResult(result, pathInput, titleInput, tagsInput);
+    await completeAddPaperResult(result, pathInput, titleInput);
   } catch (error) {
     toast(`Add failed: ${error.message}`);
   } finally {
@@ -8348,11 +8571,18 @@ async function refreshCitation(paperId) {
     button.textContent = "Searching...";
   }
   try {
-    await api(`/api/papers/${encodeURIComponent(paperId)}/citations`, { method: "POST", body: JSON.stringify({}) });
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/citations`, { method: "POST", body: JSON.stringify({}) });
+    const paper = state.library?.papers?.find(item => item.id === paperId);
+    if (paper && response.metadata) Object.assign(paper, response.metadata);
+    refreshLibraryRowOrRender(paperId);
     toast("Citation info updated");
-    await loadLibrary();
   } catch (error) {
     toast(`Citation lookup failed: ${error.message}`);
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Refresh";
+    }
   }
 }
 
@@ -8363,12 +8593,18 @@ async function refreshVideos(paperId) {
     button.textContent = "Searching...";
   }
   try {
-    await api(`/api/papers/${encodeURIComponent(paperId)}/videos`, { method: "POST", body: JSON.stringify({ force: true }) });
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/videos`, { method: "POST", body: JSON.stringify({ force: true }) });
+    const paper = state.library?.papers?.find(item => item.id === paperId);
+    if (paper && response.metadata) Object.assign(paper, response.metadata);
+    refreshLibraryRowOrRender(paperId);
     toast("Video links updated");
-    await loadLibrary();
   } catch (error) {
     toast(`Video lookup failed: ${error.message}`);
-    await loadLibrary();
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Refresh Videos";
+    }
   }
 }
 
@@ -8403,7 +8639,7 @@ async function savePaperVideos(paperId, links) {
   });
   const paper = state.library?.papers?.find(item => item.id === paperId);
   if (paper) Object.assign(paper, { video_links: nextLinks, video_search_status: nextLinks.length ? "ready" : "no_results", video_search_error: "" }, response.metadata || {});
-  renderLibrary();
+  refreshLibraryRowOrRender(paperId);
 }
 
 async function addVideoLink(paperId) {
@@ -8547,85 +8783,29 @@ function libraryImportanceEditorHtml(paper) {
   return importanceStarEditorHtml(paper, { variant: "library-cell" });
 }
 
-function bindLibraryTitleActionEvents(root = document) {
-  root.querySelectorAll?.("[data-open-paper]").forEach(button => button.addEventListener("click", async () => {
-    await loadPaper(button.dataset.openPaper);
-    activateView("reader");
-  }));
-  root.querySelectorAll?.("[data-preview-paper]").forEach(button => button.addEventListener("click", () => openLibraryPreview(button.dataset.previewPaper)));
-}
-
-function bindLibraryTagCellEvents(root = document) {
-  root.querySelectorAll?.("[data-open-tag-menu]").forEach(button => button.addEventListener("click", event => {
-    event.stopPropagation();
-    const previousPaperId = state.libraryTagMenuPaperId;
-    state.libraryTagMenuPaperId = state.libraryTagMenuPaperId === button.dataset.openTagMenu ? "" : button.dataset.openTagMenu;
-    state.libraryProjectMenuPaperId = "";
-    if (previousPaperId && previousPaperId !== button.dataset.openTagMenu) refreshLibraryTagCell(previousPaperId);
-    refreshLibraryTagCell(button.dataset.openTagMenu);
-  }));
-  root.querySelectorAll?.("[data-add-existing-tag]").forEach(button => button.addEventListener("click", event => {
-    event.stopPropagation();
-    addPaperTag(button.dataset.paperId, button.dataset.addExistingTag, tagColor(button.dataset.addExistingTag));
-  }));
-  root.querySelectorAll?.("[data-add-custom-tag]").forEach(button => button.addEventListener("click", event => {
-    event.stopPropagation();
-    addPaperTagFromInput(button.dataset.addCustomTag);
-  }));
-  root.querySelectorAll?.("[data-paper-tag-input]").forEach(input => input.addEventListener("keydown", event => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addPaperTagFromInput(input.dataset.paperTagInput);
-    }
-  }));
-  root.querySelectorAll?.("[data-remove-paper-tag]").forEach(button => button.addEventListener("click", () => removePaperTag(button.dataset.paperId, button.dataset.removePaperTag)));
-  initTagOptionFilters(root);
-}
-
-function bindLibraryProjectCellEvents(root = document) {
-  root.querySelectorAll?.("[data-open-project-menu]").forEach(button => button.addEventListener("click", event => {
-    event.stopPropagation();
-    const previousPaperId = state.libraryProjectMenuPaperId;
-    state.libraryProjectMenuPaperId = state.libraryProjectMenuPaperId === button.dataset.openProjectMenu ? "" : button.dataset.openProjectMenu;
-    state.libraryTagMenuPaperId = "";
-    if (previousPaperId && previousPaperId !== button.dataset.openProjectMenu) refreshLibraryProjectCell(previousPaperId);
-    refreshLibraryProjectCell(button.dataset.openProjectMenu);
-  }));
-  root.querySelectorAll?.("[data-add-existing-project]").forEach(button => button.addEventListener("click", event => {
-    event.stopPropagation();
-    addPaperProject(button.dataset.paperId, button.dataset.addExistingProject, projectColor(button.dataset.addExistingProject));
-  }));
-  root.querySelectorAll?.("[data-add-custom-project]").forEach(button => button.addEventListener("click", event => {
-    event.stopPropagation();
-    addPaperProjectFromInput(button.dataset.addCustomProject);
-  }));
-  root.querySelectorAll?.("[data-paper-project-input]").forEach(input => input.addEventListener("keydown", event => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addPaperProjectFromInput(input.dataset.paperProjectInput);
-    }
-  }));
-  root.querySelectorAll?.("[data-remove-paper-project]").forEach(button => button.addEventListener("click", () => removePaperProject(button.dataset.paperId, button.dataset.removePaperProject)));
-  initTagOptionFilters(root);
-}
-
 async function savePaperTags(paperId, tags, tagColors = null) {
   const nextTags = uniqueTags(tags);
   captureLibraryScroll();
-  setMetadataSaveState(paperId, "Saving...", "saving");
   const body = { tags: nextTags };
   if (tagColors) body.tag_colors = tagColors;
-  const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
   const paper = state.library?.papers?.find(item => item.id === paperId);
-  const savedTags = normalizeTagsInput(response.metadata?.tags || nextTags);
-  if (paper) Object.assign(paper, { tags: savedTags, ...(tagColors ? { tag_colors: tagColors } : {}) }, response.metadata || {});
-  if (shouldRenderWholeLibraryForMetadataChange("tags")) {
-    renderLibrary();
-    restoreLibraryScroll();
-  } else {
-    refreshLibraryTagCell(paperId);
+  const previous = paperSnapshot(paper);
+  if (paper) Object.assign(paper, { tags: nextTags, ...(tagColors ? { tag_colors: tagColors } : {}) });
+  refreshLibraryRowOrRender(paperId);
+  restoreLibraryScroll();
+  setMetadataSaveState(paperId, "Saving...", "saving");
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
+    const savedTags = normalizeTagsInput(response.metadata?.tags || nextTags);
+    if (paper) Object.assign(paper, { tags: savedTags, ...(tagColors ? { tag_colors: tagColors } : {}) }, response.metadata || {});
+    refreshLibraryRow(paperId);
+    setMetadataSaveState(paperId, "Saved", "saved");
+  } catch (error) {
+    restorePaperSnapshot(paper, previous);
+    refreshLibraryRowOrRender(paperId);
+    setMetadataSaveState(paperId, "Save failed", "error");
+    throw error;
   }
-  setMetadataSaveState(paperId, "Saved", "saved");
 }
 
 async function savePaperImportance(paperId, tags) {
@@ -8637,25 +8817,40 @@ async function savePaperImportanceLevel(paperId, level, options = {}) {
   const body = importanceFieldsForLevel(level);
   const fromLibrary = document.body.dataset.activeView === "library";
   if (fromLibrary) captureLibraryScroll();
-  setMetadataSaveState(paperId, "Saving...", "saving");
-  const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
-  const metadata = response.metadata || body;
   const paper = state.library?.papers?.find(item => item.id === paperId);
-  if (paper) Object.assign(paper, body, metadata);
+  const previous = paperSnapshot(paper);
+  const previousMetadata = state.currentPaperId === paperId && state.payload?.metadata ? paperSnapshot(state.payload.metadata) : null;
+  if (paper) Object.assign(paper, body);
   if (state.currentPaperId === paperId && state.payload?.metadata) {
-    Object.assign(state.payload.metadata, body, metadata);
+    Object.assign(state.payload.metadata, body);
     renderPaperMeta();
   }
   if (fromLibrary && options.renderLibrary !== false) {
-    if (shouldRenderWholeLibraryForMetadataChange("importance")) {
-      renderLibrary();
-      restoreLibraryScroll();
-    } else {
-      refreshLibraryImportanceCells(paperId);
-    }
+    refreshLibraryRowOrRender(paperId);
+    restoreLibraryScroll();
   }
-  setMetadataSaveState(paperId, "Saved", "saved");
-  if (!options.silent) toast(body.importance ? `Importance set to ${body.importance}/${maxImportanceStars}` : "Importance cleared");
+  setMetadataSaveState(paperId, "Saving...", "saving");
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
+    const metadata = response.metadata || body;
+    if (paper) Object.assign(paper, body, metadata);
+    if (state.currentPaperId === paperId && state.payload?.metadata) {
+      Object.assign(state.payload.metadata, body, metadata);
+      renderPaperMeta();
+    }
+    if (fromLibrary && options.renderLibrary !== false) refreshLibraryRow(paperId);
+    setMetadataSaveState(paperId, "Saved", "saved");
+    if (!options.silent) toast(body.importance ? `Importance set to ${body.importance}/${maxImportanceStars}` : "Importance cleared");
+  } catch (error) {
+    restorePaperSnapshot(paper, previous);
+    if (previousMetadata && state.currentPaperId === paperId && state.payload?.metadata) {
+      restorePaperSnapshot(state.payload.metadata, previousMetadata);
+      renderPaperMeta();
+    }
+    if (fromLibrary && options.renderLibrary !== false) refreshLibraryRowOrRender(paperId);
+    setMetadataSaveState(paperId, "Save failed", "error");
+    throw error;
+  }
 }
 
 function bindImportanceStarEditors(root = document) {
@@ -8677,19 +8872,25 @@ function bindImportanceStarEditors(root = document) {
 async function savePaperProjects(paperId, projects, projectColors = null) {
   const nextProjects = uniqueTags(projects);
   captureLibraryScroll();
-  setMetadataSaveState(paperId, "Saving...", "saving");
   const body = { projects: nextProjects, project: nextProjects[0] || "" };
   if (projectColors) body.project_colors = projectColors;
-  const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
   const paper = state.library?.papers?.find(item => item.id === paperId);
-  if (paper) Object.assign(paper, { projects: nextProjects, project: nextProjects[0] || "", ...(projectColors ? { project_colors: projectColors } : {}) }, response.metadata || {});
-  if (shouldRenderWholeLibraryForMetadataChange("projects")) {
-    renderLibrary();
-    restoreLibraryScroll();
-  } else {
-    refreshLibraryProjectCell(paperId);
+  const previous = paperSnapshot(paper);
+  if (paper) Object.assign(paper, { projects: nextProjects, project: nextProjects[0] || "", ...(projectColors ? { project_colors: projectColors } : {}) });
+  refreshLibraryRowOrRender(paperId);
+  restoreLibraryScroll();
+  setMetadataSaveState(paperId, "Saving...", "saving");
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
+    if (paper) Object.assign(paper, { projects: nextProjects, project: nextProjects[0] || "", ...(projectColors ? { project_colors: projectColors } : {}) }, response.metadata || {});
+    refreshLibraryRow(paperId);
+    setMetadataSaveState(paperId, "Saved", "saved");
+  } catch (error) {
+    restorePaperSnapshot(paper, previous);
+    refreshLibraryRowOrRender(paperId);
+    setMetadataSaveState(paperId, "Save failed", "error");
+    throw error;
   }
-  setMetadataSaveState(paperId, "Saved", "saved");
 }
 
 async function addPaperProject(paperId, project, color = "") {
@@ -8822,59 +9023,146 @@ function renderLibraryPreservingScroll() {
   restoreLibraryScroll();
 }
 
+function libraryScoped(root, selector) {
+  return Array.from((root || document).querySelectorAll?.(selector) || []);
+}
+
+function bindLibraryRowEvents(root = document) {
+  libraryScoped(root, "[data-open-paper]").forEach(button => button.addEventListener("click", async () => {
+    await loadPaper(button.dataset.openPaper);
+    activateView("reader");
+  }));
+  libraryScoped(root, "[data-preview-paper]").forEach(button => button.addEventListener("click", () => openLibraryPreview(button.dataset.previewPaper)));
+  bindImportanceStarEditors(root);
+  libraryScoped(root, "[data-field]").forEach(field => {
+    const row = field.closest("[data-paper-row]");
+    const paperId = row?.dataset.paperRow;
+    if (!paperId) return;
+    const eventName = field.tagName === "SELECT" ? "change" : "input";
+    if (field.dataset.field === "read_status") {
+      field.addEventListener("change", () => {
+        field.className = `read-status-select read-status-${readStatusTone(field.value)}`;
+      });
+    }
+    field.addEventListener(eventName, () => scheduleMetadataSave(paperId));
+    field.addEventListener("blur", () => scheduleMetadataSave(paperId, 40));
+  });
+  libraryScoped(root, "[data-process-paper]").forEach(button => button.addEventListener("click", () => processPaper(button.dataset.processPaper, button.dataset.mode)));
+  libraryScoped(root, "[data-add-library-paper-to-mindmap]").forEach(button => button.addEventListener("click", async () => {
+    if (!state.mindmap) await loadMindmap(state.currentMindmapProject || "collaborative");
+    const category = window.prompt("Mindmap category path (use / for nested categories):", normalizeTagsInput(state.library?.papers?.find(item => item.id === button.dataset.addLibraryPaperToMindmap)?.tags || [])[0] || "Uncategorized");
+    const categoryPath = String(category || "").split(/[\\/]+/).map(item => item.trim()).filter(Boolean);
+    if (!categoryPath.length) return;
+    await addPaperToMindmap(button.dataset.addLibraryPaperToMindmap, { categoryPath, source: "library" });
+  }));
+  libraryScoped(root, "[data-translate-paper]").forEach(button => button.addEventListener("click", () => translatePaper(button.dataset.translatePaper)));
+  libraryScoped(root, "[data-refresh-citation]").forEach(button => button.addEventListener("click", () => refreshCitation(button.dataset.refreshCitation)));
+  libraryScoped(root, "[data-refresh-videos]").forEach(button => button.addEventListener("click", () => refreshVideos(button.dataset.refreshVideos)));
+  libraryScoped(root, "[data-add-video]").forEach(button => button.addEventListener("click", () => addVideoLink(button.dataset.addVideo)));
+  libraryScoped(root, "[data-video-input]").forEach(input => input.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addVideoLink(input.dataset.videoInput);
+    }
+  }));
+  libraryScoped(root, "[data-delete-video]").forEach(button => button.addEventListener("click", () => deleteVideoLink(button.dataset.deleteVideo, button.dataset.videoIndex)));
+  libraryScoped(root, "[data-delete-paper]").forEach(button => button.addEventListener("click", () => deletePaper(button.dataset.deletePaper)));
+  libraryScoped(root, "[data-attach-pdf]").forEach(button => button.addEventListener("click", () => {
+    document.querySelector(`[data-attach-pdf-input="${cssEscape(button.dataset.attachPdf)}"]`)?.click();
+  }));
+  libraryScoped(root, "[data-attach-pdf-input]").forEach(input => input.addEventListener("change", async () => {
+    const paperId = input.dataset.attachPdfInput;
+    try {
+      await uploadPdfFiles(input.files, paperId);
+    } catch (error) {
+      toast(`Attach failed: ${error.message}`);
+    } finally {
+      input.value = "";
+    }
+  }));
+  libraryScoped(root, "[data-open-tag-menu]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    const paperId = button.dataset.openTagMenu;
+    const previousPaperId = state.libraryTagMenuPaperId;
+    state.libraryTagMenuPaperId = previousPaperId === paperId ? "" : paperId;
+    state.libraryProjectMenuPaperId = "";
+    if (previousPaperId && previousPaperId !== paperId) refreshLibraryRow(previousPaperId);
+    refreshLibraryRowOrRender(paperId);
+  }));
+  libraryScoped(root, "[data-open-project-menu]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    const paperId = button.dataset.openProjectMenu;
+    const previousPaperId = state.libraryProjectMenuPaperId;
+    state.libraryProjectMenuPaperId = previousPaperId === paperId ? "" : paperId;
+    state.libraryTagMenuPaperId = "";
+    if (previousPaperId && previousPaperId !== paperId) refreshLibraryRow(previousPaperId);
+    refreshLibraryRowOrRender(paperId);
+  }));
+  libraryScoped(root, "[data-add-existing-tag]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    addPaperTag(button.dataset.paperId, button.dataset.addExistingTag, tagColor(button.dataset.addExistingTag));
+  }));
+  libraryScoped(root, "[data-add-custom-tag]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    addPaperTagFromInput(button.dataset.addCustomTag);
+  }));
+  libraryScoped(root, "[data-paper-tag-input]").forEach(input => input.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addPaperTagFromInput(input.dataset.paperTagInput);
+    }
+  }));
+  libraryScoped(root, "[data-remove-paper-tag]").forEach(button => button.addEventListener("click", () => removePaperTag(button.dataset.paperId, button.dataset.removePaperTag)));
+  libraryScoped(root, "[data-add-existing-project]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    addPaperProject(button.dataset.paperId, button.dataset.addExistingProject, projectColor(button.dataset.addExistingProject));
+  }));
+  libraryScoped(root, "[data-add-custom-project]").forEach(button => button.addEventListener("click", event => {
+    event.stopPropagation();
+    addPaperProjectFromInput(button.dataset.addCustomProject);
+  }));
+  libraryScoped(root, "[data-paper-project-input]").forEach(input => input.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addPaperProjectFromInput(input.dataset.paperProjectInput);
+    }
+  }));
+  libraryScoped(root, "[data-remove-paper-project]").forEach(button => button.addEventListener("click", () => removePaperProject(button.dataset.paperId, button.dataset.removePaperProject)));
+  initTagOptionFilters(root);
+}
+
+function refreshLibraryRow(paperId) {
+  const row = document.querySelector(`[data-paper-row="${cssEscape(paperId)}"]`);
+  const paper = state.library?.papers?.find(item => item.id === paperId);
+  if (!row || !paper) return false;
+  const wrapper = document.createElement("tbody");
+  wrapper.innerHTML = libraryRowHtml(paper).trim();
+  const nextRow = wrapper.querySelector("[data-paper-row]");
+  if (!nextRow) return false;
+  row.replaceWith(nextRow);
+  bindLibraryRowEvents(nextRow);
+  return true;
+}
+
+function refreshLibraryRowOrRender(paperId) {
+  if (!refreshLibraryRow(paperId)) renderLibraryPreservingScroll();
+}
+
+function paperSnapshot(paper) {
+  return paper ? JSON.parse(JSON.stringify(paper)) : null;
+}
+
+function restorePaperSnapshot(paper, snapshot) {
+  if (!paper || !snapshot) return;
+  for (const key of Object.keys(paper)) delete paper[key];
+  Object.assign(paper, snapshot);
+}
+
 function closeLibraryTagMenus(options = {}) {
   if (!state.libraryTagMenuPaperId && !state.libraryProjectMenuPaperId) return;
-  const tagPaperId = state.libraryTagMenuPaperId;
-  const projectPaperId = state.libraryProjectMenuPaperId;
   state.libraryTagMenuPaperId = "";
   state.libraryProjectMenuPaperId = "";
-  if (options.render !== false) {
-    refreshLibraryTagCell(tagPaperId);
-    refreshLibraryProjectCell(projectPaperId);
-  }
-}
-
-function shouldRenderWholeLibraryForMetadataChange(kind) {
-  if (String(state.libraryFilter || "").trim()) return true;
-  if (kind === "tags") return state.libraryGroup === "tags";
-  if (kind === "projects") return state.libraryProject !== "all" || state.libraryView !== "all" || state.libraryGroup === "project" || state.librarySort === "project";
-  if (kind === "importance") return state.libraryGroup === "importance" || state.librarySort === "importance";
-  return false;
-}
-
-function libraryPaperById(paperId) {
-  return (state.library?.papers || []).find(item => item.id === paperId) || null;
-}
-
-function refreshLibraryTagCell(paperId) {
-  if (!paperId) return;
-  const paper = libraryPaperById(paperId);
-  const cell = document.querySelector(`[data-paper-row="${cssEscape(paperId)}"] .library-tag-cell`);
-  if (!paper || !cell) return;
-  cell.innerHTML = libraryTagEditorHtml(paper);
-  bindLibraryTagCellEvents(cell);
-}
-
-function refreshLibraryProjectCell(paperId) {
-  if (!paperId) return;
-  const paper = libraryPaperById(paperId);
-  const cell = document.querySelector(`[data-paper-row="${cssEscape(paperId)}"] .library-project-cell`);
-  if (!paper || !cell) return;
-  cell.innerHTML = libraryProjectEditorHtml(paper);
-  bindLibraryProjectCellEvents(cell);
-}
-
-function refreshLibraryImportanceCells(paperId) {
-  if (!paperId) return;
-  const paper = libraryPaperById(paperId);
-  const row = document.querySelector(`[data-paper-row="${cssEscape(paperId)}"]`);
-  if (!paper || !row) return;
-  const importanceCell = row.querySelector(".library-importance-cell");
-  if (importanceCell) importanceCell.innerHTML = libraryImportanceEditorHtml(paper);
-  const titleCell = row.querySelector(".library-title-cell");
-  if (titleCell) titleCell.innerHTML = libraryTitleCellHtml(paper);
-  bindImportanceStarEditors(row);
-  bindLibraryTitleActionEvents(row);
+  if (options.render !== false) renderLibraryPreservingScroll();
 }
 
 function sourceParentPaper(paper) {
@@ -8908,8 +9196,7 @@ function libraryCellInput(field, value, label, extraClass = "") {
 
 function libraryTitleCellHtml(paper) {
   const title = paperTitle(paper);
-  const showPreviewThumb = state.libraryPreviewThumbnailsVisible && paperPreviewImage(paper);
-  return `<div class="library-title-cell-layout ${showPreviewThumb ? "has-preview" : ""}">
+  return `<div class="library-title-cell-layout ${state.libraryPreviewThumbnailsVisible && paperPreviewImage(paper) ? "has-preview" : ""}">
     ${libraryPreviewThumbHtml(paper)}
     <div class="library-title-stack ${state.libraryTitlesCollapsed ? "collapsed" : "expanded"}">
       <textarea class="library-cell-input library-title-input" data-field="title" aria-label="Title" rows="${state.libraryTitlesCollapsed ? 1 : 4}">${escapeHtml(title)}</textarea>
@@ -9148,12 +9435,18 @@ function libraryRowsHtml(papers) {
   let currentGroup = null;
   for (const paper of papers) {
     const group = libraryGroupLabel(paper);
-    const readStatus = paper.read_status || "unread";
     if (state.libraryGroup !== "none" && group !== currentGroup) {
       currentGroup = group;
       rows.push(`<tr class="library-group-row"><td colspan="${libraryColumns.length}">${escapeHtml(group)}</td></tr>`);
     }
-    rows.push(`
+    rows.push(libraryRowHtml(paper));
+  }
+  return rows.join("");
+}
+
+function libraryRowHtml(paper) {
+  const readStatus = paper.read_status || "unread";
+  return `
       <tr data-paper-row="${escapeHtml(paper.id)}">
         <td class="library-title-cell">${libraryTitleCellHtml(paper)}</td>
         <td class="library-project-cell">${libraryProjectEditorHtml(paper)}</td>
@@ -9182,14 +9475,13 @@ function libraryRowsHtml(papers) {
             <button class="danger-button" data-delete-paper="${escapeHtml(paper.id)}">Delete</button>
           </div>
         </td>
-      </tr>`);
-  }
-  return rows.join("");
+      </tr>`;
 }
 
 function renderLibrary() {
   const root = qs("#libraryRoot");
   const papers = state.library?.papers || [];
+  renderLibraryIntakePickers();
   const projects = allLibraryProjects();
   if (state.libraryProject !== "all" && !projects.includes(state.libraryProject) && state.libraryProject !== "Unassigned") {
     state.libraryProject = "all";
@@ -9219,7 +9511,7 @@ function renderLibrary() {
       </select></label>
       <button class="secondary-button mini-button" id="resetLibraryColumns" type="button">Reset columns</button>
       <button class="secondary-button mini-button" id="toggleLibraryTitles" type="button">${state.libraryTitlesCollapsed ? "Show full titles" : "Collapse titles"}</button>
-      <button class="secondary-button mini-button" id="toggleLibraryPreviewThumbs" type="button">${state.libraryPreviewThumbnailsVisible ? "Hide thumbnails" : "Show thumbnails"}</button>
+      <button class="secondary-button mini-button library-preview-toggle ${state.libraryPreviewThumbnailsVisible ? "active" : ""}" id="toggleLibraryPreviewThumbs" type="button" aria-pressed="${state.libraryPreviewThumbnailsVisible ? "true" : "false"}">${state.libraryPreviewThumbnailsVisible ? "Hide previews" : "Show previews"}</button>
     </div>
     <div class="library-view-summary">${escapeHtml(visiblePapers.length)} of ${escapeHtml(papers.length)} papers${state.libraryProject !== "all" ? ` · ${escapeHtml(state.libraryProject)}` : ""}</div>
     ${visiblePapers.length ? `
@@ -9267,59 +9559,10 @@ function renderLibrary() {
   qs("#toggleLibraryPreviewThumbs")?.addEventListener("click", () => {
     state.libraryPreviewThumbnailsVisible = !state.libraryPreviewThumbnailsVisible;
     localStorage.setItem(libraryPreviewThumbsStorageKey, state.libraryPreviewThumbnailsVisible ? "1" : "0");
-    renderLibrary();
+    renderLibraryPreservingScroll();
   });
   initLibraryColumnResize();
-  bindLibraryTitleActionEvents(root);
-  bindImportanceStarEditors(root);
-  qsa("[data-paper-row] [data-field]").forEach(field => {
-    const row = field.closest("[data-paper-row]");
-    const paperId = row?.dataset.paperRow;
-    if (!paperId) return;
-    const eventName = field.tagName === "SELECT" ? "change" : "input";
-    if (field.dataset.field === "read_status") {
-      field.addEventListener("change", () => {
-        field.className = `read-status-select read-status-${readStatusTone(field.value)}`;
-      });
-    }
-    field.addEventListener(eventName, () => scheduleMetadataSave(paperId));
-    field.addEventListener("blur", () => scheduleMetadataSave(paperId, 40));
-  });
-  qsa("[data-process-paper]").forEach(button => button.addEventListener("click", () => processPaper(button.dataset.processPaper, button.dataset.mode)));
-  qsa("[data-add-library-paper-to-mindmap]").forEach(button => button.addEventListener("click", async () => {
-    if (!state.mindmap) await loadMindmap(state.currentMindmapProject || "collaborative");
-    const category = window.prompt("Mindmap category path (use / for nested categories):", normalizeTagsInput(state.library?.papers?.find(item => item.id === button.dataset.addLibraryPaperToMindmap)?.tags || [])[0] || "Uncategorized");
-    const categoryPath = String(category || "").split(/[\\/]+/).map(item => item.trim()).filter(Boolean);
-    if (!categoryPath.length) return;
-    await addPaperToMindmap(button.dataset.addLibraryPaperToMindmap, { categoryPath, source: "library" });
-  }));
-  qsa("[data-translate-paper]").forEach(button => button.addEventListener("click", () => translatePaper(button.dataset.translatePaper)));
-  qsa("[data-refresh-citation]").forEach(button => button.addEventListener("click", () => refreshCitation(button.dataset.refreshCitation)));
-  qsa("[data-refresh-videos]").forEach(button => button.addEventListener("click", () => refreshVideos(button.dataset.refreshVideos)));
-  qsa("[data-add-video]").forEach(button => button.addEventListener("click", () => addVideoLink(button.dataset.addVideo)));
-  qsa("[data-video-input]").forEach(input => input.addEventListener("keydown", event => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addVideoLink(input.dataset.videoInput);
-    }
-  }));
-  qsa("[data-delete-video]").forEach(button => button.addEventListener("click", () => deleteVideoLink(button.dataset.deleteVideo, button.dataset.videoIndex)));
-  qsa("[data-delete-paper]").forEach(button => button.addEventListener("click", () => deletePaper(button.dataset.deletePaper)));
-  qsa("[data-attach-pdf]").forEach(button => button.addEventListener("click", () => {
-    document.querySelector(`[data-attach-pdf-input="${cssEscape(button.dataset.attachPdf)}"]`)?.click();
-  }));
-  qsa("[data-attach-pdf-input]").forEach(input => input.addEventListener("change", async () => {
-    const paperId = input.dataset.attachPdfInput;
-    try {
-      await uploadPdfFiles(input.files, paperId);
-    } catch (error) {
-      toast(`Attach failed: ${error.message}`);
-    } finally {
-      input.value = "";
-    }
-  }));
-  bindLibraryTagCellEvents(root);
-  bindLibraryProjectCellEvents(root);
+  bindLibraryRowEvents(root);
 }
 
 function createLibraryProjectView() {
@@ -9365,6 +9608,7 @@ async function saveMetadataRow(paperId, options = {}) {
   const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(data) });
   const paper = state.library?.papers?.find(item => item.id === paperId);
   if (paper) Object.assign(paper, data, response.metadata || {});
+  if (state.currentPaperId === paperId && state.payload?.metadata) Object.assign(state.payload.metadata, data, response.metadata || {});
   setMetadataSaveState(paperId, "Saved", "saved");
   if (!options.silent) toast("Metadata saved");
 }
@@ -9559,6 +9803,20 @@ function bindEvents() {
     renderSensemakingPanel();
   }));
   qs("#addPaperButton")?.addEventListener("click", addPaperFromForm);
+  document.addEventListener("click", event => {
+    handleLibraryIntakeClick(event);
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key !== "Enter") return;
+    if (event.target?.id === "libraryIntakeProjectCustom") {
+      event.preventDefault();
+      addLibraryIntakeProjectFromInput();
+    }
+    if (event.target?.id === "libraryIntakeTagCustom") {
+      event.preventDefault();
+      addLibraryIntakeTagFromInput();
+    }
+  });
   qs("#choosePdfFiles")?.addEventListener("click", () => qs("#pdfFilePicker")?.click());
   qs("#pdfFilePicker")?.addEventListener("change", async event => {
     try {

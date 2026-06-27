@@ -2282,10 +2282,14 @@ mark.focus-flash {
 
 .library-intake {
   display: grid;
-  grid-template-columns: minmax(260px, 1.5fr) minmax(180px, 0.9fr) minmax(180px, 0.9fr) auto;
-  gap: 8px;
+  gap: 10px;
   max-width: 1180px;
   margin: 0 0 18px;
+}
+.library-intake-main {
+  display: grid;
+  grid-template-columns: minmax(260px, 1.5fr) minmax(180px, 0.9fr) auto;
+  gap: 8px;
 }
 .library-intake input {
   min-width: 0;
@@ -2294,6 +2298,53 @@ mark.focus-flash {
   background: #fff;
   color: var(--ink);
   padding: 9px 10px;
+}
+.library-intake-pickers {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.library-intake-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 10px;
+}
+.library-intake-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 760;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.library-intake-selected {
+  min-height: 28px;
+  align-items: center;
+}
+.library-intake-option-panel { min-width: 0; }
+.library-intake-option-list {
+  display: grid;
+  gap: 2px;
+  max-height: 128px;
+  overflow: auto;
+}
+.library-intake-option-list .library-tag-option.active {
+  background: #e9f2ef;
+  color: var(--accent-strong);
+  font-weight: 680;
+}
+.library-intake-custom-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: center;
 }
 .library-drop-zone {
   display: flex;
@@ -2478,6 +2529,11 @@ mark.focus-flash {
 }
 .library-new-project-view {
   border-style: dashed;
+  color: var(--accent-strong);
+}
+.library-preview-toggle.active {
+  border-color: #9fc5bb;
+  background: #e9f2ef;
   color: var(--accent-strong);
 }
 .library-root { overflow-x: auto; }

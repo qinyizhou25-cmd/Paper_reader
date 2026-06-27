@@ -50,6 +50,14 @@ button.primary {
   color: #fff;
   font-weight: 700;
 }
+button.primary.success {
+  border-color: #2f7d4f;
+  background: #2f7d4f;
+}
+button.primary.success:disabled {
+  cursor: default;
+  opacity: 1;
+}
 .app-header {
   position: sticky;
   top: 0;
@@ -250,6 +258,9 @@ h1 {
   background: #fff;
   box-shadow: 0 12px 26px rgba(31, 37, 35, 0.12);
   padding: 6px;
+}
+.tag-options[hidden] {
+  display: none;
 }
 .tag-option {
   justify-content: flex-start;

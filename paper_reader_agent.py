@@ -43,6 +43,8 @@ WRITE_LOCKS: dict[Path, threading.Lock] = {}
 WRITE_LOCKS_GUARD = threading.Lock()
 EXPORT_TIMERS: dict[Path, threading.Timer] = {}
 EXPORT_TIMERS_GUARD = threading.Lock()
+BACKGROUND_PROCESSING_TASKS: set[str] = set()
+BACKGROUND_PROCESSING_LOCK = threading.Lock()
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 ENV_FILES_LOADED = False
 
@@ -165,17 +167,19 @@ Output JSON schema:
     ]
 }"""
 
-EXPLANATION_PROMPT = """Analyze the paper according to the file I provide, and output the analysis of the paper as per my requirements. Do NOT output anything other than what I ask for. Analyze it point by point in markdown format. Make the summary content into structured bulletpoints. Use abbreviation if needed.
-
-Your output format:
-# 摘要：
-Locate the position of the abstract in the article and output it.
-# 研究问题：
-Locate the position of the research question in the article and output it. If not found, summarize it by yourself.
-# 解读：
-Explain the paper in a vivid and understandable way, can be fluid structured based on the paper framing. This should be as specific as possible and relatively long. Try to use simple and understandable language.
-
-Reminder: you MUST finish the summary in one response. Do NOT make a not-finished response. 中文去写。"""
+EXPLANATION_PROMPT = """Analyze the paper according to the file I provide, and output the analysis of the paper as per my requirements. Do NOT output anything other than what I ask for. Analyze it point by point（in to markdown format).Make the summary content into structured bulletpoints. Use abbreviation if needed. 
+Your output format: 
+# Title: The full title of the paper
+# Author: The author's name in the paper 
+# Institution: List all the insitutions. Use abbreviations if the institutions are very familiar, for example: UW, CMU 
+# Journal: The journal to which the paper belongs. Use abbreviations uniformly, for example: CHI, UIST, IEEE, arxiv 
+# Publication Year: Only take the year number. For example: 2024 
+# Abstract: Locate the position of the abstract in the article and output it. 
+# Research Question: Locate the position of the research question in the article and output it. If not found, summarize it by yourself. 
+#  Explain the paper in a vivid and understandable way, can be fluid structured based on the paper framing. 
+This should be as specific as possible and relatively long. (Try to use simple and understandable language).
+# Reminder: you MUST finish the summary in one response. do NOT make the not-finished response.
+# language:中文，除了专有名词是英文"""
 
 PROCESSING_MODE_LABELS = {
     "library-only": "未处理",
@@ -184,7 +188,7 @@ PROCESSING_MODE_LABELS = {
     "reference-card": "参考文献卡片",
 }
 
-DEFAULT_PDF_LIBRARY_PATH = "~/Downloads"
+DEFAULT_PDF_LIBRARY_PATH = "E:\\论文库\\"
 PAPER_BRIEF_BLOCK_ID = "paper-brief"
 DEFAULT_CHROME_BRIEF_PROMPT_ID = "chrome-paper-brief-v1"
 CANONICAL_PROJECTS = ["collaborative", "memories"]
@@ -390,6 +394,9 @@ def find_config(start: Path) -> Path | None:
 def resolve_workspace(workspace_arg: str | None, start: Path | None = None) -> Path:
     if workspace_arg:
         return Path(workspace_arg).expanduser().resolve()
+    configured_workspace = env_value("PAPER_READER_WORKSPACE")
+    if configured_workspace:
+        return Path(configured_workspace).expanduser().resolve()
     start = start or Path.cwd()
     config_path = find_config(start)
     if config_path:
@@ -838,14 +845,20 @@ def find_duplicate_paper_by_title(workspace: Path, title: Any, exclude_paper_id:
     title_key = normalize_title_key(title)
     if not title_key_is_usable(title_key):
         return None
-    library = load_library(workspace)
+    library = load_library_raw(workspace)
     for paper in library.get("papers", []):
         paper_id = str(paper.get("id") or "")
         if exclude_paper_id and paper_id == exclude_paper_id:
             continue
         paper_dir = workspace / paper.get("paper_dir", "")
-        metadata = read_json(paper_dir / "metadata.json", {}) if paper_dir.exists() else {}
-        existing_key = str(metadata.get("title_key") or paper.get("title_key") or normalize_title_key(metadata.get("title") or paper.get("title") or ""))
+        metadata = {}
+        existing_key = str(paper.get("title_key") or "")
+        if not existing_key:
+            existing_title = paper.get("title") or ""
+            existing_key = normalize_title_key(existing_title) if existing_title else ""
+        if not existing_key and paper_dir.exists():
+            metadata = read_json(paper_dir / "metadata.json", {})
+            existing_key = str(metadata.get("title_key") or normalize_title_key(metadata.get("title") or ""))
         if existing_key and existing_key == title_key:
             return paper
     return None
@@ -1089,7 +1102,7 @@ def update_reading_progress(workspace: Path, paper_id: str, paper_dir: Path, dat
     metadata["reading_progress_updated_at"] = progress.get("updated_at") or now_iso()
     metadata["updated_at"] = now_iso()
     write_json(paper_dir / "metadata.json", metadata)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
     return progress, metadata
 
 
@@ -1108,107 +1121,20 @@ def ollama_generate(prompt: str, model: str, host: str) -> str:
     return str(data.get("response") or "").strip()
 
 
-def siliconflow_api_key() -> str:
-    return env_value("PAPER_READER_SILICONFLOW_API_KEY", "SILICONFLOW_API_KEY")
-
-
-def siliconflow_base_url() -> str:
-    return env_value("PAPER_READER_SILICONFLOW_BASE_URL", "SILICONFLOW_BASE_URL", default="https://api.siliconflow.com/v1")
-
-
-def paper_reader_llm_model() -> str:
-    return env_value("PAPER_READER_LLM_MODEL", default="deepseek-ai/DeepSeek-V4-Pro")
-
-
 def cloud_llm_enabled() -> bool:
-    provider = env_value("PAPER_READER_LLM_PROVIDER", default="siliconflow" if siliconflow_api_key() else "local").strip().lower()
-    return provider in {"siliconflow", "deepseek", "cloud"} and bool(siliconflow_api_key())
+    return bool(kimi_api_key())
 
 
 def llm_backend_label() -> str:
     if cloud_llm_enabled():
-        return f"siliconflow:{paper_reader_llm_model()}"
+        return f"kimi:{kimi_model()}"
     return env_value("PAPER_READER_TRANSLATION_MODEL", default="qwen2.5:7b-instruct")
 
 
-def siliconflow_chat(messages: list[dict[str, str]], *, max_tokens: int = 4096, temperature: float = 0.2) -> str:
-    api_key = siliconflow_api_key()
-    if not api_key:
-        raise RuntimeError("SiliconFlow API key is not configured. Set SILICONFLOW_API_KEY or PAPER_READER_SILICONFLOW_API_KEY.")
-    payload = json.dumps(
-        {
-            "model": paper_reader_llm_model(),
-            "messages": messages,
-            "stream": False,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    endpoint = urllib.parse.urljoin(siliconflow_base_url().rstrip("/") + "/", "chat/completions")
-    request = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "paper-reader-agent/0.1",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=240) as response:  # noqa: S310 - user-configured cloud LLM endpoint
-        data = json.loads(response.read().decode("utf-8"))
-    choices = data.get("choices") or []
-    content = ((choices[0] or {}).get("message") or {}).get("content") if choices else ""
-    if not content:
-        raise RuntimeError(f"SiliconFlow returned no content: {data}")
-    return str(content).strip()
-
-
-def deepseek_api_key() -> str:
-    return env_value("PAPER_READER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY")
-
-
-def deepseek_base_url() -> str:
-    return env_value("PAPER_READER_DEEPSEEK_BASE_URL", "DEEPSEEK_BASE_URL", default="https://api.deepseek.com/v1")
-
-
-def deepseek_model() -> str:
-    return env_value("PAPER_READER_DEEPSEEK_MODEL", "DEEPSEEK_MODEL", default="deepseek-chat")
-
-
-def deepseek_chat(messages: list[dict[str, str]], *, max_tokens: int = 4096, temperature: float = 0.2) -> str:
-    api_key = deepseek_api_key()
-    if not api_key:
-        raise RuntimeError("DeepSeek API key is not configured. Set PAPER_READER_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.")
-    payload = json.dumps(
-        {
-            "model": deepseek_model(),
-            "messages": messages,
-            "stream": False,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        },
-        ensure_ascii=False,
-    ).encode("utf-8")
-    endpoint = urllib.parse.urljoin(deepseek_base_url().rstrip("/") + "/", "chat/completions")
-    request = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "paper-reader-agent/0.1",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=240) as response:  # noqa: S310 - user-configured DeepSeek-compatible endpoint
-        data = json.loads(response.read().decode("utf-8"))
-    choices = data.get("choices") or []
-    content = ((choices[0] or {}).get("message") or {}).get("content") if choices else ""
-    if not content:
-        raise RuntimeError(f"DeepSeek returned no content: {data}")
-    return str(content).strip()
+def agent_chat(messages: list[dict[str, str]], *, max_tokens: int = 4096, temperature: float = 0.2) -> tuple[str, str]:
+    if not kimi_api_key():
+        raise RuntimeError("Kimi API key is not configured. Set PAPER_READER_KIMI_API_KEY or MOONSHOT_API_KEY and restart the app.")
+    return kimi_chat(messages, max_tokens=max_tokens, temperature=temperature), f"kimi:{kimi_model()}"
 
 
 def http_error_summary(exc: urllib.error.HTTPError) -> str:
@@ -1221,41 +1147,6 @@ def http_error_summary(exc: urllib.error.HTTPError) -> str:
     if body:
         summary += f": {body[:700]}"
     return summary
-
-
-def agent_chat(messages: list[dict[str, str]], *, max_tokens: int = 4096, temperature: float = 0.2) -> tuple[str, str]:
-    default_provider = "kimi" if kimi_api_key() else "siliconflow" if siliconflow_api_key() else "deepseek"
-    provider = env_value("PAPER_READER_LLM_PROVIDER", default=default_provider).strip().lower()
-    if provider in {"kimi", "moonshot"}:
-        if not kimi_api_key():
-            raise RuntimeError("Kimi API key is not configured. Set PAPER_READER_KIMI_API_KEY or MOONSHOT_API_KEY.")
-        return kimi_chat(messages, max_tokens=max_tokens, temperature=temperature), f"kimi:{kimi_model()}"
-    if provider == "deepseek":
-        if not deepseek_api_key():
-            raise RuntimeError("DeepSeek API key is not configured. Set PAPER_READER_DEEPSEEK_API_KEY or DEEPSEEK_API_KEY.")
-        return deepseek_chat(messages, max_tokens=max_tokens, temperature=temperature), f"deepseek:{deepseek_model()}"
-    if provider in {"siliconflow", "cloud"} and siliconflow_api_key():
-        try:
-            return siliconflow_chat(messages, max_tokens=max_tokens, temperature=temperature), f"siliconflow:{paper_reader_llm_model()}"
-        except urllib.error.HTTPError as exc:
-            siliconflow_error = http_error_summary(exc)
-            if kimi_api_key():
-                try:
-                    return kimi_chat(messages, max_tokens=max_tokens, temperature=temperature), f"kimi:{kimi_model()} (fallback from siliconflow {siliconflow_error})"
-                except Exception as kimi_exc:  # noqa: BLE001
-                    if not deepseek_api_key():
-                        raise RuntimeError(f"SiliconFlow failed ({siliconflow_error}); Kimi fallback also failed: {kimi_exc}; no DeepSeek fallback key is configured.") from kimi_exc
-            if deepseek_api_key():
-                try:
-                    return deepseek_chat(messages, max_tokens=max_tokens, temperature=temperature), f"deepseek:{deepseek_model()} (fallback from siliconflow {siliconflow_error})"
-                except Exception as deepseek_exc:  # noqa: BLE001
-                    raise RuntimeError(f"SiliconFlow failed ({siliconflow_error}); DeepSeek fallback also failed: {deepseek_exc}") from deepseek_exc
-            raise RuntimeError(f"SiliconFlow failed ({siliconflow_error}); no Kimi or DeepSeek fallback key is configured.") from exc
-    if kimi_api_key():
-        return kimi_chat(messages, max_tokens=max_tokens, temperature=temperature), f"kimi:{kimi_model()}"
-    if deepseek_api_key():
-        return deepseek_chat(messages, max_tokens=max_tokens, temperature=temperature), f"deepseek:{deepseek_model()}"
-    raise RuntimeError("No chat API key is configured. Set PAPER_READER_KIMI_API_KEY/MOONSHOT_API_KEY for Kimi, SILICONFLOW_API_KEY/PAPER_READER_SILICONFLOW_API_KEY for SiliconFlow, or DEEPSEEK_API_KEY/PAPER_READER_DEEPSEEK_API_KEY for direct DeepSeek.")
 
 
 def kimi_api_key() -> str:
@@ -1383,7 +1274,7 @@ def translate_text_cloud(text: str) -> str:
     clean = str(text or "").strip()
     if not clean:
         return ""
-    return siliconflow_chat(
+    return kimi_chat(
         [
             {
                 "role": "system",
@@ -1557,25 +1448,7 @@ def candidate_dir(workspace: Path, candidate_id: str) -> Path:
 
 
 def default_chrome_paper_brief_prompt() -> str:
-    return """你是 HCI/AI 学术论文阅读助手。请基于 PDF 抽取文本生成用于快速筛选的中文 Paper Brief。
-不要编造原文没有的信息；无法确定的信息写“原文未明确说明”。
-
-输出结构：
-# Author:
-# Institution:
-# Journal:
-# Publication Year:
-# Abstract:
-# Research Question:
-# Explain the paper in a vivid and understandable way, can be fluid structured based on the paper framing.
-
-Explain 部分请额外包含：
-- 这篇论文真正关心的问题
-- 它可能与我的研究有什么关系
-- 哪些部分值得下一步细读
-- 哪些证据/方法/图表可能值得标注
-- 是否建议入库：值得 / 暂缓 / 不建议，并说明理由
-""".strip()
+    return EXPLANATION_PROMPT.strip()
 
 
 def chrome_brief_prompt(workspace: Path, override: str = "") -> str:
@@ -1589,13 +1462,188 @@ def chrome_brief_prompt(workspace: Path, override: str = "") -> str:
     return default_chrome_paper_brief_prompt()
 
 
+def clean_paper_brief_title(value: Any) -> str:
+    title = html.unescape(str(value or "")).strip()
+    title = re.sub(r"^\s{0,3}#{1,6}\s*", "", title).strip()
+    title = re.sub(r"^[-*]\s+", "", title).strip()
+    title = re.sub(r"^\*\*(.+)\*\*$", r"\1", title).strip()
+    title = re.sub(r"^(?:Title|Paper Title|论文标题|题名|标题)\s*[:：\-]\s*", "", title, flags=re.I).strip()
+    title = title.strip(" \t\r\n\"'`*_[]()（）【】")
+    title = re.sub(r":(?=[A-Z])", ": ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    if not title:
+        return ""
+    lowered = title.casefold()
+    if any(marker in lowered for marker in {"原文未明确", "not specified", "not provided", "unknown", "n/a"}):
+        return ""
+    if re.fullmatch(r"(?:doi\s*[:：]?\s*)?10\.\d{4,9}/\S+", title, flags=re.I):
+        return ""
+    if re.fullmatch(r"\d{4}\.\d{4,5}(?:v\d+)?", title, flags=re.I):
+        return ""
+    if re.fullmatch(r"[\d._\-/]+", title):
+        return ""
+    return title if title_key_is_usable(normalize_title_key(title)) else ""
+
+
+def extract_title_from_paper_brief(brief: str) -> str:
+    for line in str(brief or "").replace("\r\n", "\n").split("\n")[:80]:
+        text = line.strip()
+        if not text or text.startswith("```"):
+            continue
+        labelled = re.match(r"^\s{0,3}#{0,6}\s*(?:[-*]\s*)?(?:\*\*)?(?:Title|Paper Title|论文标题|题名|标题)(?:\*\*)?\s*[:：\-]\s*(.+)$", text, flags=re.I)
+        if labelled:
+            title = clean_paper_brief_title(labelled.group(1))
+            if title:
+                return title
+    return ""
+
+
+def unwrap_kimi_extract_prefix(text: str) -> str:
+    raw_text = str(text or "")
+    stripped = raw_text.lstrip()
+    if not stripped.startswith("{"):
+        return raw_text
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict) and isinstance(parsed.get("content"), str):
+            return parsed["content"]
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r'"content"\s*:\s*"', stripped)
+    if not match:
+        return raw_text
+    escaped = stripped[match.end():]
+    chars: list[str] = []
+    escaping = False
+    for char in escaped:
+        if escaping:
+            chars.append(char)
+            escaping = False
+            continue
+        if char == "\\":
+            chars.append(char)
+            escaping = True
+            continue
+        if char == '"':
+            break
+        chars.append(char)
+    chunk = "".join(chars)
+    for trim in range(0, min(len(chunk), 32) + 1):
+        candidate = chunk[:len(chunk) - trim] if trim else chunk
+        try:
+            return json.loads(f'"{candidate}"')
+        except json.JSONDecodeError:
+            continue
+    return chunk.replace("\\n", "\n")
+
+
+def extract_title_from_pdf_extract(text: str) -> str:
+    raw_text = unwrap_kimi_extract_prefix(text)
+    for line in raw_text.replace("\r\n", "\n").split("\n")[:120]:
+        clean_line = re.sub(r"<[^>]+>", "", line).strip()
+        if not clean_line:
+            continue
+        line_key = normalize_title_key(clean_line)
+        if re.search(r"\barxiv\b|permission to reproduce|proper attribution", clean_line, flags=re.I):
+            continue
+        if line_key in {"abstract", "author", "authors", "introduction"}:
+            break
+        heading = re.match(r"^\s{0,3}#{1,3}\s+(.+)$", clean_line)
+        if heading:
+            title = clean_paper_brief_title(heading.group(1))
+            if title:
+                return title
+    return ""
+
+
+def candidate_title_should_update(candidate: dict[str, Any], title: str) -> bool:
+    if not title:
+        return False
+    if str(candidate.get("title_source") or "").strip() == "user":
+        return False
+    current = str(candidate.get("title") or "").strip()
+    if not current:
+        return True
+    if normalize_title_key(current) == normalize_title_key(title):
+        return False
+    return str(candidate.get("title_source") or "").strip() in {"", "filename", "candidate", "paper_brief", "pdf_extract"}
+
+
+def apply_candidate_title(candidate: dict[str, Any], title: str, source: str) -> dict[str, Any]:
+    if not title:
+        return candidate
+    if source == "paper_brief":
+        candidate["paper_brief_title"] = title
+    if source == "pdf_extract":
+        candidate["pdf_extract_title"] = title
+    if candidate_title_should_update(candidate, title):
+        candidate["title"] = title
+        candidate["title_source"] = source
+        candidate["title_key"] = normalize_title_key(title)
+    return candidate
+
+
+def metadata_title_should_update(metadata: dict[str, Any], title: str, source: str) -> bool:
+    if not title:
+        return False
+    if metadata.get("title_locked") or str(metadata.get("title_source") or "").strip() == "user":
+        return False
+    current = str(metadata.get("title") or "").strip()
+    if not current:
+        return True
+    if normalize_title_key(current) == normalize_title_key(title):
+        return False
+    current_source = str(metadata.get("title_source") or "").strip()
+    if source == "pdf_extract" and current_source == "paper_brief":
+        return False
+    replaceable_sources = {"", "filename", "library", "reference", "candidate", "pdf_extract"}
+    if source == "paper_brief":
+        replaceable_sources.add("paper_brief")
+    return current_source in replaceable_sources or should_replace_title(metadata, title)
+
+
+def apply_paper_brief_title_to_metadata(metadata: dict[str, Any], brief: str, extract_text: str = "") -> dict[str, Any]:
+    title = extract_title_from_paper_brief(brief)
+    source = "paper_brief" if title else "pdf_extract"
+    if not title:
+        title = extract_title_from_pdf_extract(extract_text)
+    if not title:
+        return metadata
+    if source == "paper_brief":
+        metadata["paper_brief_title"] = title
+    else:
+        metadata["pdf_extract_title"] = title
+    if metadata_title_should_update(metadata, title, source):
+        metadata["title"] = title
+        metadata["title_source"] = source
+        metadata["title_key"] = normalize_title_key(title)
+    return metadata
+
+
+def apply_paper_brief_title_to_candidate(candidate: dict[str, Any], brief: str, extract_text: str = "") -> dict[str, Any]:
+    title = extract_title_from_paper_brief(brief)
+    if title:
+        return apply_candidate_title(candidate, title, "paper_brief")
+    return apply_candidate_title(candidate, extract_title_from_pdf_extract(extract_text), "pdf_extract")
+
+
+def read_text_prefix(path: Path, limit: int = 12000) -> str:
+    if not path.exists():
+        return ""
+    with path.open("r", encoding="utf-8", errors="ignore") as handle:
+        return handle.read(limit)
+
+
 def read_candidate(workspace: Path, candidate_id: str) -> dict[str, Any]:
     path = candidate_dir(workspace, candidate_id) / "candidate.json"
     if not path.exists():
         raise FileNotFoundError(candidate_id)
     candidate = read_json(path, {})
     candidate.setdefault("id", safe_candidate_id(candidate_id))
-    candidate.setdefault("paper_brief", (candidate_dir(workspace, candidate_id) / "paper_brief.md").read_text(encoding="utf-8") if (candidate_dir(workspace, candidate_id) / "paper_brief.md").exists() else "")
+    brief = (candidate_dir(workspace, candidate_id) / "paper_brief.md").read_text(encoding="utf-8") if (candidate_dir(workspace, candidate_id) / "paper_brief.md").exists() else ""
+    candidate.setdefault("paper_brief", brief)
+    extract_text = read_text_prefix(candidate_dir(workspace, candidate_id) / "kimi_extract.txt")
+    apply_paper_brief_title_to_candidate(candidate, brief, extract_text)
     candidate.setdefault("annotations", read_json(candidate_dir(workspace, candidate_id) / "annotations.json", {"annotations": []}).get("annotations", []))
     return candidate
 
@@ -1797,6 +1845,7 @@ def generate_candidate_brief(workspace: Path, *, pdf_bytes: bytes, filename: str
         if not extracted_text.strip():
             raise RuntimeError("Kimi returned empty extracted text")
         write_text_atomic(extract_path, extracted_text)
+        apply_paper_brief_title_to_candidate(candidate, "", extracted_text)
         messages = [
             {"role": "system", "content": extracted_text[:180000]},
             {"role": "user", "content": prompt},
@@ -1805,6 +1854,7 @@ def generate_candidate_brief(workspace: Path, *, pdf_bytes: bytes, filename: str
         write_text_atomic(brief_path, brief)
         if not annotations_path.exists():
             write_json(annotations_path, {"annotations": []})
+        apply_paper_brief_title_to_candidate(candidate, brief)
         candidate.update(
             {
                 "brief_status": "ready",
@@ -1895,6 +1945,9 @@ def update_candidate_metadata(workspace: Path, candidate_id: str, data: dict[str
     for key in {"title", "decision", "read_status", "project"}:
         if key in data:
             candidate[key] = str(data.get(key) or "")
+            if key == "title":
+                candidate["title_source"] = "user"
+                candidate["title_key"] = normalize_title_key(candidate[key])
     if "tags" in data:
         candidate["tags"] = normalize_tag_paths(data.get("tags", []))
     if "importance" in data:
@@ -1904,15 +1957,63 @@ def update_candidate_metadata(workspace: Path, candidate_id: str, data: dict[str
     return saved
 
 
+def start_background_paper_processing(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *, mode: str = "deep", refresh_citations: bool = True, refresh_videos: bool = True) -> bool:
+    task_key = f"{workspace.resolve()}::{paper_id}::{mode}"
+    with BACKGROUND_PROCESSING_LOCK:
+        if task_key in BACKGROUND_PROCESSING_TASKS:
+            return False
+        BACKGROUND_PROCESSING_TASKS.add(task_key)
+
+    workspace = workspace.resolve()
+    paper_dir = paper_dir.resolve()
+    options = dict(options or {})
+
+    def worker() -> None:
+        try:
+            metadata = process_paper_skim(workspace, paper_id, paper_dir, options) if mode == "skim" else process_paper_deep(workspace, paper_id, paper_dir, options)
+            if refresh_citations:
+                try:
+                    metadata = refresh_paper_citations(workspace, paper_id, paper_dir)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Background citation lookup failed for {paper_id}: {exc}", file=sys.stderr)
+            if refresh_videos:
+                try:
+                    metadata = refresh_paper_videos(workspace, paper_id, paper_dir)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"Background video lookup failed for {paper_id}: {exc}", file=sys.stderr)
+            metadata.update({"processing_background": "done", "updated_at": now_iso()})
+            write_json(paper_dir / "metadata.json", metadata)
+            sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Background paper processing failed for {paper_id}: {exc}", file=sys.stderr)
+            metadata = read_json(paper_dir / "metadata.json", {})
+            metadata.update({"processing_status": "failed", "processing_error": str(exc), "processing_background": "failed", "updated_at": now_iso()})
+            write_json(paper_dir / "metadata.json", metadata)
+            sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+        finally:
+            with BACKGROUND_PROCESSING_LOCK:
+                BACKGROUND_PROCESSING_TASKS.discard(task_key)
+
+    timer = threading.Timer(0.5, worker)
+    timer.name = f"paper-reader-process-{paper_id}"
+    timer.daemon = True
+    timer.start()
+    return True
+
+
 def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[str, Any]) -> dict[str, Any]:
     candidate = read_candidate(workspace, candidate_id)
     path = candidate_dir(workspace, candidate_id)
     pdf_path = path / "original.pdf"
     if not pdf_path.exists():
         raise FileNotFoundError("Candidate PDF is missing")
+    brief = (path / "paper_brief.md").read_text(encoding="utf-8") if (path / "paper_brief.md").exists() else ""
+    extract_text = read_text_prefix(path / "kimi_extract.txt")
+    apply_paper_brief_title_to_candidate(candidate, brief, extract_text)
     tags = normalize_tag_paths(data.get("tags", candidate.get("tags", [])))
     duplicate_policy = str(data.get("duplicate_policy") or "ask")
-    result = register_paper_in_library(workspace, pdf_path, title=str(data.get("title") or candidate.get("title") or pdf_path.stem), tags=tags, duplicate_policy=duplicate_policy)
+    paper_title = str(data.get("title") or candidate.get("title") or pdf_path.stem)
+    result = register_paper_in_library(workspace, pdf_path, title=paper_title, tags=tags, duplicate_policy=duplicate_policy, pdf_digest=str(candidate.get("pdf_sha256") or ""), generate_pdf_preview=False, enrich_citation=False)
     if result.get("duplicate"):
         return {"ok": False, **result}
     paper_id = str(result.get("paper_id") or "")
@@ -1928,6 +2029,9 @@ def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[
             "source_url": candidate.get("source_url", ""),
             "source_page_url": candidate.get("source_page_url", ""),
             "source_candidate_id": candidate_id,
+            "title": paper_title,
+            "title_key": normalize_title_key(paper_title),
+            "title_source": candidate.get("title_source") or "candidate",
             "tags": tags,
             "read_status": str(data.get("read_status") or candidate.get("read_status") or "unread"),
             "status": str(data.get("read_status") or candidate.get("read_status") or "unread"),
@@ -1936,11 +2040,15 @@ def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[
             "project": projects[0] if projects else "",
             **importance_fields(data.get("importance", candidate.get("importance", ""))),
             "agent_analysis_status": "candidate_brief",
+            "processing_mode": "deep",
+            "reading_mode": "deep",
+            "processing_status": "processing",
+            "processing_background": "queued",
+            "processing_error": "",
             "updated_at": now_iso(),
         }
     )
     write_json(paper_dir / "metadata.json", metadata)
-    brief = (path / "paper_brief.md").read_text(encoding="utf-8") if (path / "paper_brief.md").exists() else ""
     thinking = load_thinking(paper_dir)
     if brief.strip():
         thinking["explain"] = {
@@ -1957,25 +2065,23 @@ def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[
         thinking["annotations"].append({**item, "id": f"{candidate_id}-{item['id']}", "block_id": PAPER_BRIEF_BLOCK_ID})
     cleaned_thinking = clean_thinking(thinking)
     write_json(paper_dir / "thinking.json", cleaned_thinking)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-    processing_error = ""
-    try:
-        metadata = process_paper_deep(workspace, paper_id, paper_dir, {})
-    except Exception as exc:  # noqa: BLE001
-        processing_error = str(exc)
-        metadata = read_json(paper_dir / "metadata.json", metadata)
-    metadata = refresh_paper_citations(workspace, paper_id, paper_dir)
-    metadata = refresh_paper_videos(workspace, paper_id, paper_dir)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    background_started = start_background_paper_processing(workspace, paper_id, paper_dir, {}, mode="deep")
     candidate.update({"decision": "saved", "saved_paper_id": paper_id, "updated_at": now_iso()})
     write_candidate(workspace, candidate)
-    return {"ok": True, "paper_id": paper_id, "metadata": read_json(paper_dir / "metadata.json", metadata), "processing_error": processing_error, "migrated_annotations": len(candidate_annotations.get("annotations", [])), "candidate": candidate_summary(candidate, workspace)}
+    return {"ok": True, "paper_id": paper_id, "metadata": read_json(paper_dir / "metadata.json", metadata), "processing_background": "started" if background_started else "already_running", "migrated_annotations": len(candidate_annotations.get("annotations", [])), "candidate": candidate_summary(candidate, workspace)}
 
 
-def load_library(workspace: Path) -> dict[str, Any]:
+def load_library_raw(workspace: Path) -> dict[str, Any]:
     ensure_workspace(workspace)
     library = read_json(workspace / "library.json", {"version": TOOL_VERSION, "papers": []})
     if "papers" not in library or not isinstance(library["papers"], list):
         library["papers"] = []
+    return library
+
+
+def load_library(workspace: Path) -> dict[str, Any]:
+    library = load_library_raw(workspace)
     for paper in library["papers"]:
         paper_dir = workspace / paper.get("paper_dir", "")
         metadata = normalized_metadata(paper_dir, read_json(paper_dir / "metadata.json", {})) if paper_dir.exists() else {}
@@ -2006,7 +2112,7 @@ def save_library(workspace: Path, library: dict[str, Any]) -> None:
 
 
 def upsert_paper_record(workspace: Path, record: dict[str, Any]) -> None:
-    library = load_library(workspace)
+    library = load_library_raw(workspace)
     papers = library["papers"]
     for index, existing in enumerate(papers):
         if existing.get("id") == record.get("id"):
@@ -2030,7 +2136,7 @@ def find_paper_record(workspace: Path, paper_id: str) -> dict[str, Any] | None:
 
 
 def remove_paper_record(workspace: Path, paper_id: str) -> bool:
-    library = load_library(workspace)
+    library = load_library_raw(workspace)
     papers = library.get("papers", [])
     next_papers = [paper for paper in papers if paper.get("id") != paper_id]
     if len(next_papers) == len(papers):
@@ -2085,6 +2191,12 @@ def sync_library_from_metadata(workspace: Path, paper_id: str, paper_dir: Path, 
             "translation_status": metadata.get("translation_status", "not_started"),
             "translation_error": metadata.get("translation_error", ""),
             "translation_backend": metadata.get("translation_backend", ""),
+            "agent_analysis_status": metadata.get("agent_analysis_status", ""),
+            "paper_brief_status": metadata.get("paper_brief_status", ""),
+            "paper_brief_error": metadata.get("paper_brief_error", ""),
+            "paper_brief_updated_at": metadata.get("paper_brief_updated_at", ""),
+            "paper_brief_title": metadata.get("paper_brief_title", ""),
+            "title_source": metadata.get("title_source", ""),
             "citation_count": metadata.get("citation_count", ""),
             "citation_error": metadata.get("citation_error", ""),
             "citation_source": metadata.get("citation_source", ""),
@@ -2819,14 +2931,11 @@ def compact_mm_note_subtree(node: ET.Element, max_parts: int = 5) -> str:
 
 
 def related_works_mm_path(workspace: Path) -> Path | None:
-    candidates: list[Path] = []
-    configured = env_value("PAPER_READER_RELATED_WORKS_MM")
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.extend([
+    candidates = [
         Path.cwd() / "06_references" / "Related works.mm",
         workspace.parent / "06_references" / "Related works.mm",
-    ])
+        Path(r"E:\MSRA_3\collaborative\06_references\Related works.mm"),
+    ]
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -3877,6 +3986,7 @@ def add_reference_to_library(workspace: Path, card: dict[str, Any], parent_paper
         "id": paper_id,
         "title": title,
         "title_key": normalize_title_key(title),
+        "title_source": "reference",
         "authors": card.get("authors", ""),
         "venue": card.get("venue", ""),
         "year": card.get("year", ""),
@@ -3893,6 +4003,7 @@ def add_reference_to_library(workspace: Path, card: dict[str, Any], parent_paper
         "importance": "",
         "tags": [str(tag).strip() for tag in (tags or []) if str(tag).strip()],
         "agent_analysis_status": "reference_card",
+        "paper_brief_status": "needs_pdf",
         "updated_at": now_iso(),
     }
     write_json(paper_dir / "metadata.json", metadata)
@@ -5126,7 +5237,7 @@ def build_cloud_skim_summary(metadata: dict[str, Any], segments: list[dict[str, 
         return ""
     try:
         outline = read_json(Path(metadata.get("_paper_dir", "")) / "outline.json", {"outline": []}).get("outline", []) if metadata.get("_paper_dir") else []
-        return siliconflow_chat(briefing_messages(metadata, segments, outline, source_name), max_tokens=7000, temperature=0.2).rstrip() + "\n"
+        return kimi_chat(briefing_messages(metadata, segments, outline, source_name), max_tokens=7000, temperature=0.2).rstrip() + "\n"
     except Exception as exc:  # noqa: BLE001
         print(f"Cloud skim summary failed, falling back to local summary: {exc}", file=sys.stderr)
         return ""
@@ -5297,7 +5408,7 @@ Outline: {outline_markdown(outline, limit=12) or 'unknown'}
 """,
             },
         ]
-        return siliconflow_chat(messages, max_tokens=7000, temperature=0.2).rstrip() + "\n"
+        return kimi_chat(messages, max_tokens=7000, temperature=0.2).rstrip() + "\n"
     except Exception as exc:  # noqa: BLE001
         print(f"Cloud paper explanation failed, falling back to local explanation: {exc}", file=sys.stderr)
         return ""
@@ -5327,6 +5438,10 @@ def update_paper_brief_from_pdf(workspace: Path, paper_dir: Path, metadata: dict
     thinking = load_thinking(paper_dir)
     current = str(thinking.get("explain", {}).get("content") or "")
     if not force and current.strip() and not looks_like_auto_explanation(current):
+        apply_paper_brief_title_to_metadata(metadata, current, read_text_prefix(paper_dir / "paper_brief_kimi_extract.txt"))
+        metadata.update({"paper_brief_status": metadata.get("paper_brief_status") or "ready", "agent_analysis_status": metadata.get("agent_analysis_status") or "paper_brief_ready", "updated_at": now_iso()})
+        write_json(paper_dir / "metadata.json", metadata)
+        sync_library_from_metadata(workspace, str(metadata.get("id") or paper_dir.name), paper_dir, metadata, generate_pdf_preview=False)
         return thinking
     prompt = chrome_brief_prompt(workspace)
     file_id = ""
@@ -5343,6 +5458,7 @@ def update_paper_brief_from_pdf(workspace: Path, paper_dir: Path, metadata: dict
             {"role": "user", "content": prompt},
         ]
         brief = kimi_chat(messages, max_tokens=7000, temperature=0.2).rstrip() + "\n"
+        apply_paper_brief_title_to_metadata(metadata, brief, extracted_text)
         if env_value("PAPER_READER_KIMI_DELETE_FILES", default="1").strip().lower() not in {"0", "false", "no"}:
             deleted = kimi_delete_file(file_id)
         thinking["explain"] = {
@@ -5366,6 +5482,7 @@ def update_paper_brief_from_pdf(workspace: Path, paper_dir: Path, metadata: dict
                 "paper_brief_kimi_file_deleted": deleted,
                 "paper_brief_error": "",
                 "paper_brief_updated_at": now_iso(),
+                "agent_analysis_status": "paper_brief_ready",
                 "updated_at": now_iso(),
             }
         )
@@ -5836,12 +5953,18 @@ def register_paper_in_library(
     paper_id: str | None = None,
     title: str | None = None,
     tags: list[str] | None = None,
+    projects: list[str] | None = None,
+    tag_colors: dict[str, str] | None = None,
+    project_colors: dict[str, str] | None = None,
     duplicate_policy: str = "ask",
     replace_paper_id: str | None = None,
+    pdf_digest: str | None = None,
+    generate_pdf_preview: bool = True,
+    enrich_citation: bool = True,
 ) -> dict[str, Any]:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
-    digest = file_hash(pdf_path, limit=None)[:12]
+    digest = str(pdf_digest or "").strip().lower()[:12] or file_hash(pdf_path, limit=None)[:12]
     candidate_title = title or pdf_path.stem
     duplicate = find_duplicate_paper_by_title(workspace, candidate_title, exclude_paper_id=paper_id)
     if duplicate and duplicate_policy != "replace":
@@ -5879,11 +6002,16 @@ def register_paper_in_library(
             "institutions": metadata.get("institutions", ""),
             "importance": metadata.get("importance", ""),
             "tags": tags if tags is not None else metadata.get("tags", []),
+            "projects": projects if projects is not None else metadata.get("projects", []),
+            "project": (projects[0] if projects else "") if projects is not None else metadata.get("project", ""),
+            "tag_colors": tag_colors if tag_colors is not None else metadata.get("tag_colors", {}),
+            "project_colors": project_colors if project_colors is not None else metadata.get("project_colors", {}),
             "agent_analysis_status": metadata.get("agent_analysis_status", "not_started"),
             "replacement_backup_dir": backup_dir or metadata.get("replacement_backup_dir", ""),
         }
     )
-    metadata = metadata_with_citation(metadata)
+    if enrich_citation:
+        metadata = metadata_with_citation(metadata)
     write_json(paper_dir / "metadata.json", metadata)
     if not (paper_dir / "segments.json").exists():
         write_json(paper_dir / "segments.json", [])
@@ -5893,7 +6021,7 @@ def register_paper_in_library(
         write_json(paper_dir / "annotations.json", {"annotations": []})
     if not (paper_dir / "reader.md").exists():
         write_text_atomic(paper_dir / "reader.md", f"# {metadata['title']}\n\nThis paper is in Library only. Choose 略读 or 精读 from the Library page.\n")
-    sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata)
+    sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata, generate_pdf_preview=generate_pdf_preview)
     return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir}
 
 
@@ -5904,8 +6032,13 @@ def register_uploaded_pdf(
     paper_id: str | None = None,
     title: str | None = None,
     tags: list[str] | None = None,
+    projects: list[str] | None = None,
+    tag_colors: dict[str, str] | None = None,
+    project_colors: dict[str, str] | None = None,
     duplicate_policy: str = "ask",
     replace_paper_id: str | None = None,
+    generate_pdf_preview: bool = True,
+    enrich_citation: bool = True,
 ) -> dict[str, Any]:
     if not content:
         raise ValueError(f"Empty PDF upload: {filename}")
@@ -5947,11 +6080,16 @@ def register_uploaded_pdf(
             "institutions": metadata.get("institutions", ""),
             "importance": metadata.get("importance", ""),
             "tags": tags if tags is not None else metadata.get("tags", []),
+            "projects": projects if projects is not None else metadata.get("projects", []),
+            "project": (projects[0] if projects else "") if projects is not None else metadata.get("project", ""),
+            "tag_colors": tag_colors if tag_colors is not None else metadata.get("tag_colors", {}),
+            "project_colors": project_colors if project_colors is not None else metadata.get("project_colors", {}),
             "agent_analysis_status": metadata.get("agent_analysis_status", "not_started"),
             "replacement_backup_dir": backup_dir or metadata.get("replacement_backup_dir", ""),
         }
     )
-    metadata = metadata_with_citation(metadata)
+    if enrich_citation:
+        metadata = metadata_with_citation(metadata)
     write_json(paper_dir / "metadata.json", metadata)
     if not (paper_dir / "segments.json").exists():
         write_json(paper_dir / "segments.json", [])
@@ -5961,7 +6099,7 @@ def register_uploaded_pdf(
         write_json(paper_dir / "annotations.json", {"annotations": []})
     if not (paper_dir / "reader.md").exists():
         write_text_atomic(paper_dir / "reader.md", f"# {metadata['title']}\n\nThis paper is in Library only. Choose 略读 or 精读 from the Library page.\n")
-    sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata)
+    sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata, generate_pdf_preview=generate_pdf_preview)
     return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir}
 
 
@@ -5969,6 +6107,9 @@ def register_metadata_only_paper(
     workspace: Path,
     title: str,
     tags: list[str] | None = None,
+    projects: list[str] | None = None,
+    tag_colors: dict[str, str] | None = None,
+    project_colors: dict[str, str] | None = None,
     paper_id: str | None = None,
     metadata_fields: dict[str, Any] | None = None,
     duplicate_policy: str = "ask",
@@ -6015,6 +6156,10 @@ def register_metadata_only_paper(
             "url": metadata_fields.get("url") or metadata.get("url", ""),
             "importance": metadata_fields.get("importance") or metadata.get("importance", ""),
             "tags": tags if tags is not None else metadata.get("tags", []),
+            "projects": projects if projects is not None else metadata.get("projects", []),
+            "project": (projects[0] if projects else "") if projects is not None else metadata.get("project", ""),
+            "tag_colors": tag_colors if tag_colors is not None else metadata.get("tag_colors", {}),
+            "project_colors": project_colors if project_colors is not None else metadata.get("project_colors", {}),
             "agent_analysis_status": "metadata_only",
             "replacement_backup_dir": backup_dir or metadata.get("replacement_backup_dir", ""),
         }
@@ -6204,6 +6349,45 @@ def process_paper_deep(workspace: Path, paper_id: str, paper_dir: Path, options:
     export_notes_and_annotated(paper_dir)
     sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
     return metadata
+
+
+def prepare_pdf_brief_then_background(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *, mode: str = "deep", refresh_citations: bool = True, refresh_videos: bool = True) -> dict[str, Any]:
+    metadata = read_json(paper_dir / "metadata.json", {})
+    source_name = str(metadata.get("source_pdf_name") or "original.pdf")
+    metadata.update(
+        {
+            "processing_mode": mode,
+            "reading_mode": mode,
+            "processing_status": "paper_brief_processing",
+            "processing_background": "waiting_for_brief",
+            "processing_error": "",
+            "paper_brief_status": "generating",
+            "updated_at": now_iso(),
+        }
+    )
+    write_json(paper_dir / "metadata.json", metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    if (paper_dir / "original.pdf").exists():
+        try:
+            update_paper_brief_from_pdf(workspace, paper_dir, metadata, source_name, force=bool((options or {}).get("force_brief")))
+        except Exception as exc:  # noqa: BLE001
+            print(f"PDF Paper Brief generation failed for {paper_id}: {exc}", file=sys.stderr)
+    metadata = read_json(paper_dir / "metadata.json", metadata)
+    brief_ready = metadata.get("paper_brief_status") == "ready"
+    metadata.update(
+        {
+            "processing_mode": mode,
+            "reading_mode": mode,
+            "processing_status": "paper_brief_ready" if brief_ready else "processing_queued",
+            "processing_background": "queued",
+            "agent_analysis_status": "paper_brief_ready" if brief_ready else metadata.get("agent_analysis_status", "needs_agent"),
+            "updated_at": now_iso(),
+        }
+    )
+    write_json(paper_dir / "metadata.json", metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    start_background_paper_processing(workspace, paper_id, paper_dir, options or {}, mode=mode, refresh_citations=refresh_citations, refresh_videos=refresh_videos)
+    return read_json(paper_dir / "metadata.json", metadata)
 
 
 def ingest_pdf(args: argparse.Namespace) -> None:
@@ -6460,10 +6644,13 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
 
     def get_paper_dir(self, paper_id: str) -> Path | None:
-        library = load_library(self.workspace)
+        library = load_library_raw(self.workspace)
         for paper in library.get("papers", []):
             if paper.get("id") == paper_id:
                 return (self.workspace / paper.get("paper_dir", "")).resolve()
+        direct = (self.workspace / "papers" / paper_id).resolve()
+        if direct.exists():
+            return direct
         return None
 
     def do_GET(self) -> None:  # noqa: N802
@@ -6787,6 +6974,8 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 query = urllib.parse.parse_qs(parsed.query)
                 duplicate_policy = (query.get("duplicate_policy", ["ask"])[0] or "ask").lower()
                 replace_paper_id = (query.get("replace_paper_id", [""])[0] or "").strip() or None
+                upload_tags = normalize_tag_paths(query.get("tags", [""])[0] or "")
+                upload_projects = normalize_project_list(query.get("projects", [""])[0] or "")
                 files = parse_multipart_files(self.headers.get("Content-Type", ""), raw_body)
                 results = []
                 for index, (filename, content) in enumerate(files):
@@ -6794,9 +6983,12 @@ class ReaderHandler(BaseHTTPRequestHandler):
                         self.workspace,
                         filename,
                         content,
-                        tags=[],
+                        tags=upload_tags,
+                        projects=upload_projects,
                         duplicate_policy=duplicate_policy if len(files) == 1 else "ask",
                         replace_paper_id=replace_paper_id if len(files) == 1 else None,
+                        generate_pdf_preview=False,
+                        enrich_citation=False,
                     )
                     if result.get("duplicate"):
                         results.append(result)
@@ -6804,13 +6996,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                     paper_id = result["paper_id"]
                     paper_dir = self.get_paper_dir(paper_id)
                     if paper_dir:
-                        try:
-                            result["metadata"] = process_paper_deep(self.workspace, paper_id, paper_dir, {})
-                        except Exception as exc:  # noqa: BLE001
-                            result["metadata"] = read_json(paper_dir / "metadata.json", result.get("metadata", {}))
-                            result["processing_error"] = str(exc)
-                        result["metadata"] = refresh_paper_citations(self.workspace, paper_id, paper_dir)
-                        result["metadata"] = refresh_paper_videos(self.workspace, paper_id, paper_dir)
+                        result["metadata"] = prepare_pdf_brief_then_background(self.workspace, paper_id, paper_dir, {}, mode="deep")
                     results.append(result)
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
@@ -6842,15 +7028,9 @@ class ReaderHandler(BaseHTTPRequestHandler):
                         "updated_at": now_iso(),
                     }
                 )
-                metadata = metadata_with_citation(metadata)
                 write_json(paper_dir / "metadata.json", metadata)
-                sync_library_from_metadata(self.workspace, paper_id, paper_dir, metadata)
-                try:
-                    metadata = process_paper_deep(self.workspace, paper_id, paper_dir, {})
-                except Exception:
-                    metadata = read_json(paper_dir / "metadata.json", metadata)
-                metadata = refresh_paper_citations(self.workspace, paper_id, paper_dir)
-                metadata = refresh_paper_videos(self.workspace, paper_id, paper_dir)
+                sync_library_from_metadata(self.workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+                metadata = prepare_pdf_brief_then_background(self.workspace, paper_id, paper_dir, {}, mode="deep")
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -7030,11 +7210,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
         if library_add_match:
             pdf_value = str(data.get("path") or data.get("pdf") or "").strip().strip('"')
             title_value = str(data.get("title") or "").strip()
-            tags = data.get("tags", [])
-            if isinstance(tags, str):
-                tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
-            if not isinstance(tags, list):
-                tags = []
+            tags = normalize_tag_paths(data.get("tags", []))
+            projects = normalize_project_list(data.get("projects", data.get("project", [])))
+            tag_colors = data.get("tag_colors") if isinstance(data.get("tag_colors"), dict) else {}
+            project_colors = data.get("project_colors") if isinstance(data.get("project_colors"), dict) else {}
             try:
                 if pdf_value and pdf_value != DEFAULT_PDF_LIBRARY_PATH:
                     result = register_paper_in_library(
@@ -7042,9 +7221,14 @@ class ReaderHandler(BaseHTTPRequestHandler):
                         Path(pdf_value).expanduser().resolve(),
                         paper_id=str(data.get("paper_id") or "").strip() or None,
                         title=title_value or None,
-                        tags=[str(tag).strip() for tag in tags if str(tag).strip()],
+                        tags=tags,
+                        projects=projects,
+                        tag_colors=tag_colors,
+                        project_colors=project_colors,
                         duplicate_policy=str(data.get("duplicate_policy") or "ask").strip().lower() or "ask",
                         replace_paper_id=str(data.get("replace_paper_id") or "").strip() or None,
+                        generate_pdf_preview=False,
+                        enrich_citation=False,
                     )
                     should_process_pdf = True
                 else:
@@ -7052,7 +7236,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
                         self.workspace,
                         title_value,
                         paper_id=str(data.get("paper_id") or "").strip() or None,
-                        tags=[str(tag).strip() for tag in tags if str(tag).strip()],
+                        tags=tags,
+                        projects=projects,
+                        tag_colors=tag_colors,
+                        project_colors=project_colors,
                         metadata_fields=data if isinstance(data, dict) else {},
                         duplicate_policy=str(data.get("duplicate_policy") or "ask").strip().lower() or "ask",
                         replace_paper_id=str(data.get("replace_paper_id") or "").strip() or None,
@@ -7064,13 +7251,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 paper_dir = self.get_paper_dir(result["paper_id"])
                 if paper_dir:
                     if should_process_pdf:
-                        try:
-                            result["metadata"] = process_paper_deep(self.workspace, result["paper_id"], paper_dir, data)
-                        except Exception as exc:  # noqa: BLE001
-                            result["metadata"] = read_json(paper_dir / "metadata.json", result.get("metadata", {}))
-                            result["processing_error"] = str(exc)
-                    result["metadata"] = refresh_paper_citations(self.workspace, result["paper_id"], paper_dir)
-                    result["metadata"] = refresh_paper_videos(self.workspace, result["paper_id"], paper_dir)
+                        result["metadata"] = prepare_pdf_brief_then_background(self.workspace, result["paper_id"], paper_dir, data if isinstance(data, dict) else {}, mode="deep")
+                    else:
+                        result["metadata"] = refresh_paper_citations(self.workspace, result["paper_id"], paper_dir)
+                        result["metadata"] = refresh_paper_videos(self.workspace, result["paper_id"], paper_dir)
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
@@ -7189,11 +7373,6 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 tags = []
             save_reference_card(paper_dir, card)
             result = add_reference_to_library(self.workspace, card, paper_id, tags=[str(tag).strip() for tag in tags if str(tag).strip()])
-            if not result.get("duplicate"):
-                reference_dir = self.get_paper_dir(str(result.get("paper_id") or ""))
-                if reference_dir:
-                    result["metadata"] = refresh_paper_citations(self.workspace, str(result.get("paper_id") or ""), reference_dir)
-                    result["metadata"] = refresh_paper_videos(self.workspace, str(result.get("paper_id") or ""), reference_dir)
             self.send_json({"ok": True, "reference": card, **result})
             return
 

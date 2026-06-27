@@ -8,6 +8,26 @@ param(
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$envPath = Join-Path $scriptDir ".env"
+if (Test-Path -LiteralPath $envPath) {
+    [System.IO.File]::ReadLines($envPath, [System.Text.Encoding]::UTF8) | ForEach-Object {
+        $line = $_.Trim()
+        if (-not $line -or $line.StartsWith("#")) { return }
+        if ($line -match '^export\s+(.+)$') { $line = $Matches[1].Trim() }
+        if ($line -notmatch '^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$') { return }
+        $key = $Matches[1]
+        $value = $Matches[2].Trim()
+        if (($value.StartsWith('"') -and $value.EndsWith('"')) -or ($value.StartsWith("'") -and $value.EndsWith("'"))) {
+            $value = $value.Substring(1, $value.Length - 2)
+        }
+        if (-not [Environment]::GetEnvironmentVariable($key, "Process")) {
+            Set-Item -Path "Env:$key" -Value $value
+        }
+    }
+}
+if (-not $Workspace) {
+    $Workspace = $env:PAPER_READER_WORKSPACE
+}
 if (-not $Workspace) {
     $Workspace = Join-Path $scriptDir "paper_reading_workspace"
 }

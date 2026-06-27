@@ -106,10 +106,15 @@
             <p>Add PDFs to automatically convert them to Markdown and generate a Paper Brief. Translate full text when a paper is worth deep reading.</p>
           </div>
           <div class="library-intake">
-            <input id="addPdfPath" type="text" value="~/Downloads" placeholder="~/Downloads/paper.pdf" />
-            <input id="addPaperTitle" type="text" placeholder="Optional title" />
-            <input id="addPaperTags" type="text" placeholder="Paper type tags, comma-separated" />
-            <button id="addPaperButton" class="primary-button" type="button">Add + Parse</button>
+            <div class="library-intake-main">
+              <input id="addPdfPath" type="text" value="~/Downloads" placeholder="~/Downloads/paper.pdf" />
+              <input id="addPaperTitle" type="text" placeholder="Optional title" />
+              <button id="addPaperButton" class="primary-button" type="button">Add + Parse</button>
+            </div>
+            <div class="library-intake-pickers" aria-label="Paper intake tags">
+              <section id="libraryIntakeProjectPicker" class="library-intake-picker" aria-label="Select paper project"></section>
+              <section id="libraryIntakeTagPicker" class="library-intake-picker" aria-label="Select paper tags"></section>
+            </div>
           </div>
           <div id="libraryDropZone" class="library-drop-zone" tabindex="0">
             <input id="pdfFilePicker" type="file" accept="application/pdf,.pdf" multiple hidden />
