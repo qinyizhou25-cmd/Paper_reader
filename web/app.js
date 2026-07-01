@@ -34,6 +34,7 @@ const state = {
   libraryCustomProjects: [],
   libraryIntakeTags: [],
   libraryIntakeProjects: [],
+  libraryTagPrompt: { open: false, expanded: false, paperIds: [], saving: false },
   canvasBoards: [],
   currentCanvasProject: "collaborative",
   currentCanvasBoardId: "",
@@ -446,6 +447,22 @@ function addLibraryIntakeTagFromInput() {
 }
 
 function handleLibraryIntakeClick(event) {
+  if (event.target.closest?.("[data-close-library-tag-prompt], [data-skip-library-tag-prompt]")) {
+    event.preventDefault();
+    closeLibraryTagPrompt();
+    return true;
+  }
+  if (event.target.closest?.("[data-expand-library-tag-prompt]")) {
+    event.preventDefault();
+    state.libraryTagPrompt.expanded = !state.libraryTagPrompt.expanded;
+    renderLibraryTagPrompt();
+    return true;
+  }
+  if (event.target.closest?.("[data-save-library-tag-prompt]")) {
+    event.preventDefault();
+    saveLibraryTagPromptSelection().catch(error => toast(`Tag save failed: ${error.message}`));
+    return true;
+  }
   const projectToggle = event.target.closest?.("[data-toggle-intake-project]");
   if (projectToggle) {
     event.preventDefault();
@@ -505,6 +522,116 @@ function handleLibraryIntakeClick(event) {
     return true;
   }
   return false;
+}
+
+function uploadedPaperIdsFromResult(result) {
+  const papers = Array.isArray(result?.papers) ? result.papers : [result].filter(Boolean);
+  return uniqueTags(papers
+    .filter(item => item && !item.duplicate && !item.error)
+    .map(item => item.paper_id || item.metadata?.id || item.metadata?.paper_id || ""));
+}
+
+function libraryTagPromptPapers() {
+  const ids = new Set(state.libraryTagPrompt?.paperIds || []);
+  return (state.library?.papers || []).filter(paper => ids.has(paper.id));
+}
+
+function openLibraryTagPrompt(paperIds = []) {
+  const ids = uniqueTags(paperIds);
+  if (!ids.length) return;
+  state.libraryTagPrompt = { open: true, expanded: false, paperIds: ids, saving: false };
+  clearLibraryIntakeSelection();
+  renderLibraryTagPrompt();
+}
+
+function closeLibraryTagPrompt(options = {}) {
+  state.libraryTagPrompt = { open: false, expanded: false, paperIds: [], saving: false };
+  if (options.clearSelection !== false) clearLibraryIntakeSelection();
+  renderLibraryTagPrompt();
+}
+
+function renderLibraryTagPrompt() {
+  const root = qs("#libraryTagPrompt");
+  if (!root) return;
+  const papers = libraryTagPromptPapers();
+  const visible = Boolean(state.libraryTagPrompt.open && papers.length);
+  root.hidden = !visible;
+  root.classList.toggle("open", visible);
+  root.classList.toggle("expanded", Boolean(state.libraryTagPrompt.expanded));
+  root.setAttribute("aria-hidden", visible ? "false" : "true");
+  if (!visible) {
+    root.innerHTML = "";
+    return;
+  }
+  const title = papers.length === 1 ? compactText(paperTitle(papers[0]) || papers[0].id, 74) : `${papers.length} papers`;
+  const selectedTags = selectedLibraryIntakeTags();
+  const selectedProjects = selectedLibraryIntakeProjects();
+  const hasSelection = selectedTags.length || selectedProjects.length;
+  root.innerHTML = `
+    <div class="library-tag-prompt-header">
+      <div>
+        <span class="sense-kicker">Library intake</span>
+        <strong>PDF analysis started</strong>
+      </div>
+      <button class="icon-button" data-close-library-tag-prompt type="button" title="Close tag prompt" aria-label="Close tag prompt">x</button>
+    </div>
+    <p class="library-tag-prompt-copy">${escapeHtml(title)} ${papers.length === 1 ? "is" : "are"} parsing in the background. Add project/tag labels now, or close this and do it later.</p>
+    <div class="library-tag-prompt-paper-list" aria-label="Uploaded papers">
+      ${papers.slice(0, 3).map(paper => `<span>${escapeHtml(compactText(paperTitle(paper) || paper.id, 64))}</span>`).join("")}
+      ${papers.length > 3 ? `<span>+${papers.length - 3} more</span>` : ""}
+    </div>
+    ${state.libraryTagPrompt.expanded ? `
+      <div class="library-tag-prompt-form">
+        <section id="libraryIntakeProjectPicker" class="library-intake-picker" aria-label="Select paper project"></section>
+        <section id="libraryIntakeTagPicker" class="library-intake-picker" aria-label="Select paper tags"></section>
+        <div class="library-tag-prompt-actions">
+          <button class="secondary-button" data-skip-library-tag-prompt type="button">Not now</button>
+          <button class="primary-button" data-save-library-tag-prompt type="button" ${hasSelection && !state.libraryTagPrompt.saving ? "" : "disabled"}>${state.libraryTagPrompt.saving ? "Saving..." : "Apply to upload"}</button>
+        </div>
+      </div>` : `
+      <div class="library-tag-prompt-actions">
+        <button class="secondary-button" data-skip-library-tag-prompt type="button">Not now</button>
+        <button class="primary-button" data-expand-library-tag-prompt type="button">Add tags</button>
+      </div>`}`;
+  if (state.libraryTagPrompt.expanded) renderLibraryIntakePickers();
+}
+
+async function saveLibraryTagPromptSelection() {
+  const prompt = state.libraryTagPrompt;
+  if (!prompt.open || prompt.saving) return;
+  const tags = selectedLibraryIntakeTags();
+  const projects = selectedLibraryIntakeProjects();
+  if (!tags.length && !projects.length) return;
+  prompt.saving = true;
+  renderLibraryTagPrompt();
+  try {
+    for (const paperId of prompt.paperIds || []) {
+      const paper = state.library?.papers?.find(item => item.id === paperId);
+      if (!paper) continue;
+      const tagColors = tagColorsForPaper(paperId);
+      for (const tag of tags) tagColors[tag] = tagColor(tag, tagColors);
+      const projectColors = projectColorsForPaper(paperId);
+      for (const project of projects) projectColors[project] = projectColor(project, projectColors);
+      const nextTags = uniqueTags([...normalizeTagsInput(paper.tags || []), ...tags]);
+      const nextProjects = uniqueTags([...paperProjects(paper), ...projects]);
+      const body = {
+        tags: nextTags,
+        tag_colors: tagColors,
+        projects: nextProjects,
+        project: nextProjects[0] || "",
+        project_colors: projectColors,
+      };
+      const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(body) });
+      Object.assign(paper, body, response.metadata || {});
+      if (state.currentPaperId === paperId && state.payload?.metadata) Object.assign(state.payload.metadata, body, response.metadata || {});
+    }
+    closeLibraryTagPrompt();
+    renderLibraryPreservingScroll();
+    toast("Upload labels saved");
+  } finally {
+    prompt.saving = false;
+    if (state.libraryTagPrompt === prompt) renderLibraryTagPrompt();
+  }
 }
 
 function saveCustomLibraryProjects() {
@@ -6268,6 +6395,7 @@ function paperBriefCardHtml() {
         <button class="secondary-button" id="regeneratePaperBrief" type="button">Regenerate from PDF</button>
       </div>
       <div id="paperBriefPreview" class="sense-explain-preview thinking-text paper-brief-thinking-text" data-thinking-block="${paperBriefBlockId}" tabindex="0">${applyThinkingHighlights(content, paperBriefBlockId)}</div>
+      ${thinkingAnnotationCardsHtml(paperBriefBlockId)}
       <details class="paper-brief-edit">
         <summary>Edit paper brief</summary>
         <textarea id="paperBriefEditor" class="sense-textarea" rows="10" spellcheck="false">${escapeHtml(content)}</textarea>
@@ -6279,6 +6407,7 @@ function bindPaperBriefCard() {
   const editor = qs("#paperBriefEditor");
   const preview = qs("#paperBriefPreview");
   qs("#regeneratePaperBrief")?.addEventListener("click", regenerateExplanationFromPdf);
+  bindThinkingAnnotationControls(qs("#paper-brief") || document);
   editor?.addEventListener("input", () => {
     if (!state.thinking) state.thinking = normalizeThinkingData(state.payload?.thinking || {});
     state.thinking.explain.content = editor.value;
@@ -6286,6 +6415,26 @@ function bindPaperBriefCard() {
     if (preview) preview.innerHTML = applyThinkingHighlights(editor.value, paperBriefBlockId);
     scheduleThinkingSave();
   });
+}
+
+function refreshPaperBriefCard() {
+  const card = qs("#paper-brief");
+  if (!card) return false;
+  const wrapper = document.createElement("div");
+  wrapper.innerHTML = paperBriefCardHtml().trim();
+  const next = wrapper.firstElementChild;
+  if (!next) return false;
+  card.replaceWith(next);
+  bindPaperBriefCard();
+  updateToolbarStatus();
+  return true;
+}
+
+function refreshThinkingAnnotationSurfaces(blockId = "") {
+  if (!blockId || blockId === paperBriefBlockId) refreshPaperBriefCard();
+  renderSensemakingPanel();
+  if (shouldRenderNotesImmediately()) renderNotes();
+  refreshAllNotesInBackground();
 }
 
 async function regenerateExplanationFromPdf() {
@@ -6530,6 +6679,7 @@ function thinkingBlockHtml(block) {
       <div class="thinking-block-body">
         <div class="thinking-text" data-thinking-block="${escapeHtml(block.id)}" tabindex="0">${applyThinkingHighlights(block.content || "", block.id)}</div>
       </div>
+      ${thinkingAnnotationCardsHtml(block.id)}
       ${sourceLinks}
       <details class="thinking-edit-details">
         <summary>Edit AI output text</summary>
@@ -6547,6 +6697,36 @@ function focusThinkingBlockCard(blockId) {
   card.scrollIntoView({ behavior: "smooth", block: "start" });
   card.classList.add("focus-flash");
   setTimeout(() => card.classList.remove("focus-flash"), 1200);
+}
+
+function bindThinkingAnnotationControls(root = document) {
+  const scoped = selector => Array.from((root || document).querySelectorAll?.(selector) || []);
+  scoped("[data-focus-thinking-annotation]").forEach(button => button.addEventListener("click", () => focusThinkingAnnotation(button.dataset.focusThinkingAnnotation)));
+  scoped("[data-inline-thinking-note]").forEach(button => button.addEventListener("click", event => {
+    event.preventDefault();
+    event.stopPropagation();
+    openExistingThinkingAnnotationDrawer(button.dataset.inlineThinkingNote);
+  }));
+  scoped("[data-edit-thinking-annotation]").forEach(button => button.addEventListener("click", () => openExistingThinkingAnnotationDrawer(button.dataset.editThinkingAnnotation)));
+  scoped("[data-delete-thinking-annotation]").forEach(button => button.addEventListener("click", () => deleteThinkingAnnotation(button.dataset.deleteThinkingAnnotation)));
+  scoped("[data-thinking-tag-select]").forEach(select => select.addEventListener("change", async () => {
+    const annotationId = select.dataset.thinkingTagSelect;
+    const selectedValue = select.value;
+    select.value = "";
+    if (!annotationId || !selectedValue) return;
+    await mutateThinkingAnnotationTags(annotationId, annotation => {
+      annotation.tags = [...new Set([...annotationTags(annotation), selectedValue])];
+    });
+    toast("Tag added");
+  }));
+  scoped("[data-add-thinking-tag]").forEach(button => button.addEventListener("click", () => addTagToThinkingAnnotation(button.dataset.addThinkingTag)));
+  scoped("[data-thinking-tag-input]").forEach(input => input.addEventListener("keydown", event => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      addTagToThinkingAnnotation(input.dataset.thinkingTagInput);
+    }
+  }));
+  scoped("[data-remove-thinking-tag]").forEach(button => button.addEventListener("click", () => removeTagFromThinkingAnnotation(button.dataset.thinkingAnnotationId, button.dataset.removeThinkingTag)));
 }
 
 function renderWritingPane() {
@@ -6585,32 +6765,7 @@ function renderWritingPane() {
   qsa("[data-thinking-color]").forEach(button => button.addEventListener("click", () => addThinkingHighlightFromSelection(button.dataset.thinkingBlock, button.dataset.thinkingColor, false)));
   qsa("[data-thinking-note]").forEach(button => button.addEventListener("click", () => addThinkingHighlightFromSelection(button.dataset.thinkingNote, "yellow", true)));
   bindThinkingSourceLinks();
-  qsa("[data-focus-thinking-annotation]").forEach(button => button.addEventListener("click", () => focusThinkingAnnotation(button.dataset.focusThinkingAnnotation)));
-  qsa("[data-inline-thinking-note]").forEach(button => button.addEventListener("click", event => {
-    event.preventDefault();
-    event.stopPropagation();
-    openExistingThinkingAnnotationDrawer(button.dataset.inlineThinkingNote);
-  }));
-  qsa("[data-edit-thinking-annotation]").forEach(button => button.addEventListener("click", () => openExistingThinkingAnnotationDrawer(button.dataset.editThinkingAnnotation)));
-  qsa("[data-delete-thinking-annotation]").forEach(button => button.addEventListener("click", () => deleteThinkingAnnotation(button.dataset.deleteThinkingAnnotation)));
-  qsa("[data-thinking-tag-select]").forEach(select => select.addEventListener("change", async () => {
-    const annotationId = select.dataset.thinkingTagSelect;
-    const selectedValue = select.value;
-    select.value = "";
-    if (!annotationId || !selectedValue) return;
-    await mutateThinkingAnnotationTags(annotationId, annotation => {
-      annotation.tags = [...new Set([...annotationTags(annotation), selectedValue])];
-    });
-    toast("Tag added");
-  }));
-  qsa("[data-add-thinking-tag]").forEach(button => button.addEventListener("click", () => addTagToThinkingAnnotation(button.dataset.addThinkingTag)));
-  qsa("[data-thinking-tag-input]").forEach(input => input.addEventListener("keydown", event => {
-    if (event.key === "Enter") {
-      event.preventDefault();
-      addTagToThinkingAnnotation(input.dataset.thinkingTagInput);
-    }
-  }));
-  qsa("[data-remove-thinking-tag]").forEach(button => button.addEventListener("click", () => removeTagFromThinkingAnnotation(button.dataset.thinkingAnnotationId, button.dataset.removeThinkingTag)));
+  bindThinkingAnnotationControls(root);
 }
 
 function renderSensemakingPanel() {
@@ -6759,12 +6914,13 @@ async function savePendingThinkingAnnotation(includeNote) {
   if (state.pendingThinkingAnnotation.editing_id) {
     const annotation = state.thinking.annotations.find(item => item.id === state.pendingThinkingAnnotation.editing_id);
     if (!annotation) return;
+    const blockId = annotation.block_id;
     annotation.note = includeNote ? qs("#noteText").value.trim() : "";
     annotation.tags = selectedDrawerTags();
     annotation.updated_at = new Date().toISOString();
     await saveThinking({ silent: true });
     closeDrawer();
-    renderSensemakingPanel();
+    refreshThinkingAnnotationSurfaces(blockId);
     toast("Note updated");
     return;
   }
@@ -6781,7 +6937,7 @@ async function savePendingThinkingAnnotation(includeNote) {
   state.thinking.annotations.push(item);
   await saveThinking({ silent: true });
   closeDrawer();
-  renderSensemakingPanel();
+  refreshThinkingAnnotationSurfaces(item.block_id);
   toast("Saved locally");
 }
 
@@ -6806,8 +6962,9 @@ async function deleteThinkingAnnotation(annotationId) {
   if (!state.thinking || !annotationId) return;
   const confirmed = window.confirm("Delete this AI-output highlight/note?");
   if (!confirmed) return;
+  const annotation = state.thinking.annotations.find(item => item.id === annotationId);
   state.thinking.annotations = state.thinking.annotations.filter(item => item.id !== annotationId);
-  renderSensemakingPanel();
+  refreshThinkingAnnotationSurfaces(annotation?.block_id || "");
   await saveThinking({ silent: true });
   toast("Note deleted");
 }
@@ -6842,9 +6999,10 @@ async function deleteThinkingAnnotationFromPaper(paperId, annotationId) {
 async function mutateThinkingAnnotationTags(annotationId, updater) {
   const annotation = state.thinking?.annotations?.find(item => item.id === annotationId);
   if (!annotation) return;
+  const blockId = annotation.block_id;
   updater(annotation);
   annotation.updated_at = new Date().toISOString();
-  renderSensemakingPanel();
+  refreshThinkingAnnotationSurfaces(blockId);
   await saveThinking({ silent: true });
 }
 
@@ -8247,14 +8405,11 @@ async function uploadPdfFilesRaw(files, paperId = "", duplicateOptions = {}) {
   for (const file of files) formData.append("files", file, file.name);
   let endpoint = paperId ? `/api/papers/${encodeURIComponent(paperId)}/pdf` : "/api/library/papers/upload";
   if (!paperId) {
-    const intake = libraryIntakePayload();
     const query = new URLSearchParams();
     if (duplicateOptions.duplicate_policy) {
       query.set("duplicate_policy", duplicateOptions.duplicate_policy);
       query.set("replace_paper_id", duplicateOptions.replace_paper_id || "");
     }
-    if (intake.tags.length) query.set("tags", intake.tags.join(","));
-    if (intake.projects.length) query.set("projects", intake.projects.join(","));
     if (Array.from(query.keys()).length) endpoint += `?${query.toString()}`;
   }
   const response = await fetch(endpoint, { method: "POST", body: formData });
@@ -8387,6 +8542,7 @@ async function uploadPdfFiles(fileList, paperId = "") {
       renderLibraryUploadStatus();
       result = await uploadPdfFilesRaw(files, paperId, { duplicate_policy: "replace", replace_paper_id: duplicateItems[0].existing?.id || "" });
     }
+    const promptPaperIds = paperId ? [] : uploadedPaperIdsFromResult(result);
     finishLibraryUpload(result, files, paperId);
     const duplicateCount = Number(result.duplicate_count || 0);
     toast(paperId
@@ -8395,6 +8551,7 @@ async function uploadPdfFiles(fileList, paperId = "") {
         ? `${result.count || 0} PDF(s) added, ${duplicateCount} duplicate(s) skipped`
         : `${result.count || files.length} PDF(s) added and parsed`);
     await loadLibrary();
+    if (promptPaperIds.length) openLibraryTagPrompt(promptPaperIds);
     if (paperId && paperId === state.currentPaperId) await loadPaper(paperId);
   } catch (error) {
     failLibraryUpload(files, error);
@@ -8475,13 +8632,14 @@ async function submitAddPaperRequest(body) {
   return api("/api/library/papers", { method: "POST", body: JSON.stringify(body) });
 }
 
-async function completeAddPaperResult(result, pathInput, titleInput) {
+async function completeAddPaperResult(result, pathInput, titleInput, options = {}) {
   toast(result.processing_error ? "Added, but Parse + Brief failed" : result.replaced ? "Existing paper replaced and parsed" : "Added and parsed");
   state.currentPaperId = result.paper_id;
   if (pathInput) pathInput.value = defaultPdfLibraryPath;
   if (titleInput) titleInput.value = "";
   clearLibraryIntakeSelection();
   await loadLibrary();
+  if (options.promptTags && result.paper_id) openLibraryTagPrompt([result.paper_id]);
   activateView("library");
 }
 
@@ -8501,7 +8659,7 @@ async function addPaperFromForm() {
     button.textContent = hasPdfPath ? "Adding + parsing..." : "Adding metadata...";
   }
   try {
-    const body = { path: hasPdfPath ? path : "", title, ...libraryIntakePayload() };
+    const body = { path: hasPdfPath ? path : "", title };
     let result = await submitAddPaperRequest(body);
     if (result.duplicate) {
       const choice = await openDuplicatePaperDialog(result);
@@ -8515,7 +8673,7 @@ async function addPaperFromForm() {
       toast("Duplicate paper was not replaced");
       return;
     }
-    await completeAddPaperResult(result, pathInput, titleInput);
+    await completeAddPaperResult(result, pathInput, titleInput, { promptTags: hasPdfPath });
   } catch (error) {
     toast(`Add failed: ${error.message}`);
   } finally {
@@ -9481,7 +9639,7 @@ function libraryRowHtml(paper) {
 function renderLibrary() {
   const root = qs("#libraryRoot");
   const papers = state.library?.papers || [];
-  renderLibraryIntakePickers();
+  renderLibraryTagPrompt();
   const projects = allLibraryProjects();
   if (state.libraryProject !== "all" && !projects.includes(state.libraryProject) && state.libraryProject !== "Unassigned") {
     state.libraryProject = "all";

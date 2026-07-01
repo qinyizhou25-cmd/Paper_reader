@@ -111,10 +111,6 @@
               <input id="addPaperTitle" type="text" placeholder="Optional title" />
               <button id="addPaperButton" class="primary-button" type="button">Add + Parse</button>
             </div>
-            <div class="library-intake-pickers" aria-label="Paper intake tags">
-              <section id="libraryIntakeProjectPicker" class="library-intake-picker" aria-label="Select paper project"></section>
-              <section id="libraryIntakeTagPicker" class="library-intake-picker" aria-label="Select paper tags"></section>
-            </div>
           </div>
           <div id="libraryDropZone" class="library-drop-zone" tabindex="0">
             <input id="pdfFilePicker" type="file" accept="application/pdf,.pdf" multiple hidden />
@@ -123,6 +119,7 @@
             <button id="choosePdfFiles" class="secondary-button" type="button">Choose PDFs</button>
             <div id="libraryUploadStatus" class="library-upload-status" aria-live="polite" hidden></div>
           </div>
+          <aside id="libraryTagPrompt" class="library-tag-prompt" aria-hidden="true" aria-live="polite" hidden></aside>
           <div id="libraryRoot" class="library-root"></div>
         </div>
         <div id="canvasView" class="view">
