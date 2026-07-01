@@ -50,34 +50,50 @@
               <button class="toolbar-color swatch-purple" data-toolbar-color="purple" title="Highlight purple"></button>
               <button class="toolbar-color swatch-rose" data-toolbar-color="rose" title="Highlight rose"></button>
             </div>
-            <button id="toolbarNote" class="secondary-button" title="Add note to selection">Note</button>
-            <button id="toolbarAskAi" class="secondary-button" title="Ask AI about selection">Ask AI</button>
+            <button id="toolbarNote" class="secondary-button toolbar-command" title="Add note to selection" aria-label="Add note to selection"><span class="button-icon" aria-hidden="true">+</span><span>Note</span></button>
+            <button id="toolbarAskAi" class="secondary-button toolbar-command" title="Ask AI about selection" aria-label="Ask AI about selection"><span class="button-icon" aria-hidden="true">AI</span><span>Ask</span></button>
             <span id="toolbarStatus" class="toolbar-status">Select text to annotate</span>
           </div>
           <div id="paperMeta" class="paper-meta"></div>
           <div id="workspaceToolbar" class="workspace-toolbar" aria-label="Paper workspace controls">
             <div class="workspace-mode-tabs" aria-label="Workspace mode">
-              <button class="workspace-mode" data-workspace-mode="read">Read</button>
-              <button class="workspace-mode active" data-workspace-mode="split">Split</button>
-              <button class="workspace-mode" data-workspace-mode="think">Think</button>
+              <button class="workspace-mode" data-workspace-mode="read" data-mode-icon="Aa" aria-label="Read mode">Read</button>
+              <button class="workspace-mode active" data-workspace-mode="split" data-mode-icon="II" aria-label="Split mode">Split</button>
+              <button class="workspace-mode" data-workspace-mode="think" data-mode-icon="AI" aria-label="Think mode">Think</button>
             </div>
-            <button id="togglePaperMapMain" class="secondary-button" type="button">Paper Map</button>
-            <button id="translateCurrentPaper" class="secondary-button" type="button">Translate Full Text</button>
-            <button id="openPresentationReport" class="primary-button" type="button">Open Takeaway Report</button>
+            <button id="translateCurrentPaper" class="secondary-button icon-text-button" type="button" title="Translate current paper" aria-label="Translate current paper"><span class="button-icon" aria-hidden="true">T</span><span>Translate</span></button>
+            <button id="toggleWorkspaceMetadata" class="secondary-button icon-text-button" type="button" title="Change paper metadata" aria-label="Change paper metadata"><span class="button-icon" aria-hidden="true">Md</span><span>Metadata</span></button>
           </div>
+          <aside id="workspaceMetadataPanel" class="workspace-metadata-panel" aria-hidden="true" aria-live="polite" hidden></aside>
           <div class="reader-workspace" data-workspace-mode="split">
             <div id="documentRoot" class="document-root"></div>
             <div id="sensemakingResizeHandle" class="sensemaking-resize-handle" title="Drag to resize sensemaking panel" aria-hidden="true"></div>
-            <aside id="sensemakingPanel" class="sensemaking-panel" aria-label="Paper sensemaking">
+            <aside id="sensemakingPanel" class="sensemaking-panel" data-side-pane="sensemaking" aria-label="Paper sensemaking">
               <div class="sensemaking-header">
                 <div>
-                  <h2>Sensemaking</h2>
-                  <p>Chronological AI outputs and your reading thoughts.</p>
+                  <h2 id="readerSidePanelTitle">Sensemaking</h2>
+                  <p id="readerSidePanelDescription">Chronological AI outputs and your reading thoughts.</p>
                 </div>
                 <span id="thinkingSaveState" class="thinking-save-state">Ready</span>
               </div>
-              <section id="explainPane" class="thinking-pane thinking-pane-hidden"></section>
-              <section id="writingPane" class="thinking-pane"></section>
+              <div class="reader-side-tabs" aria-label="Reader side panel">
+                <button class="reader-side-tab active" data-reader-side-pane="sensemaking" type="button">Sensemaking</button>
+                <button class="reader-side-tab" data-reader-side-pane="takeaway" type="button">Takeaway Report</button>
+              </div>
+              <div id="sensemakingPane" class="reader-side-pane reader-side-pane-active">
+                <section id="explainPane" class="thinking-pane thinking-pane-hidden"></section>
+                <section id="writingPane" class="thinking-pane"></section>
+              </div>
+              <section id="takeawayPane" class="reader-side-pane takeaway-side-pane" hidden>
+                <div class="presentation-report-header">
+                  <div>
+                    <span class="sense-kicker">Reading Synthesis</span>
+                    <h2 id="presentationReportTitle">Takeaway Report</h2>
+                  </div>
+                  <button id="closePresentationReport" class="icon-button" title="Back to Sensemaking" aria-label="Back to Sensemaking">x</button>
+                </div>
+                <div id="presentationReportRoot" class="presentation-root muted">Waiting for agent analysis.</div>
+              </section>
             </aside>
           </div>
         </div>
@@ -118,8 +134,8 @@
             <span>or choose multiple PDF files from your computer.</span>
             <button id="choosePdfFiles" class="secondary-button" type="button">Choose PDFs</button>
             <div id="libraryUploadStatus" class="library-upload-status" aria-live="polite" hidden></div>
+            <aside id="libraryTagPrompt" class="library-tag-prompt" aria-hidden="true" aria-live="polite" hidden></aside>
           </div>
-          <aside id="libraryTagPrompt" class="library-tag-prompt" aria-hidden="true" aria-live="polite" hidden></aside>
           <div id="libraryRoot" class="library-root"></div>
         </div>
         <div id="canvasView" class="view">
@@ -229,20 +245,6 @@
         </div>
       </section>
     </main>
-
-    <aside class="presentation-report-drawer" id="presentationReportDrawer" aria-hidden="true">
-      <div id="presentationReportResizeHandle" class="presentation-report-resize-handle" title="Drag to resize Takeaway Report" aria-hidden="true"></div>
-      <div class="presentation-report-panel" role="dialog" aria-modal="false" aria-labelledby="presentationReportTitle">
-        <div class="presentation-report-header">
-          <div>
-            <span class="sense-kicker">Reading Synthesis</span>
-            <h2 id="presentationReportTitle">Takeaway Report</h2>
-          </div>
-          <button id="closePresentationReport" class="icon-button" title="Close">x</button>
-        </div>
-        <div id="presentationReportRoot" class="presentation-root muted">Waiting for agent analysis.</div>
-      </div>
-    </aside>
 
     <aside class="library-preview-drawer" id="libraryPreviewDrawer" aria-hidden="true">
       <div class="library-preview-panel" role="dialog" aria-modal="false" aria-labelledby="libraryPreviewTitle">

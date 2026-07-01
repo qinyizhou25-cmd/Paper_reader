@@ -3892,6 +3892,93 @@ def refresh_paper_videos(workspace: Path, paper_id: str, paper_dir: Path, force:
     return metadata
 
 
+METADATA_UPDATE_FIELDS = {
+    "title",
+    "author",
+    "authors",
+    "institution",
+    "institutions",
+    "journal",
+    "venue",
+    "publication_year",
+    "year",
+    "abstract",
+    "abstract_zh",
+    "research_question",
+    "method",
+    "result",
+    "discussion",
+    "doi",
+    "url",
+    "importance",
+    "importance_tags",
+    "preview_image",
+    "preview_image_alt",
+    "project",
+    "projects",
+    "project_colors",
+    "read_status",
+    "status",
+    "tags",
+    "tag_colors",
+    "processing_mode",
+    "reading_mode",
+    "processing_status",
+    "processing_error",
+    "citation_count",
+    "citation_error",
+    "influential_citation_count",
+    "citation_source",
+    "citation_url",
+    "citation_updated_at",
+    "video_links",
+    "video_search_status",
+    "video_search_error",
+    "video_search_updated_at",
+    "youtube_quota",
+    "title_key",
+    "source_pdf_name",
+    "source_type",
+    "title_source",
+    "title_locked",
+    "agent_analysis_status",
+}
+
+
+def apply_paper_metadata_update(workspace: Path, paper_id: str, paper_dir: Path, data: dict[str, Any], *, generate_pdf_preview: bool = False) -> dict[str, Any]:
+    metadata = read_json(paper_dir / "metadata.json", {})
+    if "importance" in data:
+        metadata.update(importance_fields(data.get("importance")))
+    for key, value in data.items():
+        if key not in METADATA_UPDATE_FIELDS or key == "importance":
+            continue
+        if key in {"year", "publication_year"}:
+            metadata[key] = normalize_year(value)
+        elif key == "tags":
+            metadata[key] = normalize_tag_paths(value)
+        elif key == "projects":
+            metadata[key] = normalize_project_list(value)
+        elif key == "importance_tags":
+            metadata[key] = normalize_string_list(value)
+        else:
+            metadata[key] = value
+    if "projects" in data:
+        projects = normalize_project_list(metadata.get("projects", []))
+        metadata["projects"] = projects
+        metadata["project"] = projects[0] if projects else ""
+    elif "project" in data:
+        projects = metadata_projects(metadata)
+        metadata["projects"] = projects
+    if data.get("title"):
+        metadata["title_source"] = data.get("title_source") or "user"
+    if "read_status" in data or "status" in data:
+        metadata["read_status_source"] = "user"
+    metadata["updated_at"] = now_iso()
+    write_json(paper_dir / "metadata.json", metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=generate_pdf_preview)
+    return metadata
+
+
 def aggregate_notes(workspace: Path) -> list[dict[str, Any]]:
     library = load_library(workspace)
     notes: list[dict[str, Any]] = []
@@ -6885,6 +6972,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         library_add_match = parsed.path == "/api/library/papers"
         library_upload_match = parsed.path == "/api/library/papers/upload"
+        library_metadata_match = parsed.path == "/api/library/papers/metadata"
         candidate_brief_match = parsed.path == "/api/candidates/brief"
         candidate_annotations_match = re.match(r"^/api/candidates/([^/]+)/annotations$", parsed.path)
         candidate_metadata_match = re.match(r"^/api/candidates/([^/]+)/metadata$", parsed.path)
@@ -6913,7 +7001,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         mindmap_save_match = re.match(r"^/api/mindmaps/([^/]+)$", parsed.path)
         mindmap_search_match = re.match(r"^/api/mindmaps/([^/]+)/paper-search$", parsed.path)
         mindmap_add_paper_match = re.match(r"^/api/mindmaps/([^/]+)/paper-instances$", parsed.path)
-        if not library_add_match and not library_upload_match and not candidate_brief_match and not candidate_annotations_match and not candidate_metadata_match and not candidate_save_match and not attach_pdf_match and not annotations_match and not thinking_match and not chat_match and not takeaway_match and not explain_match and not metadata_match and not reading_progress_match and not process_match and not translate_match and not citations_match and not videos_match and not reference_add_match and not canvas_boards_match and not canvas_board_match and not canvas_sync_apply_match and not mindmap_create_match and not mindmap_doc_save_match and not mindmap_duplicate_match and not mindmap_doc_add_paper_match and not mindmap_sync_apply_match and not mindmap_save_match and not mindmap_search_match and not mindmap_add_paper_match:
+        if not library_add_match and not library_upload_match and not library_metadata_match and not candidate_brief_match and not candidate_annotations_match and not candidate_metadata_match and not candidate_save_match and not attach_pdf_match and not annotations_match and not thinking_match and not chat_match and not takeaway_match and not explain_match and not metadata_match and not reading_progress_match and not process_match and not translate_match and not citations_match and not videos_match and not reference_add_match and not canvas_boards_match and not canvas_board_match and not canvas_sync_apply_match and not mindmap_create_match and not mindmap_doc_save_match and not mindmap_duplicate_match and not mindmap_doc_add_paper_match and not mindmap_sync_apply_match and not mindmap_save_match and not mindmap_search_match and not mindmap_add_paper_match:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -7042,6 +7130,32 @@ class ReaderHandler(BaseHTTPRequestHandler):
             data = json.loads(body) if body.strip() else {}
         except json.JSONDecodeError:
             self.send_error(HTTPStatus.BAD_REQUEST, "Invalid JSON")
+            return
+
+        if library_metadata_match:
+            payload = data if isinstance(data, dict) else {}
+            paper_ids = [str(item or "").strip() for item in payload.get("paper_ids", []) if str(item or "").strip()]
+            metadata_data = payload.get("metadata", {}) if isinstance(payload.get("metadata", {}), dict) else {}
+            if not paper_ids:
+                self.send_error(HTTPStatus.BAD_REQUEST, "paper_ids must be a non-empty list")
+                return
+            if not metadata_data:
+                self.send_error(HTTPStatus.BAD_REQUEST, "metadata must be a non-empty object")
+                return
+            updated = []
+            missing = []
+            for item_id in paper_ids:
+                paper_id = urllib.parse.unquote(item_id)
+                paper_dir = self.get_paper_dir(paper_id)
+                if not paper_dir:
+                    missing.append(paper_id)
+                    continue
+                metadata = apply_paper_metadata_update(self.workspace, paper_id, paper_dir, metadata_data, generate_pdf_preview=False)
+                updated.append({"paper_id": paper_id, "metadata": metadata})
+            if not updated:
+                self.send_error(HTTPStatus.NOT_FOUND, "No matching papers found")
+                return
+            self.send_json({"ok": True, "updated": updated, "missing": missing})
             return
 
         if candidate_annotations_match:
@@ -7377,84 +7491,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
 
         if metadata_match:
-            metadata = read_json(paper_dir / "metadata.json", {})
-            allowed = {
-                "title",
-                "author",
-                "authors",
-                "institution",
-                "institutions",
-                "journal",
-                "venue",
-                "publication_year",
-                "year",
-                "abstract",
-                "abstract_zh",
-                "research_question",
-                "method",
-                "result",
-                "discussion",
-                "doi",
-                "url",
-                "importance",
-                "importance_tags",
-                "preview_image",
-                "preview_image_alt",
-                "project",
-                "projects",
-                "project_colors",
-                "read_status",
-                "status",
-                "tags",
-                "tag_colors",
-                "processing_mode",
-                "reading_mode",
-                "processing_status",
-                "processing_error",
-                "citation_count",
-                "citation_error",
-                "influential_citation_count",
-                "citation_source",
-                "citation_url",
-                "citation_updated_at",
-                "video_links",
-                "video_search_status",
-                "video_search_error",
-                "video_search_updated_at",
-                "youtube_quota",
-                "title_key",
-                "source_pdf_name",
-                "source_type",
-                "title_source",
-                "title_locked",
-                "agent_analysis_status",
-            }
-            for key, value in data.items():
-                if key in allowed:
-                    if key in {"year", "publication_year"}:
-                        metadata[key] = normalize_year(value)
-                    elif key == "tags":
-                        metadata[key] = normalize_tag_paths(value)
-                    elif key == "projects":
-                        metadata[key] = normalize_project_list(value)
-                    elif key == "importance_tags":
-                        metadata[key] = normalize_string_list(value)
-                    else:
-                        metadata[key] = value
-            if "projects" in data:
-                projects = normalize_project_list(metadata.get("projects", []))
-                metadata["projects"] = projects
-                metadata["project"] = projects[0] if projects else ""
-            elif "project" in data:
-                projects = metadata_projects(metadata)
-                metadata["projects"] = projects
-            if data.get("title"):
-                metadata["title_source"] = data.get("title_source") or "user"
-            if "read_status" in data or "status" in data:
-                metadata["read_status_source"] = "user"
-            metadata["updated_at"] = now_iso()
-            write_json(paper_dir / "metadata.json", metadata)
-            sync_library_from_metadata(self.workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+            metadata = apply_paper_metadata_update(self.workspace, paper_id, paper_dir, data if isinstance(data, dict) else {}, generate_pdf_preview=False)
             self.send_json({"ok": True, "metadata": metadata})
             return
 
