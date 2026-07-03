@@ -1039,11 +1039,16 @@ function annotationMediaSrc(annotation, paperId = state.currentPaperId) {
   return fromSegment?.src ? assetUrlForPaper(paperId, fromSegment.src) : "";
 }
 
+const figureReferencePattern = /\b(?:fig(?:ure)?\.?)\s*(\d+)(?:\s*\([a-z]\)|[a-z]|[.-][a-z])?/gi;
+
 function linkFigures(htmlText) {
-  return htmlText.replace(/\b(?:fig(?:ure)?\.?)\s*\.?\s*(\d+)(?:\s*(?:[.\-]\s*)?\(?[a-z]\)?)?/gi, (match, number) => {
-    if (!state.figures[number]) return match;
-    return `<button class="figure-ref" data-figure-number="${escapeHtml(number)}" title="查看 ${escapeHtml(match)}">${escapeHtml(match)}</button>`;
-  });
+  return String(htmlText || "").split(/(<[^>]+>)/g).map(part => {
+    if (part.startsWith("<")) return part;
+    return part.replace(figureReferencePattern, (match, number) => {
+      if (!state.figures[number]) return match;
+      return `<button class="figure-ref" data-figure-number="${escapeHtml(number)}" title="查看 ${escapeHtml(match)}">${escapeHtml(match)}</button>`;
+    });
+  }).join("");
 }
 
 function inlineMarkdown(text, options = {}) {
@@ -1078,6 +1083,21 @@ function annotationKindLabel(annotation) {
   if (markdownImageInfo(annotation?.quote || "")) return "图片";
   if (annotation?.target === "table") return "表格";
   return annotation?.target === "translation" ? "中文" : "原文";
+}
+
+function annotationNoteCardText(annotation) {
+  const note = displayText(annotation?.note || "");
+  if (!note) return "";
+  const sourceTexts = [annotation?.quote, annotation?.group_quote]
+    .map(value => displayText(value || ""))
+    .filter(value => value.length >= 24);
+  for (const sourceText of sourceTexts) {
+    if (note === sourceText) return "";
+    if (note.startsWith(sourceText)) {
+      return note.slice(sourceText.length).replace(/^[\s:：,，.;。\-—–|]+/, "").trim();
+    }
+  }
+  return note;
 }
 
 function annotationGroupId(annotation) {
@@ -1152,7 +1172,7 @@ function normalizedAnnotationRange(annotation, text, target) {
 function inlineThinkingNoteChip(annotation) {
   const note = displayText(annotation?.note || "");
   if (!note) return "";
-  return `<button class="inline-thinking-note-chip" data-inline-thinking-note="${escapeHtml(annotation.id || "")}" title="Edit note">${escapeHtml(note)}</button>`;
+  return `<button class="inline-thinking-note-chip" data-inline-thinking-note="${escapeHtml(annotation.id || "")}" title="${escapeHtml(note)}">${escapeHtml(note)}</button>`;
 }
 
 function splitInlineHtmlWithHighlights(text, annotations, target, options = {}) {
@@ -5769,11 +5789,12 @@ function takeawayBlockHtml(block, index, blocks) {
   const collapsed = collapsible && state.collapsedTakeawayBlockIds.has(block.id);
   const selected = state.takeawaySelectedBlockIds.has(block.id);
   const mediaSrc = takeawayBlockMediaSrc(block);
+  const dragTitle = selected ? "Drag selected blocks to reorder" : "Drag this block to reorder";
   return `
     <div class="takeaway-block takeaway-${escapeHtml(block.type)}${selected ? " selected" : ""}" data-takeaway-block="${escapeHtml(block.id)}" data-takeaway-collapsible="${collapsible ? "true" : "false"}" data-takeaway-collapsed="${collapsed ? "true" : "false"}" data-takeaway-selected="${selected ? "true" : "false"}" style="--takeaway-indent: ${indent}">
-      <input class="takeaway-select" data-takeaway-select="${escapeHtml(block.id)}" type="checkbox" title="Select block" ${selected ? "checked" : ""}>
+      <input class="takeaway-select" data-takeaway-select="${escapeHtml(block.id)}" type="checkbox" title="Select block" aria-label="Select report block" ${selected ? "checked" : ""}>
       <button class="takeaway-collapse-toggle" data-takeaway-collapse="${escapeHtml(block.id)}" type="button" title="${collapsed ? "Expand section" : "Collapse section"}" ${collapsible ? "" : "disabled aria-hidden=\"true\""}>${collapsible ? (collapsed ? "⌃" : "⌄") : ""}</button>
-      <button class="takeaway-drag-handle" data-takeaway-drag="${escapeHtml(block.id)}" draggable="true" type="button" title="Drag to reorder">::</button>
+      <button class="takeaway-drag-handle" data-takeaway-drag="${escapeHtml(block.id)}" draggable="true" type="button" title="${escapeHtml(dragTitle)}" aria-label="${escapeHtml(dragTitle)}"><span aria-hidden="true"></span></button>
       <button class="takeaway-type-button" data-takeaway-toggle-type="${escapeHtml(block.id)}" type="button" title="Toggle heading/bullet">${block.type === "heading" ? "H" : "B"}</button>
       <div class="takeaway-block-main">
         <div class="takeaway-block-text" data-takeaway-text="${escapeHtml(block.id)}" contenteditable="true" spellcheck="true" data-placeholder="${escapeHtml(placeholder)}">${escapeHtml(block.text || "").replace(/\n/g, "<br>")}</div>
@@ -5834,10 +5855,11 @@ function bindTakeawayEditorEvents() {
       state.takeawayDragBlockId = handle.dataset.takeawayDrag;
       event.dataTransfer.effectAllowed = "move";
       event.dataTransfer.setData("text/plain", state.takeawayDragBlockId || "");
+      handle.closest("[data-takeaway-block]")?.classList.add("takeaway-dragging");
     });
     handle.addEventListener("dragend", () => {
       state.takeawayDragBlockId = "";
-      qsa(".takeaway-drop-before, .takeaway-drop-after").forEach(node => node.classList.remove("takeaway-drop-before", "takeaway-drop-after"));
+      qsa(".takeaway-dragging, .takeaway-drop-before, .takeaway-drop-after").forEach(node => node.classList.remove("takeaway-dragging", "takeaway-drop-before", "takeaway-drop-after"));
     });
   });
   qsa("[data-takeaway-block]").forEach(row => {
@@ -5873,14 +5895,17 @@ function renderPresentationPanel(outline = state.payload?.outline || {}) {
   const selectedCount = state.takeawaySelectedBlockIds.size;
   root.innerHTML = `
     <div class="takeaway-toolbar">
-      <button class="secondary-button mini-button" id="arrangeTakeawayTree" type="button">Arrange by Source Order</button>
-      <button class="secondary-button mini-button" id="addTakeawayToMindmap" type="button">Add to Mindmap</button>
-      <button class="secondary-button mini-button" data-takeaway-add="heading" data-after-block="${escapeHtml(doc.blocks[doc.blocks.length - 1]?.id || "")}" type="button">+ Heading</button>
-      <button class="secondary-button mini-button" data-takeaway-add="bullet" data-after-block="${escapeHtml(doc.blocks[doc.blocks.length - 1]?.id || "")}" type="button">+ Bullet</button>
+      <div class="takeaway-toolbar-main">
+        <button class="primary-button mini-button" data-takeaway-add="bullet" data-after-block="${escapeHtml(doc.blocks[doc.blocks.length - 1]?.id || "")}" type="button">Write</button>
+        <button class="secondary-button mini-button" data-takeaway-add="heading" data-after-block="${escapeHtml(doc.blocks[doc.blocks.length - 1]?.id || "")}" type="button">Heading</button>
+        <button class="secondary-button mini-button" id="arrangeTakeawayTree" type="button">Source order</button>
+        <button class="secondary-button mini-button" id="addTakeawayToMindmap" type="button">Mindmap</button>
+      </div>
       ${selectedCount ? `<span class="takeaway-selection-count">${selectedCount} selected</span><button class="secondary-button mini-button" id="clearTakeawaySelection" type="button">Clear</button>` : ""}
       <button class="secondary-button mini-button" id="saveTakeawayNow" type="button">Save</button>
       <span id="takeawaySaveState" class="thinking-save-state">${doc.updated_at ? "Saved" : "Draft"}</span>
     </div>
+    <div class="takeaway-doc-guidance">Write directly in the report. Drag the grip to reorder, Tab / Shift+Tab changes hierarchy, and Source order can regroup evidence by the paper flow.</div>
     ${state.takeawayArrangePreview ? takeawayArrangePreviewHtml(state.takeawayArrangePreview) : ""}
     <div class="takeaway-doc-editor" aria-label="Editable takeaway report">
       ${visibleBlocks.map(item => takeawayBlockHtml(item.block, item.index, doc.blocks)).join("")}
@@ -6152,6 +6177,79 @@ function renderPaperMeta() {
   renderWorkspaceMetadataPanel();
 }
 
+function firstMetadataValue(paper, keys = []) {
+  for (const key of keys) {
+    const value = paper?.[key];
+    if (Array.isArray(value) && value.length) return value;
+    if (value && typeof value === "object" && Object.keys(value).length) return value;
+    if (String(value ?? "").trim()) return value;
+  }
+  return "";
+}
+
+function metadataValueList(value) {
+  if (Array.isArray(value)) return value.map(item => String(item || "").trim()).filter(Boolean);
+  if (value && typeof value === "object") return Object.values(value).map(item => String(item || "").trim()).filter(Boolean);
+  return String(value || "").split(/[;；\n]+/).map(item => item.trim()).filter(Boolean);
+}
+
+function metadataUrlCards(paper) {
+  const cards = [];
+  const addUrl = (label, value) => {
+    const url = String(value || "").trim();
+    if (!url) return;
+    cards.push(`<a class="metadata-info-card metadata-info-link" href="${escapeHtml(url)}" target="_blank" rel="noreferrer"><span>${escapeHtml(label)}</span><strong>${escapeHtml(compactText(url, 96))}</strong></a>`);
+  };
+  addUrl("PDF / source", firstMetadataValue(paper, ["source_url", "pdf_url", "url", "original_url"]));
+  addUrl("Web page", firstMetadataValue(paper, ["source_page_url", "page_url", "html_url"]));
+  addUrl("Citation profile", firstMetadataValue(paper, ["citation_url", "semantic_scholar_url", "openalex_url"]));
+  const videos = firstMetadataValue(paper, ["videos", "related_videos", "youtube_videos", "video_results"]);
+  if (Array.isArray(videos)) {
+    videos.slice(0, 3).forEach((video, index) => {
+      const url = typeof video === "string" ? video : video?.url;
+      const title = typeof video === "string" ? `YouTube ${index + 1}` : video?.title || `YouTube ${index + 1}`;
+      addUrl(title, url);
+    });
+  } else {
+    metadataValueList(firstMetadataValue(paper, ["youtube_url", "video_url"])).slice(0, 3).forEach((url, index) => addUrl(`YouTube ${index + 1}`, url));
+  }
+  return cards.join("");
+}
+
+function workspaceMetadataInfoHtml(paper) {
+  const rows = [];
+  const addRow = (label, value) => {
+    const text = Array.isArray(value) ? value.filter(Boolean).join(", ") : String(value ?? "").trim();
+    if (!text) return;
+    rows.push(`<div class="metadata-info-row"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(text)}</dd></div>`);
+  };
+  addRow("Authors", firstMetadataValue(paper, ["authors", "author"]));
+  addRow("Venue", firstMetadataValue(paper, ["venue", "journal"]));
+  addRow("Year", firstMetadataValue(paper, ["year", "publication_year"]));
+  addRow("DOI", firstMetadataValue(paper, ["doi"]));
+  addRow("Citations", firstMetadataValue(paper, ["citation_count", "cited_by_count"]));
+  addRow("Influential", firstMetadataValue(paper, ["influential_citation_count"]));
+  addRow("Citation source", firstMetadataValue(paper, ["citation_source"]));
+  const quota = paper?.youtube_quota;
+  if (quota && typeof quota === "object") addRow("YouTube quota", `${quota.used ?? 0}/${quota.limit ?? "?"}`);
+  const citationText = firstMetadataValue(paper, ["bibtex", "citation", "apa", "mla"]);
+  const citationBlock = String(citationText || "").trim()
+    ? `<details class="metadata-citation-details"><summary>Citation text</summary><pre>${escapeHtml(String(citationText).trim())}</pre></details>`
+    : "";
+  const links = metadataUrlCards(paper);
+  if (!rows.length && !links && !citationBlock) return "";
+  return `
+    <section class="metadata-info-section" aria-label="Reading metadata">
+      <div class="metadata-info-heading">
+        <span>Reading references</span>
+        <small>Links and citation details used while reading</small>
+      </div>
+      ${links ? `<div class="metadata-info-cards">${links}</div>` : ""}
+      ${rows.length ? `<dl class="metadata-info-list">${rows.join("")}</dl>` : ""}
+      ${citationBlock}
+    </section>`;
+}
+
 function workspaceMetadataPaper() {
   const libraryPaper = state.library?.papers?.find(item => item.id === state.currentPaperId) || {};
   return { ...libraryPaper, ...(state.payload?.metadata || {}) };
@@ -6209,6 +6307,7 @@ function renderWorkspaceMetadataPanel() {
       </div>
       <button class="icon-button" data-close-workspace-metadata type="button" title="Close metadata editor" aria-label="Close metadata editor">x</button>
     </div>
+    ${workspaceMetadataInfoHtml(workspaceMetadataPaper())}
     <section class="metadata-picker metadata-importance-picker" aria-label="Paper importance">
       <div class="library-intake-picker-header"><span>Importance</span><button class="secondary-button mini-button" data-clear-workspace-importance type="button">Clear</button></div>
       ${quickImportanceEditorHtml(editor.importance, "data-set-workspace-importance")}
@@ -6506,16 +6605,18 @@ function paragraphHtml(paragraph) {
       ? `<div class="translation annotation-text" data-pid="${pid}" data-target="translation">${applyHighlights(displayText(paragraph.translation, { trim: false }), pid, "translation")}</div>`
       : "";
   const notes = annotationCardsHtml(pid);
-  return `<article class="paragraph" id="${pid}" data-pid="${pid}" data-reading-state="${escapeHtml(readingProgress.state)}" style="--reading-depth: ${readingProgress.depth || 0}">${body}${translation}${notes}</article>`;
+  return `<article class="paragraph${notes ? " has-comments" : ""}" id="${pid}" data-pid="${pid}" data-reading-state="${escapeHtml(readingProgress.state)}" style="--reading-depth: ${readingProgress.depth || 0}">${body}${translation}${notes}</article>`;
 }
 
 function annotationCardsHtml(paragraphId) {
-  const items = getAnnotationsFor(paragraphId).filter(item => item.note);
+  const items = getAnnotationsFor(paragraphId)
+    .map(item => ({ item, noteText: annotationNoteCardText(item) }))
+    .filter(entry => entry.noteText);
   if (!items.length) return "";
-  return `<div class="comment-stack">${items.map(item => `
+  return `<div class="comment-stack">${items.map(({ item, noteText }) => `
     <div class="comment-card" data-jump-annotation="${escapeHtml(item.id || "")}" role="button" tabindex="0" title="Jump to highlighted text">
       <span class="comment-color hl-${escapeHtml(item.color || "yellow")}"></span>
-      <span class="comment-text">${escapeHtml(item.note)}</span>
+      <span class="comment-text">${escapeHtml(noteText)}</span>
       <button class="comment-edit" data-edit-annotation="${escapeHtml(item.id || "")}" title="Edit note">Edit</button>
       <button class="comment-delete" data-delete-annotation="${escapeHtml(item.id || "")}" data-paper-id="${escapeHtml(state.currentPaperId || "")}" title="Delete note">x</button>
       ${annotationTags(item).length ? `<span class="comment-tags">${annotationTags(item).map(tag => `<span>${escapeHtml(tag)}</span>`).join("")}</span>` : ""}
@@ -6763,7 +6864,6 @@ function paperBriefCardHtml() {
         <button class="secondary-button" id="regeneratePaperBrief" type="button">Regenerate from PDF</button>
       </div>
       <div id="paperBriefPreview" class="sense-explain-preview thinking-text paper-brief-thinking-text" data-thinking-block="${paperBriefBlockId}" tabindex="0">${applyThinkingHighlights(content, paperBriefBlockId)}</div>
-      ${thinkingAnnotationCardsHtml(paperBriefBlockId)}
       <details class="paper-brief-edit">
         <summary>Edit paper brief</summary>
         <textarea id="paperBriefEditor" class="sense-textarea" rows="10" spellcheck="false">${escapeHtml(content)}</textarea>
@@ -6807,21 +6907,33 @@ function refreshThinkingAnnotationSurfaces(blockId = "") {
 
 async function regenerateExplanationFromPdf() {
   if (!state.currentPaperId) return;
-  const confirmed = window.confirm("Regenerate Explanation from the parsed PDF text? This will replace the current Explain draft.");
+  const confirmed = window.confirm("Regenerate Paper Brief from the PDF? This will replace the current Paper Brief.");
   if (!confirmed) return;
-  setThinkingSaveState("Generating...", "saving");
+  const paperId = state.currentPaperId;
+  const buttons = qsa("#regeneratePaperBrief, #regenerateExplain");
+  buttons.forEach(button => {
+    button.disabled = true;
+    button.dataset.previousLabel = button.textContent || "";
+    button.textContent = "Regenerating...";
+  });
+  setThinkingSaveState("Regenerating Paper Brief...", "saving");
   try {
-    const response = await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/thinking/explain`, {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/thinking/explain`, {
       method: "POST",
-      body: JSON.stringify({}),
+      body: JSON.stringify({ force: true, target: "paper_brief" }),
     });
     state.thinking = normalizeThinkingData(response.thinking || state.thinking, { seed: false });
     if (state.payload) state.payload.thinking = state.thinking;
-    refreshPaperBriefCard();
-    renderSensemakingPanel();
-    toast("Explanation regenerated");
+    if (state.currentPaperId === paperId) await loadPaper(paperId);
+    setThinkingSaveState("Paper Brief regenerated", "saved");
+    toast("Paper Brief regenerated");
   } catch (error) {
-    setThinkingSaveState("Generate failed", "error");
+    buttons.forEach(button => {
+      button.disabled = false;
+      button.textContent = button.dataset.previousLabel || "Regenerate from PDF";
+      delete button.dataset.previousLabel;
+    });
+    setThinkingSaveState("Paper Brief regenerate failed", "error");
     toast(`Regenerate failed: ${error.message}`);
   }
 }
@@ -6889,6 +7001,12 @@ function modeLabel(mode) {
   return mode === "source" ? "Source-grounded" : mode === "free" ? "Free reflection" : "Manual output";
 }
 
+function chatModeHint(mode = state.chatMode) {
+  return mode === "source"
+    ? "Uses selected passages and paragraph anchors."
+    : "No source constraint; useful for riffs, comparisons, and design ideas.";
+}
+
 function isAgentThinkingBlock(block) {
   return ["source", "free"].includes(String(block?.mode || "")) || Boolean(block?.model);
 }
@@ -6924,9 +7042,13 @@ function chatComposerHtml() {
         <span class="sense-kicker">Think Agent</span>
         <h3>Ask about this paper or riff on design ideas</h3>
       </div>
-      <div class="thinking-chat-mode" role="group" aria-label="Agent mode">
-        <button class="thinking-chat-mode-button ${state.chatMode === "source" ? "active" : ""}" data-chat-mode="source" type="button">Source-grounded</button>
-        <button class="thinking-chat-mode-button ${state.chatMode === "free" ? "active" : ""}" data-chat-mode="free" type="button">Free reflection</button>
+      <div class="thinking-chat-mode-shell">
+        <span class="thinking-chat-mode-label">Mode inside Sensemaking</span>
+        <div class="thinking-chat-mode" role="group" aria-label="Agent mode">
+          <button class="thinking-chat-mode-button ${state.chatMode === "source" ? "active" : ""}" data-chat-mode="source" aria-pressed="${state.chatMode === "source" ? "true" : "false"}" type="button">Source-grounded</button>
+          <button class="thinking-chat-mode-button ${state.chatMode === "free" ? "active" : ""}" data-chat-mode="free" aria-pressed="${state.chatMode === "free" ? "true" : "false"}" type="button">Free reflection</button>
+        </div>
+        <p class="thinking-chat-mode-help">${escapeHtml(chatModeHint())}</p>
       </div>
       ${selectionRefs.length ? `<div class="thinking-chat-selection"><span>Quoted from paper</span>${selectionRefsHtml(selectionRefs)}<button class="icon-button" id="clearChatSelection" type="button" title="Clear quoted source">x</button></div>` : ""}
       <textarea id="thinkingChatInput" class="sense-textarea" rows="4" placeholder="Ask the agent..." ${state.chatSending ? "disabled" : ""}>${escapeHtml(state.chatDraft || "")}</textarea>
@@ -10161,6 +10283,11 @@ function scrollToParagraph(paragraphId) {
   history.replaceState(null, "", `#${paragraphId}`);
   updateCurrentOutlineHint(state.payload?.outline?.outline || [], paragraphId);
   target.scrollIntoView({ behavior: "smooth", block: "start" });
+  target.classList.remove("source-flash");
+  window.requestAnimationFrame(() => {
+    target.classList.add("source-flash");
+    window.setTimeout(() => target.classList.remove("source-flash"), 1500);
+  });
 }
 
 function saveWorkspaceScrollPosition() {
@@ -10342,7 +10469,6 @@ function bindEvents() {
   qs("#openPresentationReport")?.addEventListener("click", togglePresentationReport);
   qs("#closePresentationReport")?.addEventListener("click", closePresentationReport);
   qs("#closeLibraryPreview")?.addEventListener("click", closeLibraryPreview);
-  qs("#takeawayReportRail")?.addEventListener("click", openPresentationReport);
   qs("#togglePaperMap")?.addEventListener("click", () => setPaperMapCollapsed(true));
   qs("#togglePaperMapMain")?.addEventListener("click", () => setPaperMapCollapsed(!state.paperMapCollapsed));
   qs("#paperMapRail")?.addEventListener("click", () => setPaperMapCollapsed(false));
