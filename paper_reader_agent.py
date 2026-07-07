@@ -31,6 +31,7 @@ import webbrowser
 import xml.etree.ElementTree as ET
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -192,6 +193,7 @@ DEFAULT_PDF_LIBRARY_PATH = "E:\\论文库\\"
 PAPER_BRIEF_BLOCK_ID = "paper-brief"
 DEFAULT_CHROME_BRIEF_PROMPT_ID = "chrome-paper-brief-v1"
 CANONICAL_PROJECTS = ["collaborative", "memories"]
+PROJECT_CONTEXT_SOURCE_ENV_PREFIX = "PAPER_READER_PROJECT_CONTEXT_"
 PROJECT_ALIASES = {
     "collaborative": "collaborative",
     "collective": "collaborative",
@@ -798,6 +800,239 @@ def tag_dictionary() -> dict[str, Any]:
             {"id": "potential-scenario", "label": "潜在场景"},
         ],
     }
+
+
+class ContextHTMLTextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self.skip_depth = 0
+        self.heading_level = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self.skip_depth += 1
+        elif re.fullmatch(r"h[1-6]", tag):
+            self.heading_level = int(tag[1])
+            self.parts.append("\n" + "#" * self.heading_level + " ")
+        elif tag in {"p", "div", "section", "article", "header", "footer", "li", "tr", "br", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self.skip_depth:
+            self.skip_depth -= 1
+        elif re.fullmatch(r"h[1-6]", tag):
+            self.heading_level = 0
+            self.parts.append("\n")
+        elif tag in {"p", "div", "section", "article", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6"}:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth and data:
+            self.parts.append(data)
+
+    def text(self) -> str:
+        clean = html.unescape("".join(self.parts))
+        clean = re.sub(r"[ \t\r\f\v]+", " ", clean)
+        clean = re.sub(r"\n\s*\n\s*\n+", "\n\n", clean)
+        return clean.strip()
+
+
+def project_contexts_path(workspace: Path) -> Path:
+    return workspace / "project_contexts.json"
+
+
+def default_project_context_source(project: str) -> str:
+    key = re.sub(r"[^A-Z0-9]+", "_", normalize_project_name(project).upper()).strip("_")
+    return env_value(f"{PROJECT_CONTEXT_SOURCE_ENV_PREFIX}{key}") if key else ""
+
+
+def read_project_contexts(workspace: Path) -> dict[str, Any]:
+    ensure_workspace(workspace)
+    raw = read_json(project_contexts_path(workspace), {"version": 1, "contexts": {}})
+    contexts = raw.get("contexts") if isinstance(raw.get("contexts"), dict) else {}
+    for project in CANONICAL_PROJECTS:
+        if project not in contexts:
+            contexts[project] = {"project": project, "source_path": default_project_context_source(project), "cards": []}
+    return {"version": 1, "contexts": contexts, "updated_at": raw.get("updated_at", "")}
+
+
+def save_project_contexts(workspace: Path, data: dict[str, Any]) -> dict[str, Any]:
+    payload = {"version": 1, "contexts": data.get("contexts", {}), "updated_at": now_iso()}
+    write_json(project_contexts_path(workspace), payload)
+    return payload
+
+
+def clean_context_source_text(text: str, suffix: str = "") -> str:
+    raw = str(text or "")
+    if suffix.lower() in {".html", ".htm"} or re.search(r"<\s*(html|body|section|article|div|p|h[1-6])\b", raw, flags=re.I):
+        parser = ContextHTMLTextExtractor()
+        parser.feed(raw)
+        raw = parser.text()
+    else:
+        raw = markdown_plain_text(raw)
+    raw = re.sub(r"\n\s*\n\s*\n+", "\n\n", raw)
+    raw = re.sub(r"[ \t]+", " ", raw)
+    return raw.strip()
+
+
+def context_card_type(title: str, body: str) -> str:
+    text = f"{title}\n{body}".lower()
+    if re.search(r"\b(claim|contribution|thesis|argument)\b|贡献|主张", text):
+        return "claim"
+    if re.search(r"\b(question|rq|problem|gap|challenge)\b|问题|缺口|挑战", text):
+        return "problem"
+    if re.search(r"\b(method|system|design|workflow|pipeline|interface)\b|方法|系统|设计|流程|界面", text):
+        return "method"
+    if re.search(r"\b(study|evaluation|participant|finding|result|dataset)\b|实验|评估|发现|访谈|数据", text):
+        return "evidence"
+    if re.search(r"\b(outline|section|paper skeleton|draft)\b|大纲|章节|论文", text):
+        return "outline"
+    return "background"
+
+
+def compact_context_body(text: str, max_chars: int = 720) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= max_chars:
+        return clean
+    return clean[:max_chars].rstrip(" ,.;:，。；：") + "..."
+
+
+def build_project_context_cards(project: str, source_text: str, max_cards: int = 16) -> list[dict[str, Any]]:
+    raw = str(source_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = clean_context_source_text(raw) if re.search(r"<\s*(html|body|section|article|div|p|h[1-6])\b", raw, flags=re.I) else raw.strip()
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    if not text:
+        return []
+    lines = [line.strip() for line in text.splitlines()]
+    sections: list[tuple[str, list[str]]] = []
+    major_heading_indexes = [index for index, line in enumerate(lines) if re.match(r"^\d{2}\s*[·.:-]\s+", line)]
+    if major_heading_indexes:
+        intro = [line for line in lines[: major_heading_indexes[0]] if line and not re.match(r"^[A-Z][A-Za-z &/]+$", line)]
+        if intro:
+            sections.append(("Project Overview", intro))
+        for position, start in enumerate(major_heading_indexes):
+            end = major_heading_indexes[position + 1] if position + 1 < len(major_heading_indexes) else len(lines)
+            title = re.sub(r"^#{1,6}\s*", "", lines[start]).strip()
+            body = [line for line in lines[start + 1 : end] if line]
+            sections.append((title, body))
+    else:
+        current_title = "Project Background"
+        current_body: list[str] = []
+        heading_pattern = re.compile(r"^(?:#{1,6}\s*)?((?:\d+(?:\.\d+)*|\d{2})\s*(?:[.)·:-]\s*)?[A-Z0-9][^\n]{3,110}|[A-Z][^\n]{3,100})$")
+        for line in lines:
+            if not line:
+                continue
+            markdown_heading = bool(re.match(r"^#{1,6}\s+", line))
+            is_heading = markdown_heading or (bool(heading_pattern.match(line)) and len(line.split()) <= 14 and not line.endswith("."))
+            if is_heading and current_body:
+                sections.append((current_title, current_body))
+                current_title = re.sub(r"^#{1,6}\s*", "", line).strip()
+                current_body = []
+            elif is_heading and current_title == "Project Background" and not current_body:
+                current_title = re.sub(r"^#{1,6}\s*", "", line).strip()
+            else:
+                current_body.append(line)
+        if current_body:
+            sections.append((current_title, current_body))
+    if not sections:
+        chunks = re.split(r"(?<=[。.!?？])\s+", text)
+        sections = [("Project Background", chunks)]
+
+    cards: list[dict[str, Any]] = []
+    for index, (title, body_lines) in enumerate(sections):
+        body = " ".join(body_lines).strip()
+        summary = compact_context_body(body)
+        if not summary:
+            continue
+        card_id = hashlib.sha1(f"{project}\n{title}\n{body[:400]}".encode("utf-8", errors="ignore")).hexdigest()[:12]
+        cards.append(
+            {
+                "id": f"ctx-{card_id}",
+                "project": project,
+                "title": compact_context_body(title, 120) or f"Context {index + 1}",
+                "summary": summary,
+                "type": context_card_type(title, body),
+                "source": "local-file",
+                "order": index,
+            }
+        )
+        if len(cards) >= max_cards:
+            break
+    return cards
+
+
+def project_context_summary_for_prompt(context: dict[str, Any], max_chars: int = 5200) -> str:
+    cards = context.get("cards") if isinstance(context.get("cards"), list) else []
+    lines = []
+    for card in cards:
+        title = str(card.get("title") or "Context").strip()
+        card_type = str(card.get("type") or "background").strip()
+        summary = compact_context_body(str(card.get("summary") or ""), 520)
+        if summary:
+            lines.append(f"- [{card_type}] {title}: {summary}")
+    result = "\n".join(lines).strip()
+    return result[:max_chars].rstrip() + ("\n..." if len(result) > max_chars else "")
+
+
+def load_project_context(workspace: Path, project: Any) -> dict[str, Any]:
+    clean_project = normalize_project_name(project) or "collaborative"
+    contexts = read_project_contexts(workspace)
+    context = contexts.get("contexts", {}).get(clean_project, {})
+    if not context:
+        context = {"project": clean_project, "source_path": default_project_context_source(clean_project), "cards": []}
+    return {**context, "project": clean_project}
+
+
+def upsert_project_context(workspace: Path, project: Any, data: dict[str, Any]) -> dict[str, Any]:
+    clean_project = normalize_project_name(project) or "collaborative"
+    contexts = read_project_contexts(workspace)
+    current = contexts.setdefault("contexts", {}).get(clean_project, {})
+    next_context = {**current, "project": clean_project}
+    if "source_path" in data:
+        next_context["source_path"] = str(data.get("source_path") or "").strip()
+    if "cards" in data and isinstance(data.get("cards"), list):
+        next_context["cards"] = data.get("cards")
+    next_context["updated_at"] = now_iso()
+    contexts["contexts"][clean_project] = next_context
+    save_project_contexts(workspace, contexts)
+    return next_context
+
+
+def refresh_project_context_from_source(workspace: Path, project: Any, source_path: str = "") -> dict[str, Any]:
+    clean_project = normalize_project_name(project) or "collaborative"
+    current = load_project_context(workspace, clean_project)
+    raw_path = str(source_path or current.get("source_path") or default_project_context_source(clean_project) or "").strip()
+    if not raw_path:
+        raise ValueError("source_path is required")
+    path = Path(raw_path).expanduser()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"Project context source not found: {raw_path}")
+    raw_text = path.read_text(encoding="utf-8", errors="ignore")
+    source_text = clean_context_source_text(raw_text, path.suffix)
+    cards = build_project_context_cards(clean_project, source_text)
+    context = upsert_project_context(
+        workspace,
+        clean_project,
+        {
+            "source_path": str(path),
+            "cards": cards,
+        },
+    )
+    context.update(
+        {
+            "source_size": path.stat().st_size,
+            "source_mtime": dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc).isoformat(),
+            "source_chars": len(source_text),
+            "card_count": len(cards),
+            "refreshed_at": now_iso(),
+        }
+    )
+    contexts = read_project_contexts(workspace)
+    contexts.setdefault("contexts", {})[clean_project] = context
+    save_project_contexts(workspace, contexts)
+    return context
 
 
 def metadata_projects(metadata: dict[str, Any]) -> list[str]:
@@ -1999,6 +2234,60 @@ def start_background_paper_processing(workspace: Path, paper_id: str, paper_dir:
     timer.daemon = True
     timer.start()
     return True
+
+
+RESUMABLE_PROCESSING_STATUSES = {
+    "processing",
+    "processing_queued",
+    "paper_brief_processing",
+    "paper_brief_ready",
+}
+
+RESUMABLE_BACKGROUND_STATES = {"queued", "waiting_for_brief"}
+
+
+def nonempty_segment_count(paper_dir: Path) -> int:
+    segments = read_json(paper_dir / "segments.json", []) if (paper_dir / "segments.json").exists() else []
+    if not isinstance(segments, list):
+        return 0
+    return sum(1 for segment in segments if isinstance(segment, dict) and str(segment.get("markdown") or "").strip())
+
+
+def should_resume_processing(paper_dir: Path, metadata: dict[str, Any]) -> tuple[bool, str]:
+    if not (paper_dir / "original.pdf").exists():
+        return False, ""
+    mode = str(metadata.get("processing_mode") or metadata.get("reading_mode") or "deep").strip().lower()
+    status = str(metadata.get("processing_status") or "").strip().lower()
+    background = str(metadata.get("processing_background") or "").strip().lower()
+    if status in RESUMABLE_PROCESSING_STATUSES:
+        return True, mode if mode in {"skim", "deep"} else "deep"
+    if status != "ready" and background in RESUMABLE_BACKGROUND_STATES:
+        return True, mode if mode in {"skim", "deep"} else "deep"
+    if mode == "deep" and status == "ready" and nonempty_segment_count(paper_dir) == 0:
+        return True, "deep"
+    return False, ""
+
+
+def resume_interrupted_processing_tasks(workspace: Path) -> list[str]:
+    resumed: list[str] = []
+    library = load_library_raw(workspace)
+    for paper in library.get("papers", []):
+        paper_id = str(paper.get("id") or "").strip()
+        if not paper_id:
+            continue
+        paper_dir = workspace / str(paper.get("paper_dir") or f"papers/{paper_id}")
+        if not paper_dir.exists():
+            continue
+        metadata = read_json(paper_dir / "metadata.json", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        should_resume, mode = should_resume_processing(paper_dir, metadata)
+        if not should_resume:
+            continue
+        started = start_background_paper_processing(workspace, paper_id, paper_dir, {}, mode=mode, refresh_citations=True, refresh_videos=True)
+        if started:
+            resumed.append(paper_id)
+    return resumed
 
 
 def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -3439,14 +3728,35 @@ def strip_reference_markup(text: str) -> str:
     return text
 
 
+REFERENCE_SECTION_TITLES = {"references", "bibliography", "works cited", "literature cited"}
+
+
+def normalized_reference_section_title(value: Any) -> str:
+    text = strip_reference_markup(value)
+    text = re.sub(r"^#+\s*", "", text)
+    text = re.sub(r"^\d+(?:\.\d+)*\s*[.):-]?\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip(" .:-").lower()
+    return text
+
+
+def is_reference_section_path(section_path: Any) -> bool:
+    if isinstance(section_path, str):
+        section_items = [section_path]
+    elif isinstance(section_path, list):
+        section_items = section_path
+    else:
+        return False
+    return any(normalized_reference_section_title(item) in REFERENCE_SECTION_TITLES for item in section_items)
+
+
 def parse_reference_entry(segment: dict[str, Any]) -> dict[str, Any] | None:
     raw = segment.get("markdown", "")
     clean = strip_reference_markup(raw)
-    match = re.match(r"^\[(\d+)\]\s+(.+)$", clean)
+    match = re.match(r"^(?:\[(\d+)\]|(\d+)\s*[.)])\s+(.+)$", clean)
     if not match:
         return None
-    number = match.group(1)
-    body = match.group(2).strip()
+    number = match.group(1) or match.group(2)
+    body = match.group(3).strip()
     year_match = re.search(r"\b(19|20)\d{2}\b", body)
     year = year_match.group(0) if year_match else ""
     authors = body[: year_match.start()].strip(" .") if year_match else ""
@@ -3492,7 +3802,7 @@ def load_reference_index(paper_dir: Path) -> dict[str, Any]:
     segments = load_segments(paper_dir)
     references: dict[str, dict[str, Any]] = {}
     for segment in segments:
-        if "References" not in segment.get("section_path", []):
+        if not is_reference_section_path(segment.get("section_path", [])):
             continue
         parsed = parse_reference_entry(segment)
         if parsed:
@@ -4057,7 +4367,14 @@ def reference_paper_id(card: dict[str, Any]) -> str:
     return f"{slugify(str(card.get('title') or 'reference'), 'reference')}-{digest}"
 
 
-def add_reference_to_library(workspace: Path, card: dict[str, Any], parent_paper_id: str, tags: list[str] | None = None) -> dict[str, Any]:
+def add_reference_to_library(
+    workspace: Path,
+    card: dict[str, Any],
+    parent_paper_id: str,
+    tags: list[str] | None = None,
+    projects: list[str] | None = None,
+    importance: Any = "",
+) -> dict[str, Any]:
     paper_id = reference_paper_id(card)
     title = card.get("title") or f"Reference {card.get('number', '')}".strip()
     duplicate = find_duplicate_paper_by_title(workspace, title, exclude_paper_id=paper_id)
@@ -4067,6 +4384,7 @@ def add_reference_to_library(workspace: Path, card: dict[str, Any], parent_paper
     paper_dir.mkdir(parents=True, exist_ok=True)
     abstract = card.get("abstract") or ""
     abstract_zh = card.get("abstract_zh") or ""
+    clean_projects = normalize_project_list(projects or [])
     parent_record = find_paper_record(workspace, parent_paper_id) or {}
     parent_title = parent_record.get("title") or parent_paper_id
     metadata = {
@@ -4087,8 +4405,10 @@ def add_reference_to_library(workspace: Path, card: dict[str, Any], parent_paper
         "source_type": "reference",
         "status": "unread",
         "read_status": "unread",
-        "importance": "",
+        **importance_fields(importance),
         "tags": [str(tag).strip() for tag in (tags or []) if str(tag).strip()],
+        "projects": clean_projects,
+        "project": clean_projects[0] if clean_projects else "",
         "agent_analysis_status": "reference_card",
         "paper_brief_status": "needs_pdf",
         "updated_at": now_iso(),
@@ -4153,11 +4473,113 @@ def block_type(block: str) -> tuple[str, int | None]:
         return "code", None
     if first.startswith(">"):
         return "quote", None
-    if first.startswith("|"):
+    if first.startswith("|") or re.search(r"<\s*table[\s>]", block, flags=re.I):
         return "table", None
     if re.match(r"^\s*([-*+]\s+|\d+[.)]\s+)", first):
         return "list", None
     return "paragraph", None
+
+
+class MarkdownTableHTMLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.rows: list[list[dict[str, Any]]] = []
+        self.current_row: list[dict[str, Any]] | None = None
+        self.current_cell: dict[str, Any] | None = None
+        self.capture_cell = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        clean_tag = tag.lower()
+        if clean_tag == "tr":
+            self.current_row = []
+        elif clean_tag in {"td", "th"} and self.current_row is not None:
+            attr_map = {key.lower(): value for key, value in attrs if key}
+            self.current_cell = {"tag": clean_tag, "attrs": attr_map, "parts": []}
+            self.capture_cell = True
+        elif self.capture_cell and clean_tag in {"br", "p", "div"} and self.current_cell is not None:
+            self.current_cell["parts"].append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        clean_tag = tag.lower()
+        if clean_tag in {"td", "th"} and self.current_cell is not None and self.current_row is not None:
+            self.current_row.append(self.current_cell)
+            self.current_cell = None
+            self.capture_cell = False
+        elif clean_tag == "tr" and self.current_row is not None:
+            self.rows.append(self.current_row)
+            self.current_row = None
+
+    def handle_data(self, data: str) -> None:
+        if self.capture_cell and self.current_cell is not None:
+            self.current_cell["parts"].append(data)
+
+
+def clean_table_cell_text(value: Any) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\b([A-Za-z]{2,})-\s+([A-Za-z]{2,})\b", r"\1\2", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text
+
+
+def table_cell_text(cell: dict[str, Any]) -> str:
+    return clean_table_cell_text("".join(str(part) for part in cell.get("parts", [])))
+
+
+def raw_table_cell_text(cell: dict[str, Any]) -> str:
+    text = html.unescape("".join(str(part) for part in cell.get("parts", [])))
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def repair_two_column_wrapped_rows(rows: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    if len(rows) < 2:
+        return rows
+    header = [table_cell_text(cell).casefold() for cell in rows[0]]
+    if len(header) != 2 or "code" not in header[0] or "description" not in header[1]:
+        return rows
+    repaired: list[list[dict[str, Any]]] = [rows[0]]
+    for row in rows[1:]:
+        if len(row) == 2:
+            first = raw_table_cell_text(row[0])
+            second = raw_table_cell_text(row[1])
+            if re.fullmatch(r"[a-z]{2,12}", first) and re.match(r"^\d+(?:\.\d+)+\s+", second):
+                split = re.match(r"^(?P<prefix>\d+(?:\.\d+)+\s+.*?\s+)(?P<broken>[A-Za-z]+)-\s*(?P<description>[A-Z][a-z].*)$", second)
+                if split:
+                    label = clean_table_cell_text(split.group("prefix") + split.group("broken") + first)
+                    description = clean_table_cell_text(split.group("description"))
+                    row[0]["parts"] = [label]
+                    row[1]["parts"] = [description]
+        repaired.append(row)
+    return repaired
+
+
+def render_html_table(rows: list[list[dict[str, Any]]]) -> str:
+    rendered_rows: list[str] = []
+    for row in rows:
+        cells: list[str] = []
+        for cell in row:
+            tag = "th" if str(cell.get("tag") or "td").lower() == "th" else "td"
+            attrs = cell.get("attrs") if isinstance(cell.get("attrs"), dict) else {}
+            attr_text = ""
+            for attr_name in ("rowspan", "colspan"):
+                attr_value = str(attrs.get(attr_name) or "").strip()
+                if attr_value.isdigit() and int(attr_value) > 1:
+                    attr_text += f' {attr_name}="{html.escape(attr_value)}"'
+            cells.append(f"<{tag}{attr_text}>{inline_markdown_to_html(table_cell_text(cell))}</{tag}>")
+        rendered_rows.append("<tr>" + "".join(cells) + "</tr>")
+    return "<table>" + "".join(rendered_rows) + "</table>"
+
+
+def normalize_html_tables(markdown: str) -> str:
+    def replace_table(match: re.Match[str]) -> str:
+        if re.search(r"<\s*img\b", match.group(0), flags=re.I):
+            return match.group(0)
+        parser = MarkdownTableHTMLParser()
+        parser.feed(match.group(0))
+        rows = repair_two_column_wrapped_rows(parser.rows)
+        return render_html_table(rows) if rows else match.group(0)
+
+    return re.sub(r"<\s*table[\s\S]*?<\s*/\s*table\s*>", replace_table, str(markdown or ""), flags=re.I)
 
 
 def normalize_math_fragment(text: str) -> str:
@@ -4289,7 +4711,7 @@ def split_numbered_heading_line(line: str) -> tuple[str, str] | None:
 
 
 def split_markdown_blocks(markdown: str) -> list[str]:
-    markdown = cleanup_markdown_artifacts(normalize_pdf_fallback_markdown(markdown))
+    markdown = normalize_html_tables(cleanup_markdown_artifacts(normalize_pdf_fallback_markdown(markdown)))
     lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     blocks: list[str] = []
     current: list[str] = []
@@ -4513,6 +4935,20 @@ def markdown_block_to_html(block: str, kind: str, level: int | None) -> str:
                 items.append(f"<li>{inline_markdown_to_html(item)}</li>")
         return "<ul>" + "".join(items) + "</ul>"
     if kind == "table":
+        html_table = re.search(r"<\s*table[\s\S]*?<\s*/\s*table\s*>", block, flags=re.I)
+        if html_table:
+            caption = clean_table_cell_text(block[: html_table.start()])
+            if re.search(r"<\s*img\b", html_table.group(0), flags=re.I):
+                table_html = html_table.group(0)
+                if caption:
+                    return f"<figure class=\"paper-table\"><figcaption>{inline_markdown_to_html(caption)}</figcaption>{table_html}</figure>"
+                return table_html
+            parser = MarkdownTableHTMLParser()
+            parser.feed(html_table.group(0))
+            table_html = render_html_table(repair_two_column_wrapped_rows(parser.rows)) if parser.rows else html_table.group(0)
+            if caption:
+                return f"<figure class=\"paper-table\"><figcaption>{inline_markdown_to_html(caption)}</figcaption>{table_html}</figure>"
+            return table_html
         rows = []
         for line in lines:
             cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
@@ -4714,6 +5150,13 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
         context_error = str(block.get("context_error") or "").strip()
         if context_error:
             cleaned_block["context_error"] = context_error[:800]
+        project_context = block.get("project_context") if isinstance(block.get("project_context"), dict) else {}
+        if project_context:
+            cleaned_block["project_context"] = {
+                "project": str(project_context.get("project") or "").strip(),
+                "card_count": int(project_context.get("card_count") or 0),
+                "source_path": str(project_context.get("source_path") or "").strip(),
+            }
         status = str(block.get("status") or "").strip()
         if status:
             cleaned_block["status"] = status
@@ -5746,9 +6189,10 @@ def recent_thinking_context(thinking: dict[str, Any], limit: int = 4) -> str:
     return "\n\n".join(lines)
 
 
-def generate_chat_reply(metadata: dict[str, Any], segments: list[dict[str, Any]], thinking: dict[str, Any], message: str, mode: str, source_refs: list[dict[str, str]], full_markdown: str = "") -> tuple[str, str]:
+def generate_chat_reply(metadata: dict[str, Any], segments: list[dict[str, Any]], thinking: dict[str, Any], message: str, mode: str, source_refs: list[dict[str, str]], full_markdown: str = "", project_context: str = "") -> tuple[str, str]:
     title = str(metadata.get("title") or "Untitled Paper")
     paper_markdown = str(full_markdown or "").strip() or paper_markdown_for_chat(segments)
+    project_context_block = f"\n\n项目背景 Context Cards（用户长期维护的项目背景摘要；只在和当前问题相关时使用）：\n{project_context.strip()}" if project_context.strip() else ""
     if mode == "source":
         source_context = chat_context_from_refs(source_refs)
         messages = [
@@ -5761,6 +6205,7 @@ def generate_chat_reply(metadata: dict[str, Any], segments: list[dict[str, Any]]
                 "content": f"""当前论文：{title}
 
 用户问题：{message}
+{project_context_block}
 
 完整论文 Markdown（包含稳定段落锚点，例如 <a id="p-0001"></a>）：
 {paper_markdown or '暂无论文 Markdown'}
@@ -5785,6 +6230,7 @@ def generate_chat_reply(metadata: dict[str, Any], segments: list[dict[str, Any]]
         {
             "role": "user",
             "content": f"""当前论文：{title}
+{project_context_block}
 
 完整论文 Markdown（包含稳定段落锚点，例如 <a id="p-0001"></a>）：
 {paper_markdown or '暂无论文 Markdown'}
@@ -5814,6 +6260,18 @@ def append_chat_output_block(paper_id: str, paper_dir: Path, data: dict[str, Any
     metadata = normalized_metadata(paper_dir, read_json(paper_dir / "metadata.json", {}))
     segments = load_segments(paper_dir)
     thinking = load_thinking(paper_dir)
+    project_context = ""
+    project_context_info: dict[str, Any] = {}
+    if bool(data.get("use_project_context")):
+        paper_projects = metadata_projects(metadata)
+        project = normalize_project_name(data.get("project") or (paper_projects[0] if paper_projects else "")) or "collaborative"
+        context = load_project_context(paper_dir.parent.parent, project)
+        project_context = project_context_summary_for_prompt(context)
+        project_context_info = {
+            "project": project,
+            "card_count": len(context.get("cards", [])),
+            "source_path": context.get("source_path", ""),
+        }
     selection_refs = normalize_selection_refs_for_chat(paper_id, data.get("selection_refs"))
     source_refs = retrieve_chat_source_refs(paper_id, segments, message, selection_refs, limit=7) if mode == "source" else []
     paper_markdown = load_paper_markdown_for_chat(paper_dir, segments)
@@ -5824,14 +6282,14 @@ def append_chat_output_block(paper_id: str, paper_dir: Path, data: dict[str, Any
         context_mode = "compressed_size_limit"
         context_markdown = compressed_paper_markdown_for_chat(segments, source_refs, message)
     try:
-        content, model_label = generate_chat_reply(metadata, segments, thinking, message, mode, source_refs, context_markdown)
+        content, model_label = generate_chat_reply(metadata, segments, thinking, message, mode, source_refs, context_markdown, project_context)
     except Exception as exc:  # noqa: BLE001
         if context_mode.startswith("compressed") or not should_retry_chat_with_compressed_context(exc):
             raise
         context_mode = "compressed_after_error"
         context_error = str(exc)
         context_markdown = compressed_paper_markdown_for_chat(segments, source_refs, message)
-        content, model_label = generate_chat_reply(metadata, segments, thinking, message, mode, source_refs, context_markdown)
+        content, model_label = generate_chat_reply(metadata, segments, thinking, message, mode, source_refs, context_markdown, project_context)
     now = now_iso()
     block = {
         "id": f"tb-chat-{hashlib.sha1((paper_id + message + now).encode('utf-8')).hexdigest()[:12]}",
@@ -5844,6 +6302,7 @@ def append_chat_output_block(paper_id: str, paper_dir: Path, data: dict[str, Any
         "context_mode": context_mode,
         "context_chars": len(paper_markdown),
         "context_error": context_error[:800],
+        "project_context": project_context_info,
         "source_refs": source_refs,
         "selection_refs": selection_refs,
         "created_at": now,
@@ -6313,6 +6772,7 @@ def process_paper_skim(workspace: Path, paper_id: str, paper_dir: Path, options:
                 "venue": metadata.get("venue") or infer_venue(raw_md[:5000]),
                 "year": normalize_year(metadata.get("year", "")),
                 "processing_status": "ready",
+                "processing_background": "done",
                 "read_status": "skimmed",
                 "agent_analysis_status": "skim_ready",
                 "updated_at": now_iso(),
@@ -6413,6 +6873,7 @@ def process_paper_deep(workspace: Path, paper_id: str, paper_dir: Path, options:
                 "tags": metadata.get("tags", []),
                 "agent_analysis_status": metadata.get("agent_analysis_status", "needs_agent"),
                 "processing_status": "ready",
+                "processing_background": "done",
                 "updated_at": now_iso(),
             }
         )
@@ -6760,7 +7221,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/library":
             library = load_library(self.workspace)
-            self.send_json({"workspace": str(self.workspace), "library": library, "tag_dictionary": tag_dictionary()})
+            self.send_json({"workspace": str(self.workspace), "library": library, "tag_dictionary": tag_dictionary(), "project_contexts": read_project_contexts(self.workspace)})
+            return
+        if path == "/api/project-contexts":
+            self.send_json({"ok": True, "workspace": str(self.workspace), "project_contexts": read_project_contexts(self.workspace)})
             return
         if path == "/api/tag-dictionary":
             self.send_json({"ok": True, "tag_dictionary": tag_dictionary()})
@@ -6973,6 +7437,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         library_add_match = parsed.path == "/api/library/papers"
         library_upload_match = parsed.path == "/api/library/papers/upload"
         library_metadata_match = parsed.path == "/api/library/papers/metadata"
+        project_context_match = re.match(r"^/api/project-contexts/([^/]+)$", parsed.path)
         candidate_brief_match = parsed.path == "/api/candidates/brief"
         candidate_annotations_match = re.match(r"^/api/candidates/([^/]+)/annotations$", parsed.path)
         candidate_metadata_match = re.match(r"^/api/candidates/([^/]+)/metadata$", parsed.path)
@@ -7001,7 +7466,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         mindmap_save_match = re.match(r"^/api/mindmaps/([^/]+)$", parsed.path)
         mindmap_search_match = re.match(r"^/api/mindmaps/([^/]+)/paper-search$", parsed.path)
         mindmap_add_paper_match = re.match(r"^/api/mindmaps/([^/]+)/paper-instances$", parsed.path)
-        if not library_add_match and not library_upload_match and not library_metadata_match and not candidate_brief_match and not candidate_annotations_match and not candidate_metadata_match and not candidate_save_match and not attach_pdf_match and not annotations_match and not thinking_match and not chat_match and not takeaway_match and not explain_match and not metadata_match and not reading_progress_match and not process_match and not translate_match and not citations_match and not videos_match and not reference_add_match and not canvas_boards_match and not canvas_board_match and not canvas_sync_apply_match and not mindmap_create_match and not mindmap_doc_save_match and not mindmap_duplicate_match and not mindmap_doc_add_paper_match and not mindmap_sync_apply_match and not mindmap_save_match and not mindmap_search_match and not mindmap_add_paper_match:
+        if not library_add_match and not library_upload_match and not library_metadata_match and not project_context_match and not candidate_brief_match and not candidate_annotations_match and not candidate_metadata_match and not candidate_save_match and not attach_pdf_match and not annotations_match and not thinking_match and not chat_match and not takeaway_match and not explain_match and not metadata_match and not reading_progress_match and not process_match and not translate_match and not citations_match and not videos_match and not reference_add_match and not canvas_boards_match and not canvas_board_match and not canvas_sync_apply_match and not mindmap_create_match and not mindmap_doc_save_match and not mindmap_duplicate_match and not mindmap_doc_add_paper_match and not mindmap_sync_apply_match and not mindmap_save_match and not mindmap_search_match and not mindmap_add_paper_match:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -7156,6 +7621,24 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.NOT_FOUND, "No matching papers found")
                 return
             self.send_json({"ok": True, "updated": updated, "missing": missing})
+            return
+
+        if project_context_match:
+            project = urllib.parse.unquote(project_context_match.group(1))
+            try:
+                payload = data if isinstance(data, dict) else {}
+                source_path = str(payload.get("source_path") or "").strip()
+                if payload.get("refresh", True):
+                    context = refresh_project_context_from_source(self.workspace, project, source_path)
+                else:
+                    context = upsert_project_context(self.workspace, project, {"source_path": source_path})
+            except FileNotFoundError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
+            self.send_json({"ok": True, "context": context, "project_contexts": read_project_contexts(self.workspace)})
             return
 
         if candidate_annotations_match:
@@ -7485,8 +7968,20 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 tags = [tag.strip() for tag in tags.split(",") if tag.strip()]
             if not isinstance(tags, list):
                 tags = []
+            projects = data.get("projects", [])
+            if isinstance(projects, str):
+                projects = [project.strip() for project in projects.split(",") if project.strip()]
+            if not isinstance(projects, list):
+                projects = []
             save_reference_card(paper_dir, card)
-            result = add_reference_to_library(self.workspace, card, paper_id, tags=[str(tag).strip() for tag in tags if str(tag).strip()])
+            result = add_reference_to_library(
+                self.workspace,
+                card,
+                paper_id,
+                tags=[str(tag).strip() for tag in tags if str(tag).strip()],
+                projects=[str(project).strip() for project in projects if str(project).strip()],
+                importance=data.get("importance", ""),
+            )
             self.send_json({"ok": True, "reference": card, **result})
             return
 
@@ -7615,11 +8110,14 @@ class ReaderHandler(BaseHTTPRequestHandler):
 def serve(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
     ensure_workspace(workspace)
+    resumed = resume_interrupted_processing_tasks(workspace)
     ReaderHandler.workspace = workspace
     server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
     url = f"http://{args.host}:{args.port}/"
     print(f"Serving workspace: {workspace}")
     print(f"Reader URL: {url}")
+    if resumed:
+        print(f"Resumed interrupted processing for {len(resumed)} paper(s): {', '.join(resumed)}")
     if args.open:
         webbrowser.open(url)
     try:

@@ -33,7 +33,12 @@
             <h2>Paper Map</h2>
             <button id="togglePaperMap" class="icon-button sidebar-toggle-button" type="button" title="Collapse Paper Map" aria-label="Collapse Paper Map">×</button>
           </div>
-          <div id="outlineList" class="outline-list"></div>
+          <div class="paper-map-tabs" aria-label="Paper Map views">
+            <button class="paper-map-tab active" data-paper-map-tab="map" type="button">Map</button>
+            <button class="paper-map-tab" data-paper-map-tab="media" type="button">Figures / Tables</button>
+          </div>
+          <div id="outlineList" class="outline-list paper-map-pane"></div>
+          <div id="paperMapMediaList" class="paper-map-media-list paper-map-pane" hidden></div>
         </section>
       </aside>
 

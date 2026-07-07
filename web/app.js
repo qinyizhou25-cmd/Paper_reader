@@ -31,6 +31,8 @@ const state = {
   libraryProjectMenuPaperId: "",
   libraryPreviewThumbnailsVisible: false,
   libraryPreview: { open: false, paperId: "", payload: null, loading: false, error: "" },
+  projectContexts: { version: 1, contexts: {} },
+  projectContextPanel: { open: false, project: "collaborative", saving: false, error: "" },
   libraryCustomProjects: [],
   libraryIntakeTags: [],
   libraryIntakeProjects: [],
@@ -76,6 +78,9 @@ const state = {
   workspaceScrollByPaper: {},
   workspaceMode: "split",
   paperMapCollapsed: false,
+  paperMapTab: "map",
+  takeawayPreviousWorkspaceMode: "",
+  takeawayPreviousPaperMapCollapsed: null,
   collapsedOutlineIds: new Set(),
   currentOutlineId: "",
   presentationReportOpen: false,
@@ -93,6 +98,7 @@ const state = {
   takeawayHistoryRestoring: false,
   collapsedTakeawayBlockIds: new Set(),
   takeawaySelectedBlockIds: new Set(),
+  takeawaySelectionMode: false,
   takeawayLastSelectedBlockId: "",
   takeawayDragBlockId: "",
   takeawayArrangePreview: null,
@@ -100,6 +106,7 @@ const state = {
   chatMode: "source",
   chatDraft: "",
   chatSelectionDraft: null,
+  chatUseProjectContext: false,
   chatSending: false,
   sensemakingWidth: null,
   reportWidth: null,
@@ -345,6 +352,27 @@ function allLibraryProjects() {
     for (const project of paperProjects(paper)) projects.add(project);
   }
   return Array.from(projects).sort((a, b) => a.localeCompare(b));
+}
+
+function projectContextFor(project) {
+  const clean = normalizeProjectName(project) || "collaborative";
+  return state.projectContexts?.contexts?.[clean] || { project: clean, source_path: "", cards: [] };
+}
+
+function currentPaperProject() {
+  const metadataProjects = paperProjects(state.payload?.metadata || {});
+  if (metadataProjects.length) return metadataProjects[0];
+  const paper = state.library?.papers?.find(item => item.id === state.currentPaperId);
+  return paperProject(paper) || state.projectContextPanel.project || "collaborative";
+}
+
+function projectContextCards(project) {
+  const cards = projectContextFor(project).cards;
+  return Array.isArray(cards) ? cards : [];
+}
+
+function hasProjectContextCards(project) {
+  return projectContextCards(project).length > 0;
 }
 
 function selectedLibraryIntakeTags() {
@@ -1140,7 +1168,7 @@ function effectiveAnnotationsFor(paragraphId, target) {
       range: annotation.range,
       quote: annotation.quote || "",
     });
-    return recalculated?.target === target ? { ...annotation, paired_range: recalculated } : annotation;
+    return recalculated?.target === target ? { ...annotation, paired_range: recalculated } : { ...annotation, paired_range: null };
   });
 }
 
@@ -2046,6 +2074,7 @@ async function loadLibrary() {
   const data = await api("/api/library");
   state.library = data.library;
   if (data.tag_dictionary) state.tagDictionary = data.tag_dictionary;
+  state.projectContexts = data.project_contexts || { version: 1, contexts: {} };
   qs("#workspaceLabel").textContent = data.workspace || "Local workspace";
   renderPaperSelect();
   const paperIds = new Set((state.library.papers || []).map(paper => paper.id));
@@ -4268,6 +4297,7 @@ async function loadPaper(paperId) {
   const referenceIndex = await api(`/api/papers/${encodeURIComponent(paperId)}/references`);
   state.references = referenceIndex.references || {};
   state.figures = buildFigureIndex(state.payload.segments || []);
+  state.paperMapTab = "map";
   state.annotations = state.payload.annotations?.annotations || [];
   state.thinking = normalizeThinkingData(state.payload.thinking || {});
   if (state.takeawaySaveTimer) clearTimeout(state.takeawaySaveTimer);
@@ -4480,6 +4510,75 @@ function buildFigureIndex(segments) {
     }
   }
   return figures;
+}
+
+function segmentIsTable(segment = {}) {
+  const text = segment.markdown || "";
+  return isHtmlTable(text) || segment.kind === "table" || text.includes("\n|");
+}
+
+function segmentIsImage(segment = {}) {
+  return Boolean(markdownImageInfo(segment.markdown || ""));
+}
+
+function figureEntryFromIndexedFigure(figure) {
+  const segmentId = figure.image_segment_id || figure.caption_segment_id || "";
+  if (!segmentId) return null;
+  return {
+    kind: "figure",
+    key: `figure-${figure.number}-${segmentId}`,
+    segment_id: segmentId,
+    image_segment_id: figure.image_segment_id || "",
+    caption_segment_id: figure.caption_segment_id || "",
+    title: `Figure ${figure.number}`,
+    caption: figure.caption || "",
+    src: figure.src || "",
+  };
+}
+
+function paperMapTableTitle(segment, fallbackIndex) {
+  const text = displayText(segment?.markdown || "").replace(/\s+/g, " ").trim();
+  const match = text.match(/\btable\s*([0-9]+[a-z]?)/i);
+  return match ? `Table ${match[1]}` : `Table ${fallbackIndex}`;
+}
+
+function paperMapMediaEntries() {
+  const entries = [];
+  const seenSegments = new Set();
+  const figures = Object.values(state.figures || {}).map(figureEntryFromIndexedFigure).filter(Boolean);
+  figures.sort((left, right) => segmentIdNumber(left.segment_id) - segmentIdNumber(right.segment_id));
+  for (const figure of figures) {
+    entries.push(figure);
+    if (figure.image_segment_id) seenSegments.add(figure.image_segment_id);
+    if (figure.caption_segment_id) seenSegments.add(figure.caption_segment_id);
+  }
+  let tableIndex = 1;
+  for (const segment of state.payload?.segments || []) {
+    if (!segment?.id) continue;
+    if (segmentIsTable(segment)) {
+      entries.push({
+        kind: "table",
+        key: `table-${segment.id}`,
+        segment_id: segment.id,
+        title: paperMapTableTitle(segment, tableIndex),
+        caption: segment.markdown || "",
+      });
+      tableIndex += 1;
+      continue;
+    }
+    if (segmentIsImage(segment) && !seenSegments.has(segment.id)) {
+      const image = markdownImageInfo(segment.markdown || "");
+      entries.push({
+        kind: "figure",
+        key: `image-${segment.id}`,
+        segment_id: segment.id,
+        title: "Figure",
+        caption: segment.markdown || "",
+        src: assetUrlForPaper(state.currentPaperId, image?.src || ""),
+      });
+    }
+  }
+  return entries.sort((left, right) => segmentIdNumber(left.segment_id) - segmentIdNumber(right.segment_id));
 }
 
 const presentationPaperGroups = [
@@ -5700,6 +5799,7 @@ function moveTakeawayBlock(dragId, targetId, after = false) {
 
 function updateTakeawaySelection(blockId, event, checked) {
   if (!blockId) return;
+  state.takeawaySelectionMode = true;
   const blocks = state.takeawayDoc?.blocks || [];
   const visibleIds = visibleTakeawayBlockEntries(blocks).map(item => item.block.id);
   if (event?.shiftKey && state.takeawayLastSelectedBlockId) {
@@ -5715,11 +5815,24 @@ function updateTakeawaySelection(blockId, event, checked) {
     state.takeawaySelectedBlockIds.delete(blockId);
   }
   state.takeawayLastSelectedBlockId = blockId;
+  if (!state.takeawaySelectedBlockIds.size) state.takeawaySelectionMode = false;
+  renderPresentationPanel(state.payload?.outline || {});
+}
+
+function enableTakeawaySelectionMode(blockId, event = null) {
+  if (!blockId) return;
+  event?.preventDefault?.();
+  state.takeawaySelectionMode = true;
+  if (!state.takeawaySelectedBlockIds.has(blockId)) {
+    state.takeawaySelectedBlockIds.add(blockId);
+    state.takeawayLastSelectedBlockId = blockId;
+  }
   renderPresentationPanel(state.payload?.outline || {});
 }
 
 function clearTakeawaySelection() {
   state.takeawaySelectedBlockIds.clear();
+  state.takeawaySelectionMode = false;
   state.takeawayLastSelectedBlockId = "";
   renderPresentationPanel(state.payload?.outline || {});
 }
@@ -5788,14 +5901,15 @@ function takeawayBlockHtml(block, index, blocks) {
   const collapsible = takeawayBlockHasChildren(blocks, index);
   const collapsed = collapsible && state.collapsedTakeawayBlockIds.has(block.id);
   const selected = state.takeawaySelectedBlockIds.has(block.id);
+  const hasUserNote = Boolean(displayText(block.note || ""));
+  const sourceKind = takeawayBlockSourceKind(block);
   const mediaSrc = takeawayBlockMediaSrc(block);
   const dragTitle = selected ? "Drag selected blocks to reorder" : "Drag this block to reorder";
   return `
-    <div class="takeaway-block takeaway-${escapeHtml(block.type)}${selected ? " selected" : ""}" data-takeaway-block="${escapeHtml(block.id)}" data-takeaway-collapsible="${collapsible ? "true" : "false"}" data-takeaway-collapsed="${collapsed ? "true" : "false"}" data-takeaway-selected="${selected ? "true" : "false"}" style="--takeaway-indent: ${indent}">
+    <div class="takeaway-block takeaway-${escapeHtml(block.type)}${selected ? " selected" : ""}${hasUserNote ? " takeaway-user-note" : sourceKind ? " takeaway-highlight-only" : ""}" data-takeaway-block="${escapeHtml(block.id)}" data-takeaway-collapsible="${collapsible ? "true" : "false"}" data-takeaway-collapsed="${collapsed ? "true" : "false"}" data-takeaway-selected="${selected ? "true" : "false"}" data-takeaway-source-kind="${escapeHtml(sourceKind)}" style="--takeaway-indent: ${indent}">
       <input class="takeaway-select" data-takeaway-select="${escapeHtml(block.id)}" type="checkbox" title="Select block" aria-label="Select report block" ${selected ? "checked" : ""}>
       <button class="takeaway-collapse-toggle" data-takeaway-collapse="${escapeHtml(block.id)}" type="button" title="${collapsed ? "Expand section" : "Collapse section"}" ${collapsible ? "" : "disabled aria-hidden=\"true\""}>${collapsible ? (collapsed ? "⌃" : "⌄") : ""}</button>
       <button class="takeaway-drag-handle" data-takeaway-drag="${escapeHtml(block.id)}" draggable="true" type="button" title="${escapeHtml(dragTitle)}" aria-label="${escapeHtml(dragTitle)}"><span aria-hidden="true"></span></button>
-      <button class="takeaway-type-button" data-takeaway-toggle-type="${escapeHtml(block.id)}" type="button" title="Toggle heading/bullet">${block.type === "heading" ? "H" : "B"}</button>
       <div class="takeaway-block-main">
         <div class="takeaway-block-text" data-takeaway-text="${escapeHtml(block.id)}" contenteditable="true" spellcheck="true" data-placeholder="${escapeHtml(placeholder)}">${escapeHtml(block.text || "").replace(/\n/g, "<br>")}</div>
         ${mediaSrc ? `<img class="takeaway-block-media" src="${escapeHtml(mediaSrc)}" alt="${escapeHtml(quote || block.text || "Original source image")}">` : ""}
@@ -5809,6 +5923,7 @@ function takeawayBlockHtml(block, index, blocks) {
       <div class="takeaway-block-actions">
         <button class="icon-button" data-takeaway-add="bullet" data-after-block="${escapeHtml(block.id)}" type="button" title="Add bullet below">+</button>
         <button class="icon-button" data-takeaway-add="heading" data-after-block="${escapeHtml(block.id)}" type="button" title="Add heading below">H</button>
+        <button class="takeaway-type-button" data-takeaway-toggle-type="${escapeHtml(block.id)}" type="button" title="Toggle heading/bullet">${block.type === "heading" ? "H" : "B"}</button>
         <button class="icon-button" data-takeaway-outdent="${escapeHtml(block.id)}" type="button" title="Outdent">&lt;</button>
         <button class="icon-button" data-takeaway-indent="${escapeHtml(block.id)}" type="button" title="Indent">&gt;</button>
         <button class="icon-button" data-takeaway-delete="${escapeHtml(block.id)}" type="button" title="Delete block">x</button>
@@ -5863,6 +5978,10 @@ function bindTakeawayEditorEvents() {
     });
   });
   qsa("[data-takeaway-block]").forEach(row => {
+    row.addEventListener("contextmenu", event => {
+      if (event.target.closest(".takeaway-block-actions, button, input, select, a")) return;
+      enableTakeawaySelectionMode(row.dataset.takeawayBlock, event);
+    });
     row.addEventListener("dragover", event => {
       if (!canDropTakeawayBlock(state.takeawayDragBlockId, row.dataset.takeawayBlock)) return;
       event.preventDefault();
@@ -5907,7 +6026,7 @@ function renderPresentationPanel(outline = state.payload?.outline || {}) {
     </div>
     <div class="takeaway-doc-guidance">Write directly in the report. Drag the grip to reorder, Tab / Shift+Tab changes hierarchy, and Source order can regroup evidence by the paper flow.</div>
     ${state.takeawayArrangePreview ? takeawayArrangePreviewHtml(state.takeawayArrangePreview) : ""}
-    <div class="takeaway-doc-editor" aria-label="Editable takeaway report">
+    <div class="takeaway-doc-editor${state.takeawaySelectionMode ? " takeaway-selection-mode" : ""}" aria-label="Editable takeaway report">
       ${visibleBlocks.map(item => takeawayBlockHtml(item.block, item.index, doc.blocks)).join("")}
     </div>`;
   bindTakeawayEditorEvents();
@@ -6014,6 +6133,18 @@ function renderSidebar() {
   const outline = state.payload?.outline || {};
   const list = qs("#outlineList");
   if (!list) return;
+  const mediaList = qs("#paperMapMediaList");
+  const activeTab = state.paperMapTab === "media" ? "media" : "map";
+  qsa("[data-paper-map-tab]").forEach(button => {
+    const active = button.dataset.paperMapTab === activeTab;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+  });
+  list.hidden = activeTab !== "map";
+  if (mediaList) {
+    mediaList.hidden = activeTab !== "media";
+    if (activeTab !== "media") mediaList.innerHTML = "";
+  }
   list.innerHTML = "";
   const outlineItems = outline.outline || [];
   for (const [index, item] of outlineItems.entries()) {
@@ -6046,8 +6177,79 @@ function renderSidebar() {
     list.appendChild(button);
   }
   if (!list.children.length) list.textContent = "No outline yet.";
+  if (activeTab === "media" && mediaList) renderPaperMapMediaList(mediaList);
   updateCurrentOutlineHint(outlineItems);
   renderPresentationPanel(outline);
+}
+
+function paperMapMediaCaption(text) {
+  return compactText(displayText(String(text || "").replace(/!\[[^\]]*\]\([^)]+\)/g, "")).replace(/\s+/g, " "), 150);
+}
+
+function paperMapTableCellsFromHtml(text) {
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(String(text || ""), "text/html");
+  return Array.from(doc.querySelectorAll("tr")).slice(0, 4).map(row => Array.from(row.children)
+    .filter(cell => /^(td|th)$/i.test(cell.tagName))
+    .slice(0, 3)
+    .map(cell => displayText(cell.textContent))
+  ).filter(row => row.length);
+}
+
+function paperMapTableCellsFromPipe(text) {
+  return String(text || "").split("\n")
+    .filter(line => line.includes("|"))
+    .map(line => line.replace(/^\||\|$/g, "").split("|").map(cell => displayText(cell)))
+    .filter(cells => !cells.every(cell => /^:?-{3,}:?$/.test(cell)))
+    .slice(0, 4)
+    .map(cells => cells.slice(0, 3));
+}
+
+function paperMapTablePreviewHtml(entry) {
+  const segment = segmentForId(entry.segment_id) || {};
+  const text = segment.markdown || entry.caption || "";
+  const rows = isHtmlTable(text) ? paperMapTableCellsFromHtml(text) : paperMapTableCellsFromPipe(text);
+  if (!rows.length) return `<div class="paper-map-media-placeholder">Table</div>`;
+  const columnCount = Math.max(1, Math.min(3, ...rows.map(row => row.length)));
+  const cells = rows.flatMap(row => {
+    const padded = [...row];
+    while (padded.length < columnCount) padded.push("");
+    return padded.slice(0, columnCount);
+  });
+  return `<div class="paper-map-mini-table" style="--paper-map-table-cols: ${columnCount}">${cells.map(cell => `<span>${escapeHtml(compactText(cell, 42))}</span>`).join("")}</div>`;
+}
+
+function paperMapFigurePreviewHtml(entry) {
+  if (!entry.src) return `<div class="paper-map-media-placeholder">Figure</div>`;
+  return `<div class="paper-map-media-thumb"><img src="${escapeHtml(entry.src)}" alt="${escapeHtml(entry.title)} preview" loading="lazy"></div>`;
+}
+
+function paperMapMediaEntryHtml(entry) {
+  const preview = entry.kind === "table" ? paperMapTablePreviewHtml(entry) : paperMapFigurePreviewHtml(entry);
+  const badge = entry.kind === "table" ? "Table" : "Figure";
+  const caption = paperMapMediaCaption(entry.caption || entry.title);
+  return `<button class="paper-map-media-card" data-paper-map-jump="${escapeHtml(entry.segment_id)}" type="button">
+    <span class="paper-map-media-head"><strong>${escapeHtml(entry.title)}</strong><small>${escapeHtml(badge)}</small></span>
+    ${preview}
+    ${caption ? `<span class="paper-map-media-caption">${escapeHtml(caption)}</span>` : ""}
+  </button>`;
+}
+
+function renderPaperMapMediaList(root) {
+  const entries = paperMapMediaEntries();
+  if (!entries.length) {
+    root.innerHTML = `<div class="paper-map-empty">No figures or tables found in this parsed paper.</div>`;
+    return;
+  }
+  root.innerHTML = `<div class="paper-map-media-summary">${entries.length} visual checkpoints</div>${entries.map(paperMapMediaEntryHtml).join("")}`;
+  root.querySelectorAll("[data-paper-map-jump]").forEach(button => {
+    button.addEventListener("click", () => scrollToParagraph(button.dataset.paperMapJump));
+  });
+}
+
+function setPaperMapTab(tab) {
+  state.paperMapTab = tab === "media" ? "media" : "map";
+  renderSidebar();
 }
 
 function setWorkspaceMode(mode) {
@@ -6058,7 +6260,7 @@ function setWorkspaceMode(mode) {
   const workspace = qs(".reader-workspace");
   if (workspace) workspace.dataset.workspaceMode = nextMode;
   qsa("[data-workspace-mode]").forEach(button => button.classList.toggle("active", button.dataset.workspaceMode === nextMode));
-  if (nextMode !== "split" && state.presentationReportOpen) setReaderSidePane("sensemaking");
+  if (nextMode === "read" && state.presentationReportOpen) setReaderSidePane("sensemaking");
   updateAnnotationToolbarVisibility();
 }
 
@@ -6144,13 +6346,26 @@ function setReaderSidePane(pane) {
 }
 
 function openPresentationReport() {
-  if (state.workspaceMode === "read") setWorkspaceMode("split");
+  if (!state.presentationReportOpen) {
+    state.takeawayPreviousWorkspaceMode = state.workspaceMode || "split";
+    state.takeawayPreviousPaperMapCollapsed = state.paperMapCollapsed;
+  }
+  if (!state.paperMapCollapsed) setPaperMapCollapsed(true);
+  if (state.workspaceMode !== "think") setWorkspaceMode("think");
   renderPresentationPanel(state.payload?.outline || {});
   setReaderSidePane("takeaway");
 }
 
 function closePresentationReport() {
   setReaderSidePane("sensemaking");
+  const previousMode = state.takeawayPreviousWorkspaceMode || "split";
+  const previousPaperMapCollapsed = state.takeawayPreviousPaperMapCollapsed;
+  state.takeawayPreviousWorkspaceMode = "";
+  state.takeawayPreviousPaperMapCollapsed = null;
+  if (state.workspaceMode === "think") setWorkspaceMode(previousMode === "think" ? "split" : previousMode);
+  if (typeof previousPaperMapCollapsed === "boolean" && state.paperMapCollapsed !== previousPaperMapCollapsed) {
+    setPaperMapCollapsed(previousPaperMapCollapsed);
+  }
 }
 
 function togglePresentationReport() {
@@ -7036,6 +7251,8 @@ function chatSelectionRefs() {
 
 function chatComposerHtml() {
   const selectionRefs = chatSelectionRefs();
+  const project = currentPaperProject();
+  const projectCardCount = projectContextCards(project).length;
   return `
     <section class="sense-section thinking-agent-compose">
       <div class="sense-section-heading">
@@ -7051,6 +7268,11 @@ function chatComposerHtml() {
         <p class="thinking-chat-mode-help">${escapeHtml(chatModeHint())}</p>
       </div>
       ${selectionRefs.length ? `<div class="thinking-chat-selection"><span>Quoted from paper</span>${selectionRefsHtml(selectionRefs)}<button class="icon-button" id="clearChatSelection" type="button" title="Clear quoted source">x</button></div>` : ""}
+      <label class="thinking-project-context-toggle ${projectCardCount ? "" : "disabled"}">
+        <input id="useProjectContext" type="checkbox" ${state.chatUseProjectContext && projectCardCount ? "checked" : ""} ${projectCardCount ? "" : "disabled"} />
+        <span>Use Project Context</span>
+        <small>${escapeHtml(project)} · ${escapeHtml(projectCardCount)} cards</small>
+      </label>
       <textarea id="thinkingChatInput" class="sense-textarea" rows="4" placeholder="Ask the agent..." ${state.chatSending ? "disabled" : ""}>${escapeHtml(state.chatDraft || "")}</textarea>
       <div class="thinking-chat-actions">
         <button id="sendThinkingChat" class="primary-button" type="button" ${state.chatSending ? "disabled" : ""}>${state.chatSending ? "Thinking..." : "Send"}</button>
@@ -7122,7 +7344,7 @@ async function sendThinkingChat() {
   try {
     const response = await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/chat`, {
       method: "POST",
-      body: JSON.stringify({ message, mode: state.chatMode, selection_refs: chatSelectionRefs() }),
+      body: JSON.stringify({ message, mode: state.chatMode, selection_refs: chatSelectionRefs(), use_project_context: state.chatUseProjectContext, project: currentPaperProject() }),
     });
     state.thinking = normalizeThinkingData(response.thinking || state.thinking, { seed: false });
     if (state.payload) state.payload.thinking = state.thinking;
@@ -7161,7 +7383,8 @@ function askAiFromCurrentSelection() {
 }
 
 function thinkingBlockHtml(block) {
-  const promptHtml = block.prompt ? `<div class="thinking-block-prompt"><span>${escapeHtml(modeLabel(block.mode))}</span><p>${escapeHtml(block.prompt)}</p>${selectionRefsHtml(block.selection_refs)}</div>` : "";
+  const projectContext = block.project_context && block.project_context.card_count ? `<div class="thinking-context-chip">Used Project Context · ${escapeHtml(block.project_context.project || "project")} · ${escapeHtml(block.project_context.card_count)} cards</div>` : "";
+  const promptHtml = block.prompt ? `<div class="thinking-block-prompt"><span>${escapeHtml(modeLabel(block.mode))}</span><p>${escapeHtml(block.prompt)}</p>${selectionRefsHtml(block.selection_refs)}${projectContext}</div>` : "";
   const sourceLinks = hasInlineParagraphRefs(block.content) ? "" : sourceRefsHtml(block.source_refs);
   return `
     <section class="thinking-block" data-thinking-block-card="${escapeHtml(block.id)}">
@@ -7234,6 +7457,7 @@ function renderWritingPane() {
     renderWritingPane();
   }));
   qs("#thinkingChatInput")?.addEventListener("input", event => { state.chatDraft = event.target.value; });
+  qs("#useProjectContext")?.addEventListener("change", event => { state.chatUseProjectContext = event.target.checked; });
   qs("#thinkingChatInput")?.addEventListener("keydown", event => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
@@ -7451,8 +7675,6 @@ function focusThinkingAnnotation(annotationId) {
 
 async function deleteThinkingAnnotation(annotationId) {
   if (!state.thinking || !annotationId) return;
-  const confirmed = window.confirm("Delete this AI-output highlight/note?");
-  if (!confirmed) return;
   const annotation = state.thinking.annotations.find(item => item.id === annotationId);
   state.thinking.annotations = state.thinking.annotations.filter(item => item.id !== annotationId);
   refreshThinkingAnnotationSurfaces(annotation?.block_id || "");
@@ -7462,8 +7684,6 @@ async function deleteThinkingAnnotation(annotationId) {
 
 async function deleteThinkingAnnotationFromPaper(paperId, annotationId) {
   if (!paperId || !annotationId) return;
-  const confirmed = window.confirm("Delete this Paper Brief / AI-output highlight/note?");
-  if (!confirmed) return;
   const payload = paperId === state.currentPaperId ? state.payload : await api(`/api/papers/${encodeURIComponent(paperId)}`);
   const thinking = normalizeThinkingData(payload?.thinking || {}, { seed: false });
   thinking.annotations = (thinking.annotations || []).filter(item => item.id !== annotationId);
@@ -7799,6 +8019,45 @@ function bindReferenceAddButtons() {
     button.dataset.bound = "true";
     button.addEventListener("click", () => openExistingReferencePaper(button.dataset.openExistingReference));
   });
+  qsa("[data-reference-importance]").forEach(button => {
+    if (button.dataset.bound === "true") return;
+    button.dataset.bound = "true";
+    button.addEventListener("click", () => setReferenceImportance(button.dataset.referenceImportance, button.dataset.importanceLevel));
+  });
+}
+
+function referenceImportanceEditorHtml(number, level = 0) {
+  const current = normalizeImportanceLevel(level);
+  return `<div class="importance-star-editor importance-star-editor-quick${current ? "" : " is-empty"}" aria-label="Reference paper importance">
+    <div class="importance-star-buttons">
+      ${[1, 2, 3].map(star => `<button class="importance-star-button ${star <= current ? "active" : ""}" data-reference-importance="${escapeHtml(number)}" data-importance-level="${star}" type="button" aria-label="${star === current ? "Clear importance" : `Set importance to ${star} star${star === 1 ? "" : "s"}`}" aria-pressed="${star <= current ? "true" : "false"}" title="${star === current ? "Click again to clear importance" : `Set to ${star}/${maxImportanceStars}`}">${star <= current ? "★" : "☆"}</button>`).join("")}
+    </div>
+    <span class="importance-star-label" data-reference-importance-label="${escapeHtml(number)}">${current ? `${current}/${maxImportanceStars}` : "No stars"}</span>
+  </div>`;
+}
+
+function selectedReferenceImportance(number) {
+  const buttons = qsa(`[data-reference-importance="${cssEscape(number)}"].active`);
+  return buttons.reduce((level, button) => Math.max(level, normalizeImportanceLevel(button.dataset.importanceLevel)), 0);
+}
+
+function setReferenceImportance(number, level) {
+  const clicked = normalizeImportanceLevel(level);
+  const current = selectedReferenceImportance(number);
+  const next = clicked === current ? 0 : clicked;
+  qsa(`[data-reference-importance="${cssEscape(number)}"]`).forEach(button => {
+    const star = normalizeImportanceLevel(button.dataset.importanceLevel);
+    const active = star <= next;
+    button.classList.toggle("active", active);
+    button.textContent = active ? "★" : "☆";
+    button.setAttribute("aria-pressed", active ? "true" : "false");
+    button.setAttribute("aria-label", star === next ? "Clear importance" : `Set importance to ${star} star${star === 1 ? "" : "s"}`);
+    button.title = star === next ? "Click again to clear importance" : `Set to ${star}/${maxImportanceStars}`;
+  });
+  const label = document.querySelector(`[data-reference-importance-label="${cssEscape(number)}"]`);
+  if (label) label.textContent = next ? `${next}/${maxImportanceStars}` : "No stars";
+  const editor = document.querySelector(`[data-reference-card="${cssEscape(number)}"] .importance-star-editor`);
+  editor?.classList.toggle("is-empty", !next);
 }
 
 async function openExistingReferencePaper(paperId) {
@@ -7813,6 +8072,7 @@ function referenceCardHtml(card) {
   const abstract = card.abstract || "";
   const abstractZh = card.abstract_zh || "";
   const tagOptions = allLibraryTags();
+  const projectOptions = allLibraryProjects();
   const existingPaper = libraryDuplicateByTitle(card.title || "");
   return `
     <section class="reference-card" data-reference-card="${escapeHtml(number)}">
@@ -7822,12 +8082,33 @@ function referenceCardHtml(card) {
           ? `<button class="secondary-button reference-add-button" disabled type="button">已在 Library</button><button class="secondary-button" data-open-existing-reference="${escapeHtml(existingPaper.id)}" type="button">Open existing</button>`
           : `<button class="primary-button reference-add-button" data-add-reference="${escapeHtml(number)}">+ 添加</button>`}
         <span class="reference-help">${existingPaper ? `Already in Library · ${escapeHtml(duplicatePaperSummary(existingPaper) || paperTitle(existingPaper))}` : card.loadingOnline && !abstract ? "已显示本地解析，正在后台补在线摘要..." : "添加该文章以便稍后阅读，status: unread"}</span>
-        ${existingPaper ? "" : `<div class="reference-tag-row">
-          <select data-reference-tag-select="${escapeHtml(number)}">
-            <option value="">Add existing tag...</option>
-            ${tagOptions.map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`).join("")}
-          </select>
-          <input data-reference-tag-input="${escapeHtml(number)}" placeholder="Custom tag" />
+        ${existingPaper ? "" : `<div class="reference-intake-grid">
+          <label class="reference-field">
+            <span>Paper tag</span>
+            <select data-reference-tag-select="${escapeHtml(number)}">
+              <option value="">Add existing tag...</option>
+              ${tagOptions.map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(libraryTagLabel(tag))}</option>`).join("")}
+            </select>
+          </label>
+          <label class="reference-field">
+            <span>Custom tag</span>
+            <input data-reference-tag-input="${escapeHtml(number)}" placeholder="Custom tag" />
+          </label>
+          <label class="reference-field">
+            <span>Project</span>
+            <select data-reference-project-select="${escapeHtml(number)}">
+              <option value="">Add project...</option>
+              ${projectOptions.map(project => `<option value="${escapeHtml(project)}">${escapeHtml(project)}</option>`).join("")}
+            </select>
+          </label>
+          <label class="reference-field">
+            <span>New project</span>
+            <input data-reference-project-input="${escapeHtml(number)}" placeholder="New project" />
+          </label>
+          <div class="reference-field reference-importance-field">
+            <span>Importance</span>
+            ${referenceImportanceEditorHtml(number)}
+          </div>
         </div>`}
       </div>`}
       <dl class="reference-meta">
@@ -7851,9 +8132,18 @@ async function addReferenceToLibrary(number) {
   const button = document.querySelector(`[data-add-reference="${cssEscape(number)}"]`);
   const selectedTag = document.querySelector(`[data-reference-tag-select="${cssEscape(number)}"]`)?.value?.trim() || "";
   const customTag = document.querySelector(`[data-reference-tag-input="${cssEscape(number)}"]`)?.value?.trim() || "";
+  const selectedProject = normalizeProjectName(document.querySelector(`[data-reference-project-select="${cssEscape(number)}"]`)?.value || "");
+  const customProject = normalizeProjectName(document.querySelector(`[data-reference-project-input="${cssEscape(number)}"]`)?.value || "");
+  const projects = uniqueTags([selectedProject, customProject].filter(Boolean));
+  if (customProject && !allLibraryProjects().includes(customProject)) {
+    state.libraryCustomProjects = uniqueTags([...state.libraryCustomProjects, customProject]);
+    saveCustomLibraryProjects();
+  }
   const body = {
     title: cardNode?.querySelector(".reference-meta dd")?.textContent?.trim() || card.title,
     tags: [...new Set([selectedTag, customTag].filter(Boolean))],
+    projects,
+    importance: selectedReferenceImportance(number) || "",
   };
   if (button) {
     button.disabled = true;
@@ -7956,41 +8246,100 @@ function clampRangeToText(range, text) {
   return end > start ? { start, end } : null;
 }
 
+function trimRangeToText(range, text) {
+  const raw = String(text || "");
+  const clamped = clampRangeToText(range, raw);
+  if (!clamped) return null;
+  let { start, end } = clamped;
+  while (start < end && /\s/.test(raw[start])) start += 1;
+  while (end > start && /\s/.test(raw[end - 1])) end -= 1;
+  return end > start ? { start, end } : null;
+}
+
+function tokenHitEvidence(hits) {
+  const uniqueTokens = new Set(hits.map(hit => String(hit.token || "").toLowerCase()));
+  const strongHits = hits.filter(hit => /^\d+$/.test(hit.token) || String(hit.token || "").length >= 6);
+  return { uniqueCount: uniqueTokens.size, strongCount: strongHits.length };
+}
+
+function pairedCandidateRange(range, text) {
+  const trimmed = trimRangeToText(range, text);
+  if (!trimmed) return null;
+  const candidate = String(text || "").slice(trimmed.start, trimmed.end);
+  const mediaIndex = candidate.search(/!\[[^\]]*\]\(/);
+  if (mediaIndex > 0) return trimRangeToText({ start: trimmed.start, end: trimmed.start + mediaIndex }, text);
+  return trimmed;
+}
+
 function rangeFromSharedTokens(toText, target, tokens, ratioHint) {
   const hits = findTokenHits(toText, tokens);
   if (!hits.length) return null;
   const sentences = sentenceRanges(toText, target);
   const sentenceScores = sentences.map(sentence => {
     const sentenceHits = hits.filter(hit => hit.start >= sentence.start && hit.end <= sentence.end);
+    const evidence = tokenHitEvidence(sentenceHits);
     const score = sentenceHits.reduce((sum, hit) => sum + Math.max(1, hit.token.length / 4), 0);
     const center = (sentence.start + sentence.end) / 2;
-    const distancePenalty = Math.abs(center / Math.max(1, toText.length) - ratioHint) * 2;
-    return { sentence, sentenceHits, score: score - distancePenalty };
+    const distance = Math.abs(center / Math.max(1, toText.length) - ratioHint);
+    const distancePenalty = distance * 2;
+    return { sentence, sentenceHits, evidence, distance, score: score - distancePenalty };
   }).filter(item => item.sentenceHits.length);
   if (!sentenceScores.length) return null;
   sentenceScores.sort((a, b) => b.score - a.score);
   const best = sentenceScores[0];
+  if (best.evidence.uniqueCount < 2 && !(best.evidence.strongCount >= 1 && best.distance <= 0.22)) return null;
   const minHit = Math.min(...best.sentenceHits.map(hit => hit.start));
   const maxHit = Math.max(...best.sentenceHits.map(hit => hit.end));
   const sentenceLength = best.sentence.end - best.sentence.start;
   if (sentenceLength > 260 && maxHit > minHit) {
     const windowStart = Math.max(best.sentence.start, minHit - 56);
     const windowEnd = Math.min(best.sentence.end, maxHit + 88);
-    return clampRangeToText({ start: windowStart, end: windowEnd }, toText);
+    return pairedCandidateRange({ start: windowStart, end: windowEnd }, toText);
   }
-  return clampRangeToText(best.sentence, toText);
+  return pairedCandidateRange(best.sentence, toText);
 }
 
-function proportionalPairedRange(fromText, toText, selectionInfo, target) {
-  const fromLength = Math.max(1, fromText.length);
-  const ratioStart = Math.max(0, Math.min(1, selectionInfo.range.start / fromLength));
-  const ratioEnd = Math.max(ratioStart, Math.min(1, selectionInfo.range.end / fromLength));
-  const midpoint = ((ratioStart + ratioEnd) / 2) * toText.length;
-  const sentences = sentenceRanges(toText, target);
-  const sentence = rangeContainingOffset(sentences, midpoint);
-  if (sentence) return clampRangeToText(sentence, toText);
-  const approxWidth = Math.max(24, Math.min(220, (ratioEnd - ratioStart) * toText.length * 1.6));
-  return clampRangeToText({ start: midpoint - approxWidth / 2, end: midpoint + approxWidth / 2 }, toText);
+function selectionSentenceSpan(sentences, range) {
+  const start = Number(range?.start || 0);
+  const end = Number(range?.end || start);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  const overlaps = sentences.map((sentence, index) => ({
+    index,
+    sentence,
+    overlap: Math.max(0, Math.min(sentence.end, end) - Math.max(sentence.start, start)),
+  })).filter(item => item.overlap > 0);
+  if (!overlaps.length) return null;
+  return {
+    startIndex: overlaps[0].index,
+    endIndex: overlaps[overlaps.length - 1].index,
+    overlap: overlaps.reduce((sum, item) => sum + item.overlap, 0),
+  };
+}
+
+function mappedSentenceIndex(index, fromCount, toCount) {
+  if (fromCount <= 1 || toCount <= 1) return 0;
+  return Math.max(0, Math.min(toCount - 1, Math.round((index / (fromCount - 1)) * (toCount - 1))));
+}
+
+function sentenceAlignedPairedRange(fromText, toText, selectionInfo, target) {
+  const fromSentences = sentenceRanges(fromText, selectionInfo.target);
+  const toSentences = sentenceRanges(toText, target);
+  if (!fromSentences.length || !toSentences.length) return null;
+  const span = selectionSentenceSpan(fromSentences, selectionInfo.range);
+  if (!span) return null;
+  const fromCount = fromSentences.length;
+  const toCount = toSentences.length;
+  const countDelta = Math.abs(fromCount - toCount);
+  if (fromCount > 1 && toCount > 1 && countDelta > Math.max(1, Math.floor(Math.max(fromCount, toCount) * 0.25))) return null;
+  const sourceSentenceStart = fromSentences[span.startIndex].start;
+  const sourceSentenceEnd = fromSentences[span.endIndex].end;
+  const sourceSentenceLength = Math.max(1, sourceSentenceEnd - sourceSentenceStart);
+  const selectionLength = Math.max(0, Number(selectionInfo.range?.end || 0) - Number(selectionInfo.range?.start || 0));
+  const coversEnoughSentence = span.overlap / sourceSentenceLength >= 0.45 || selectionLength >= 90 || span.endIndex > span.startIndex;
+  if (!coversEnoughSentence) return null;
+  const startIndex = mappedSentenceIndex(span.startIndex, fromCount, toCount);
+  const endIndex = Math.max(startIndex, mappedSentenceIndex(span.endIndex, fromCount, toCount));
+  return pairedCandidateRange({ start: toSentences[startIndex].start, end: toSentences[endIndex].end }, toText);
 }
 
 function pairedRangeForSelection(segment, selectionInfo) {
@@ -8002,15 +8351,34 @@ function pairedRangeForSelection(segment, selectionInfo) {
   const ratioHint = midpoint / Math.max(1, fromText.length);
   const quote = selectionInfo.quote || fromText.slice(selectionInfo.range.start, selectionInfo.range.end);
   const localContext = fromText.slice(Math.max(0, selectionInfo.range.start - 90), Math.min(fromText.length, selectionInfo.range.end + 90));
-  const tokenRange = rangeFromSharedTokens(toText, target, meaningfulAlignmentTokens(`${quote} ${localContext}`), ratioHint);
-  const range = tokenRange || proportionalPairedRange(fromText, toText, selectionInfo, target);
+  const selectedSpan = selectionSentenceSpan(sentenceRanges(fromText, selectionInfo.target), selectionInfo.range);
+  const spansMultipleSentences = selectedSpan && selectedSpan.endIndex > selectedSpan.startIndex;
+  const tokenRange = spansMultipleSentences ? null : (
+    rangeFromSharedTokens(toText, target, meaningfulAlignmentTokens(quote), ratioHint)
+      || rangeFromSharedTokens(toText, target, meaningfulAlignmentTokens(`${quote} ${localContext}`), ratioHint)
+  );
+  const range = tokenRange || sentenceAlignedPairedRange(fromText, toText, selectionInfo, target);
   if (!range) return null;
-  return { ...range, target, quote: toText.slice(range.start, range.end) };
+  const pairedQuote = toText.slice(range.start, range.end);
+  if (target === "translation" && /[\u4e00-\u9fff]/.test(toText) && !/[\u4e00-\u9fff]/.test(pairedQuote)) return null;
+  if (target === "source" && /[A-Za-z]{3,}/.test(toText) && !/[A-Za-z]{3,}/.test(pairedQuote)) return null;
+  return { ...range, target, quote: pairedQuote };
 }
 
 function sentenceRanges(text, target) {
   const raw = String(text || "");
   if (!raw.trim()) return [];
+  if (typeof Intl !== "undefined" && Intl.Segmenter) {
+    try {
+      const locale = target === "translation" ? "zh" : "en";
+      const ranges = Array.from(new Intl.Segmenter(locale, { granularity: "sentence" }).segment(raw))
+        .map(segment => trimRangeToText({ start: segment.index, end: segment.index + segment.segment.length }, raw))
+        .filter(Boolean);
+      if (ranges.length) return ranges;
+    } catch (error) {
+      // Fall back to punctuation splitting below when Intl.Segmenter is unavailable or rejects a locale.
+    }
+  }
   const ranges = [];
   let start = 0;
   const punctuation = target === "translation" ? /[。！？；.!?;]/ : /[.!?;]/;
@@ -8380,8 +8748,6 @@ async function saveAnnotations() {
 
 async function deleteAnnotation(annotationId, paperId = state.currentPaperId) {
   if (!annotationId || !paperId) return;
-  const confirmed = window.confirm("Delete this highlight/note?");
-  if (!confirmed) return;
   const payload = paperId === state.currentPaperId ? state.payload : await api(`/api/papers/${encodeURIComponent(paperId)}`);
   const annotations = payload?.annotations?.annotations || [];
   const target = annotations.find(item => item.id === annotationId);
@@ -8522,7 +8888,7 @@ function previewEffectiveAnnotationsFor(segment, payload, target) {
       range: annotation.range,
       quote: annotation.quote || "",
     });
-    return recalculated?.target === target ? { ...annotation, paired_range: recalculated } : annotation;
+    return recalculated?.target === target ? { ...annotation, paired_range: recalculated } : { ...annotation, paired_range: null };
   });
 }
 
@@ -10108,6 +10474,45 @@ function libraryRowsHtml(papers) {
   return rows.join("");
 }
 
+function projectContextPanelHtml() {
+  if (!state.projectContextPanel.open) return "";
+  const projects = allLibraryProjects();
+  const fallbackProject = state.libraryProject !== "all" && state.libraryProject !== "Unassigned" ? state.libraryProject : "collaborative";
+  const project = projects.includes(state.projectContextPanel.project) ? state.projectContextPanel.project : fallbackProject;
+  state.projectContextPanel.project = project;
+  const context = projectContextFor(project);
+  const cards = projectContextCards(project);
+  const sourcePath = context.source_path || "";
+  return `
+    <section class="project-context-panel" aria-label="Project Context">
+      <div class="project-context-header">
+        <div>
+          <span class="sense-kicker">Project Context</span>
+          <h2>${escapeHtml(project)}</h2>
+        </div>
+        <button class="icon-button" id="closeProjectContextPanel" type="button" title="Close Project Context">x</button>
+      </div>
+      <div class="project-context-controls">
+        <label>Project <select id="projectContextProject">
+          ${projects.map(item => `<option value="${escapeHtml(item)}" ${item === project ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
+        </select></label>
+        <label class="project-context-source-field">Source file <input id="projectContextSourcePath" type="text" value="${escapeHtml(sourcePath)}" placeholder="E:\\path\\to\\outline.html" /></label>
+        <button class="primary-button mini-button" id="refreshProjectContext" type="button" ${state.projectContextPanel.saving ? "disabled" : ""}>${state.projectContextPanel.saving ? "Refreshing..." : "Save + Refresh"}</button>
+      </div>
+      <div class="project-context-status ${state.projectContextPanel.error ? "error" : ""}">
+        ${state.projectContextPanel.error ? escapeHtml(state.projectContextPanel.error) : `${escapeHtml(cards.length)} context cards${context.source_chars ? ` · ${escapeHtml(context.source_chars)} source chars` : ""}${context.refreshed_at ? ` · refreshed ${escapeHtml(context.refreshed_at.slice(0, 16).replace("T", " "))}` : ""}`}
+      </div>
+      <div class="project-context-card-list">
+        ${cards.length ? cards.slice(0, 8).map(card => `
+          <article class="project-context-card">
+            <div class="project-context-card-top"><span>${escapeHtml(card.type || "background")}</span><strong>${escapeHtml(card.title || "Context")}</strong></div>
+            <p>${escapeHtml(card.summary || "")}</p>
+          </article>
+        `).join("") : '<p class="muted small-text">Connect a local outline file, then refresh to create compact cards for AI chat and future Mindmap use.</p>'}
+      </div>
+    </section>`;
+}
+
 function libraryRowHtml(paper) {
   const readStatus = paper.read_status || "unread";
   return `
@@ -10156,7 +10561,9 @@ function renderLibrary() {
     <div class="library-view-tabs" aria-label="Project views">
       ${viewChips.map(view => `<button class="library-view-tab ${state.libraryView === view ? "active" : ""}" data-library-view="${escapeHtml(view)}" type="button">${view === "all" ? "All papers" : escapeHtml(view)}</button>`).join("")}
       <button class="library-view-tab library-new-project-view" id="createLibraryProjectView" type="button">+ Project view</button>
+      <button class="library-view-tab project-context-entry ${state.projectContextPanel.open ? "active" : ""}" id="openProjectContextPanel" type="button">Project Context</button>
     </div>
+    ${projectContextPanelHtml()}
     <div class="library-controls library-grid-controls">
       <input id="libraryFilter" type="search" value="${escapeHtml(state.libraryFilter)}" placeholder="Search title, author, project, importance, journal, year, tags" />
       <label>Project <select id="libraryProject">
@@ -10214,6 +10621,21 @@ function renderLibrary() {
   });
   qsa("[data-library-view]").forEach(button => button.addEventListener("click", () => applyLibraryView(button.dataset.libraryView || "all")));
   qs("#createLibraryProjectView")?.addEventListener("click", createLibraryProjectView);
+  qs("#openProjectContextPanel")?.addEventListener("click", () => {
+    state.projectContextPanel.open = !state.projectContextPanel.open;
+    if (state.libraryProject !== "all" && state.libraryProject !== "Unassigned") state.projectContextPanel.project = state.libraryProject;
+    renderLibrary();
+  });
+  qs("#closeProjectContextPanel")?.addEventListener("click", () => {
+    state.projectContextPanel.open = false;
+    renderLibrary();
+  });
+  qs("#projectContextProject")?.addEventListener("change", event => {
+    state.projectContextPanel.project = event.target.value || "collaborative";
+    state.projectContextPanel.error = "";
+    renderLibrary();
+  });
+  qs("#refreshProjectContext")?.addEventListener("click", refreshProjectContextFromPanel);
   qs("#resetLibraryColumns")?.addEventListener("click", resetLibraryColumnWidths);
   qs("#toggleLibraryTitles")?.addEventListener("click", () => {
     state.libraryTitlesCollapsed = !state.libraryTitlesCollapsed;
@@ -10238,6 +10660,27 @@ function createLibraryProjectView() {
     saveCustomLibraryProjects();
   }
   applyLibraryView(project);
+}
+
+async function refreshProjectContextFromPanel() {
+  const project = normalizeProjectName(qs("#projectContextProject")?.value || state.projectContextPanel.project || "collaborative");
+  const sourcePath = qs("#projectContextSourcePath")?.value?.trim() || "";
+  if (!project) return;
+  state.projectContextPanel = { ...state.projectContextPanel, open: true, project, saving: true, error: "" };
+  renderLibrary();
+  try {
+    const response = await api(`/api/project-contexts/${encodeURIComponent(project)}`, {
+      method: "POST",
+      body: JSON.stringify({ source_path: sourcePath, refresh: true }),
+    });
+    state.projectContexts = response.project_contexts || state.projectContexts;
+    state.projectContextPanel = { ...state.projectContextPanel, open: true, project, saving: false, error: "" };
+    toast("Project context refreshed");
+  } catch (error) {
+    state.projectContextPanel = { ...state.projectContextPanel, open: true, project, saving: false, error: error.message };
+    toast(`Project context failed: ${error.message}`);
+  }
+  renderLibrary();
 }
 
 function setMetadataSaveState(paperId, message, kind = "") {
@@ -10472,6 +10915,7 @@ function bindEvents() {
   qs("#togglePaperMap")?.addEventListener("click", () => setPaperMapCollapsed(true));
   qs("#togglePaperMapMain")?.addEventListener("click", () => setPaperMapCollapsed(!state.paperMapCollapsed));
   qs("#paperMapRail")?.addEventListener("click", () => setPaperMapCollapsed(false));
+  qsa("[data-paper-map-tab]").forEach(button => button.addEventListener("click", () => setPaperMapTab(button.dataset.paperMapTab)));
   qsa("[data-thinking-tab]").forEach(button => button.addEventListener("click", () => {
     state.thinkingTab = button.dataset.thinkingTab || "explain";
     renderSensemakingPanel();
