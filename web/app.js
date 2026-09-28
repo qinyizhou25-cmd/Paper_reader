@@ -433,7 +433,7 @@ async function exportReadingData(format) {
 const defaultNoteTags = [];
 const paperBriefBlockId = "paper-brief";
 const defaultLibraryProjects = ["collaborative", "memories"];
-const defaultPdfLibraryPath = "E:\\论文库\\";
+const defaultPdfLibraryPath = "";
 const readingSkimmedMs = 2500;
 const readingCarefulMs = 20000;
 const maxImportanceStars = 3;
@@ -13103,7 +13103,7 @@ function projectContextPanelHtml() {
         <label>Project <select id="projectContextProject">
           ${projects.map(item => `<option value="${escapeHtml(item)}" ${item === project ? "selected" : ""}>${escapeHtml(item)}</option>`).join("")}
         </select></label>
-        <label class="project-context-source-field">Source file <input id="projectContextSourcePath" type="text" value="${escapeHtml(sourcePath)}" placeholder="E:\\path\\to\\outline.html" /></label>
+        <label class="project-context-source-field">Source file <input id="projectContextSourcePath" type="text" value="${escapeHtml(sourcePath)}" placeholder="Path to the project context file" /></label>
         <button class="primary-button mini-button" id="refreshProjectContext" type="button" ${state.projectContextPanel.saving ? "disabled" : ""}>${state.projectContextPanel.saving ? "Refreshing..." : "Save + Refresh"}</button>
       </div>
       <div class="project-context-status ${state.projectContextPanel.error ? "error" : ""}">

@@ -507,7 +507,8 @@ responses. Exports do not infer which sentences are questions.
 
 Tab lists and view positions live in browser preferences; paper content,
 translations, and saved notes remain server-side local files. Tab preferences
-are not a backup. Cross-computer session handoff and Mac migration are deferred.
+are not a backup. Automatic data migration and cross-computer session handoff
+are deferred; platform setup is described below.
 
 Paper Reader Agent imports papers into a local file-backed workspace, serves an anchored web reader, stores highlights and notes as JSON/Markdown, and provides optional AI-assisted paper briefs, translation, skim summaries, source-grounded chat, citation/video helpers, and browser-side paper brief capture. It is intended for small-group trial use: users keep papers and notes on their own machine, and each user supplies their own API keys.
 
@@ -535,6 +536,8 @@ paper-reader-agent/
     styles.css
   chrome_extension/            # Optional browser side panel helper
   paper-reader-app.ps1         # Optional Windows launcher
+  paper-reader-app.command     # Foreground macOS / POSIX launcher
+  requirements-pdf.txt         # Optional PDF preview/page-count helpers only
   .env.example                 # API-key/environment reference
 ```
 
@@ -563,12 +566,16 @@ paper_reading_workspace/
 
 - Python 3.10+.
 - Windows PowerShell is the most tested environment, but the backend is plain Python standard library.
+- Optional PDF preview/page-count helpers: `pypdfium2`, `Pillow`, and `pypdf`, listed separately in `requirements-pdf.txt`.
 - Optional PDF conversion backend such as MinerU. Raw Markdown import works without MinerU.
 - Optional Kimi / Moonshot API key for Paper Brief generation, Kimi PDF text extraction, source-grounded chat, cloud translation, and the Chrome side-panel brief workflow.
 - Optional Ollama for local translation when no Kimi key is configured.
 - Optional YouTube API key for related-video search.
 
-No Python package install is required for the core server. External tools such as MinerU must be installed separately if you want PDF parsing.
+No Python package install is required for the core server, saved-paper reading,
+notes, or raw Markdown import. `requirements-pdf.txt` is optional, not a core
+requirements file and not a MinerU installer. External tools such as MinerU
+must be installed separately if you want PDF-to-Markdown conversion.
 
 KaTeX 0.17.0 is bundled locally for equation rendering, including its CSS and
 fonts. Its [MIT license](web/vendor/katex/LICENSE) is included with the assets.
@@ -580,13 +587,54 @@ Python backend and browser UI; separate long-lived Windows and Mac codebases
 are not needed. Platform-specific launchers and configuration can use the
 same application code.
 
-Mac migration is not implemented or verified yet. Existing Windows-written
-library paths need separator normalization, and the launcher, PDF tools,
-AI services and Feishu CLI need setup on the destination machine. Pulling the
-repository updates code only: separately transfer the complete reading workspace,
-including hidden publication receipts, and configure local paths and credentials.
-Browser tab/view preferences are not included in that workspace. Concurrent
-two-computer editing and automatic conflict merging are not supported.
+Existing workspace-relative index paths written with Windows backslashes are
+resolved on either platform without rewriting source text, notes, or publication
+receipts. New index entries use forward-slash relative paths. Absolute paths
+that point at another machine's drive are rejected rather than guessed or used
+to create a replacement library. Cached project context stays readable; its
+external source path must be reconfigured before refreshing that context.
+
+This portability work adds a macOS launcher and setup path; it does **not**
+claim validation in a real Mac user environment. Finder double-click,
+Apple Silicon/Intel Python and PDF tools, Feishu login, and local proxy
+integration still need a smoke test on the destination Mac. Synthetic launcher
+tests are not a substitute for those checks. The Windows PowerShell launcher
+remains available unchanged.
+
+Pulling the repository updates code only. Keep the selected paper workspace
+outside the code checkout and transfer it separately, including `library.json`,
+`papers/`, assets, and hidden publication receipts. Preserve the complete
+workspace structure and original PDFs rather than copying only generated
+Markdown. Reconfigure its local path on each machine; an external Windows
+drive path is not automatically a mounted Mac file. Browser tab/view preferences
+are not included in that workspace. Save and stop editing before transferring
+data; concurrent two-computer editing and automatic conflict merging are not
+supported.
+
+Automated notes/data migration tooling and cross-machine synchronization are
+explicitly deferred. This setup selects an existing workspace or deliberately
+initializes a new one; it does not migrate notes or merge libraries.
+
+### Shared main and temporary feature branches
+
+`main` is the shared long-lived codebase for both operating systems.
+`feature/cross-platform` is a temporary implementation/validation branch, not
+a permanent Mac fork. During testing, use the same branch and revision on both
+machines; a local feature branch is available on the other machine only after
+it is deliberately published. Keep `main` and the feature branch separate
+until acceptance. Only after review, validation, and acceptance, merge into
+`main`, then update both checkouts from `main` (use `git pull --ff-only`).
+Keep future OS changes in short-lived feature branches as well.
+
+The [compatibility workflow](.github/workflows/compatibility.yml) runs Python
+regressions and reader-state checks on Windows and macOS for this branch and
+`main`. It uses disposable synthetic data, not real papers, credentials,
+conversion models or cloud services. These checks do not replace a user's
+Mac acceptance test.
+
+Git moves code, not the paper library, `.env`, authentication caches, installed
+tools, or `.venv`. Recreate machine-specific environments locally, and never
+commit credentials or selected paper data to make another checkout work.
 
 ## Quick Start
 
@@ -629,6 +677,138 @@ You can also launch the local server on Windows with:
 ```powershell
 .\paper-reader-app.ps1 -Workspace .\paper_reading_workspace
 ```
+
+Normal `serve` requires an existing workspace directory with a valid
+`library.json`. For a genuinely new library, deliberately run `init` first,
+as above; direct
+`serve --create-workspace` is an explicit alternative. If an expected library
+or external disk is missing, reconnect it and check the selected path instead
+of initializing an empty replacement. The macOS launcher never opts into
+workspace creation.
+
+### macOS setup and launch
+
+1. Install a native Python **3.10 or newer** using your preferred trusted
+   installer/package manager. Do not copy a Windows `.venv` to the Mac.
+   Obtain the same code revision as your other machine. For example, after
+   replacing the repository URL:
+
+   ```sh
+   git clone "<your repository URL>" "$HOME/Tools/Paper Reader"
+   cd "$HOME/Tools/Paper Reader"
+   ```
+
+   During feature testing, select the published branch **before** setup:
+
+   ```sh
+   git switch feature/cross-platform
+   ```
+
+   Then create this machine's environment:
+
+   ```sh
+   python3 --version
+   python3 -m venv .venv
+   [ -e .env ] || cp .env.example .env
+   chmod +x paper-reader-app.command
+   ```
+
+   A new clone normally selects `main`. After the compatibility work is accepted
+   and merged, use `main` instead. There is **no mandatory pip install** for the
+   reader.
+
+2. Choose the paper data separately. If moving an existing library, transfer
+   its complete workspace to the Mac first; do not run `init` on an assumed
+   destination to hide a missing disk. Edit this machine's `.env` to select
+   the actual path, for example:
+
+   ```env
+   PAPER_READER_WORKSPACE="/Volumes/Research/论文阅读"
+   ```
+
+   Use an absolute local path. Quotes and spaces are supported; `.env` values
+   are data, not shell expressions, so do not use `$HOME`, command
+   substitutions, or `source .env`. A Windows drive-letter path must be
+   replaced with the actual Mac path.
+
+   **Only for a deliberately new library**, initialize a chosen location:
+
+   ```sh
+   ./.venv/bin/python paper_reader_agent.py --workspace "$HOME/Documents/Paper Library" init
+   ```
+
+   Then point `.env` at that same location (or pass `--workspace` explicitly).
+   An existing `PAPER_READER_WORKSPACE` environment/`.env` setting takes
+   precedence over the local config written by `init`.
+
+3. Check configuration and launch the selected existing library:
+
+   ```sh
+   ./.venv/bin/python paper_reader_agent.py doctor
+   ./paper-reader-app.command
+   ```
+
+   Explicit paths and an alternate local port work too:
+
+   ```sh
+   ./.venv/bin/python paper_reader_agent.py --workspace "/Volumes/Research/论文阅读" doctor
+   ./paper-reader-app.command --workspace "/Volumes/Research/论文阅读" --host 127.0.0.1 --port 8766 --no-browser
+   ```
+
+   Omit `--no-browser` to request a browser after successful backend startup;
+   `--no-open` is an alias. Keep the default loopback host unless you
+   intentionally need network access. If the port is occupied, choose a free
+   one or stop the known reader yourself: the launcher never opens an
+   arbitrary existing app just because that port responds.
+
+After `chmod +x`, Finder can double-click `paper-reader-app.command`. It opens
+in Terminal, enters the repository directory, and keeps the backend in the
+foreground; **Ctrl+C** stops it. Relative paths are resolved from the repository,
+even if launched from another working directory. The script does not install
+packages, start proxies/daemons, or initialize data, and it preserves backend
+errors and exit codes.
+
+Python selection is: exported `PAPER_READER_PYTHON`, repository
+`.venv/bin/python`, then `python3` on `PATH`. The selected interpreter must pass
+the Python 3.10+ check; a broken or old selected interpreter fails visibly
+instead of silently switching environments. The override is **one executable
+path**, never a shell command or flags:
+
+```sh
+PAPER_READER_PYTHON="/absolute/path/to/python3" ./paper-reader-app.command --no-browser
+```
+
+Set that override in the launching process, **not in `.env`**: interpreter
+selection happens before Python reads `.env`. Finder may not inherit Terminal
+`PATH` or exports, so a repository `.venv` is the reliable double-click choice.
+The launcher never evaluates or sources `.env`; the shared Python backend
+parses it.
+
+### Optional per-machine tools
+
+- **PDF previews:** only if needed, run
+  `./.venv/bin/python -m pip install -r requirements-pdf.txt` on the Mac.
+  These packages supply PDF previews/page-count helpers, not the core server
+  or MinerU's full conversion pipeline.
+- **MinerU:** install a macOS-supported converter environment separately,
+  including its own model/runtime requirements. Set `PAPER_READER_MINERU` to
+  that machine's runnable `mineru` executable, or put it on the launcher's
+  `PATH`. Use an absolute path in `.env` for Finder launches. Do not copy a
+  Windows `.bat` wrapper or virtual environment; `doctor` discovery alone
+  does not prove native model loading or conversion works.
+- **Feishu:** install the native macOS `lark-cli` and authenticate on that
+  machine. Set `PAPER_READER_LARK_CLI` to the native executable if discovery
+  fails, not a copied Windows `.cmd`/`.bat` wrapper. Configure the intended
+  Base/table locally; leave `PAPER_READER_FEISHU_AUTO_SYNC=0` unless automatic
+  metadata refresh is wanted. Keep credentials and login caches out of Git;
+  reading-record publication still requires an explicit user action.
+- **AI proxy / Ollama:** configure, authenticate, and start these separately
+  on each machine only if using those optional features. A loopback URL such
+  as `http://127.0.0.1:4141/v1` refers to the current Mac, not the Windows PC.
+  The launcher does not start these services or transfer credentials. Enable
+  `PAPER_READER_TRANSLATION_PROVIDER=copilot` only for an intentionally
+  configured proxy; it forwards paper text upstream and is not an offline
+  model.
 
 ## API Keys And Environment
 
@@ -680,6 +860,18 @@ Optional workspace and PDF converter overrides:
 PAPER_READER_WORKSPACE=C:\path\to\paper_reading_workspace
 PAPER_READER_MINERU=C:\path\to\mineru.bat
 ```
+
+Use this machine's paths instead on macOS, for example:
+
+```env
+PAPER_READER_WORKSPACE="/Users/you/Documents/Paper Library"
+PAPER_READER_MINERU="/Users/you/.local/bin/mineru"
+PAPER_READER_LARK_CLI="/absolute/path/to/native/lark-cli"
+```
+
+The examples are placeholders, not portable credentials or existing libraries.
+Do not copy a real `.env` into Git. Set `PAPER_READER_PYTHON` in the launching
+shell/environment rather than here.
 
 ## Useful Commands
 
@@ -751,6 +943,19 @@ node --test .\tests\reader_state.test.cjs
 py -B -m unittest discover -s .\tests -p "test_*.py" -v
 Get-ChildItem .\chrome_extension -Filter *.js | ForEach-Object { node --check $_.FullName }
 ```
+
+Focused launcher checks on macOS/Linux:
+
+```sh
+python3 -B -m unittest discover -s tests -p "test_reader_launcher.py" -v
+```
+
+These tests use synthetic executables and fixtures under `tests/`, never the
+real Python backend, library, browser, or services. They exercise interpreter
+selection/version failures, quoted arguments, foreground execution, and exit
+codes. On Windows the LF/shebang checks run and native POSIX execution tests
+are explicitly skipped. Passing POSIX CI does not claim a real Mac
+Finder/MinerU/Feishu/proxy setup has been validated.
 
 The browser regressions in `tests/reader_ui.test.cjs` require Playwright and an
 installed Edge browser (override `READER_BROWSER_CHANNEL` for another supported

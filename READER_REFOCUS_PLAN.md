@@ -947,7 +947,33 @@ Validation of the table-first flow:
   passed with no extra requests (cold median 472 ms, warm median 196 ms in this
   shared environment; not a performance guarantee).
 
-## Later - Windows to Mac migration and optional second computer
+## Cross-platform foundation (2026-09-28)
+
+Implementation lives on the temporary `feature/cross-platform` branch. Keep
+the verified Windows baseline on `main` until Mac acceptance; this is one shared
+application, not a long-lived Windows/Mac fork.
+
+- Read legacy workspace-relative Windows paths through a shared resolver and
+  write portable relative paths for new index entries. Reading does not migrate
+  or rewrite the original files, paragraph IDs, annotations, or cloud receipts.
+- Keep source/translation, notes, queues, CLI queries, and Feishu intake on the
+  same resolver. Explicitly reject foreign absolute drive paths and paths that
+  escape the workspace instead of guessing a different paper.
+- Require an initialized workspace before normal server startup or read-only
+  CLI operations. `init` and `serve --create-workspace` are deliberate first-use
+  actions. Bind the server port before resuming processing jobs.
+- Add a foreground macOS launcher, native tool discovery, optional PDF-preview
+  dependencies and machine-specific setup guidance. Do not copy Windows virtual
+  environments, API keys or CLI login caches.
+- Regression fixtures include relocated saved notes and publication receipts,
+  plus separate Windows/macOS CI. Native MinerU conversion, Finder startup,
+  Feishu authorization and the user's AI proxy still require Mac acceptance.
+
+No real paper workspace is modified or uploaded by this compatibility work.
+Selected-paper packaging/import is a separate task; GitHub carries app code,
+while selected reading data will be transferred privately by USB or cloud drive.
+
+## Later - selected-paper transfer and Mac acceptance
 
 - Inventory and back up the complete reading workspace before migration.
 - Transfer original PDFs, parsed text, translations, figures, annotations,

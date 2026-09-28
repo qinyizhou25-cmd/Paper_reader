@@ -60,7 +60,7 @@ def cell_text(value: Any) -> str:
 
 
 def cli_command(configured: str = "") -> str:
-    candidate = Path(configured) if configured else Path(shutil.which("lark-cli") or "")
+    candidate = Path(configured).expanduser() if configured else Path(shutil.which("lark-cli") or "")
     if candidate.is_file() and candidate.suffix.lower() not in {".cmd", ".bat", ".ps1"}:
         return str(candidate.resolve())
     if not configured and candidate.is_file():

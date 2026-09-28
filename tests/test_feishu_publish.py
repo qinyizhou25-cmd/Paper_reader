@@ -1145,6 +1145,26 @@ class TablePublicationTests(PublicationFixture):
     def table_calls(self) -> list[tuple]:
         return [call for call in self.fake.calls if call[0][2] == "+record-upsert"]
 
+    def test_copied_paper_keeps_publication_ownership_without_duplicate_cloud_writes(self) -> None:
+        first = self.start()
+        self.assert_synced(first)
+        original = self.paper
+        copied = self.workspace / "new computer" / "papers" / original.name
+        shutil.copytree(original, copied)
+        self.papers.append(copied)
+        self.paper = copied
+        before = self.source_bytes()
+        writes = list(self.fake.writes)
+        preview = self.preview()
+        self.assertFalse(preview["changed"])
+        status = self.start(preview)
+        self.assert_synced(status)
+        self.assertEqual(status["fingerprint"], first["fingerprint"])
+        self.assertEqual(self.source_bytes(), before)
+        self.assertEqual(self.fake.writes, writes)
+        self.assertEqual(len(self.fake.record[BACKUP]), 1)
+        self.assert_no_docs()
+
     def assert_no_docs(self) -> None:
         self.assertFalse(any(argv[1] == "docs" for argv, _kwargs in self.fake.calls))
 

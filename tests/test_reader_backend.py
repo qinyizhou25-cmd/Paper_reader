@@ -555,6 +555,27 @@ class ReaderBackendTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["files"], self.files)
         self.assertEqual(self.tree_state(), before)
 
+    def test_windows_written_index_opens_source_pdf_and_original_exports_on_either_platform(self) -> None:
+        library = reader.read_library_index(self.workspace)
+        library["papers"][0].update({
+            "paper_dir": r"papers\paper-a",
+            "notes_md": r"papers\paper-a\notes.md",
+            "source_pdf": r"papers\paper-a\original.pdf",
+        })
+        self.write_json(self.workspace / "library.json", library)
+        pdf = b"%PDF-1.4 synthetic portable source"
+        (self.paper_dir / "original.pdf").write_bytes(pdf)
+        before = self.tree_state()
+        for endpoint in ("", "/pdf", "/notes-md", "/reading-data"):
+            with self.subTest(endpoint=endpoint):
+                status, _, body = self.request("/api/papers/paper-a" + endpoint)
+                self.assertEqual(status, 200, body)
+                if endpoint == "/pdf":
+                    self.assertEqual(body, pdf)
+                elif endpoint == "/reading-data":
+                    self.assertEqual(json.loads(body)["files"], self.files)
+        self.assertEqual(self.tree_state(), before)
+
     def test_paper_get_does_not_generate_previews_parse_pdfs_or_initialize_workspace(self) -> None:
         before = self.tree_state()
         with (

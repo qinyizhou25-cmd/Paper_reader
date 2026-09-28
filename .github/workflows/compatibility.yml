@@ -1,0 +1,41 @@
+name: Shared reader compatibility
+
+on:
+  push:
+    branches: [main, feature/cross-platform]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: Python and reader state (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    env:
+      PYTHONUTF8: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Backend and platform regressions (synthetic data only)
+        run: python -B -m unittest discover -s tests -p "test_*.py"
+      - name: Frontend syntax
+        run: node --check web/app.js
+      - name: Reader state regressions
+        run: node --test tests/reader_state.test.cjs
+        env:
+          READER_TEST_PYTHON: ${{ steps.python.outputs.python-path }}

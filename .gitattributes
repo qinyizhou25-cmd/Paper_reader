@@ -1,0 +1,2 @@
+# Finder/Terminal launchers must keep their POSIX shebang and LF line endings.
+*.command text eol=lf

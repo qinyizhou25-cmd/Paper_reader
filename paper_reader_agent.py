@@ -13,6 +13,7 @@ import datetime as dt
 import difflib
 import hashlib
 import html
+import importlib.util
 import ipaddress
 import json
 import math
@@ -38,7 +39,7 @@ from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 import feishu_metadata
@@ -203,7 +204,7 @@ PROCESSING_MODE_LABELS = {
     "reference-card": "参考文献卡片",
 }
 
-DEFAULT_PDF_LIBRARY_PATH = "E:\\论文库\\"
+DEFAULT_PDF_LIBRARY_PATH = "E:\\论文库\\"  # Legacy directory-only UI placeholder.
 PAPER_BRIEF_BLOCK_ID = "paper-brief"
 DEFAULT_CHROME_BRIEF_PROMPT_ID = "chrome-paper-brief-v1"
 CANONICAL_PROJECTS = ["collaborative", "memories"]
@@ -409,22 +410,50 @@ def find_config(start: Path) -> Path | None:
     return None
 
 
+def resolve_local_path(value: str, *, base: Path | None = None) -> Path:
+    raw = str(value).replace("\\", "/")
+    windows = PureWindowsPath(raw)
+    if windows.drive and not windows.root:
+        raise ValueError("Drive-relative paths depend on another working directory. Use a full native path or a relative path without a drive.")
+    if os.name != "nt" and windows.drive:
+        raise ValueError("This is a Windows drive/UNC path. Configure a local path on this computer; do not copy another computer's workspace or tool settings.")
+    if os.name == "nt" and windows.root and not windows.drive:
+        raise ValueError("Use a full Windows drive/UNC path or a relative path on this computer.")
+    path = Path(raw).expanduser()
+    return ((base / path) if base is not None and not path.is_absolute() else path).resolve()
+
+
+def stored_workspace_path(workspace: Path, value: str) -> Path:
+    raw = str(value).replace("\\", "/")
+    windows = PureWindowsPath(raw)
+    path = Path(raw)
+    if windows.drive and not path.is_absolute():
+        raise ValueError("A saved library path uses a foreign Windows drive. Library entries must be workspace-relative before moving computers.")
+    if path.is_absolute():
+        try:
+            path = path.relative_to(workspace.absolute())
+        except ValueError:
+            raise ValueError("A saved library path points outside this workspace. Restore its workspace-relative path before opening the paper.") from None
+    elif windows.root or windows.drive:
+        raise ValueError("A saved library path must not depend on the current drive.")
+    if not path.parts or ".." in path.parts:
+        raise ValueError("A saved library path must name a file or folder inside the workspace without parent traversal.")
+    return workspace / path
+
+
 def resolve_workspace(workspace_arg: str | None, start: Path | None = None) -> Path:
     if workspace_arg:
-        return Path(workspace_arg).expanduser().resolve()
+        return resolve_local_path(workspace_arg)
     configured_workspace = env_value("PAPER_READER_WORKSPACE")
     if configured_workspace:
-        return Path(configured_workspace).expanduser().resolve()
+        return resolve_local_path(configured_workspace)
     start = start or Path.cwd()
     config_path = find_config(start)
     if config_path:
         config = read_json(config_path, {})
         workspace = config.get("workspace")
         if workspace:
-            workspace_path = Path(workspace)
-            if not workspace_path.is_absolute():
-                workspace_path = config_path.parent / workspace_path
-            return workspace_path.resolve()
+            return resolve_local_path(workspace, base=config_path.parent)
     return (Path.cwd() / DEFAULT_WORKSPACE_NAME).resolve()
 
 
@@ -437,6 +466,18 @@ def ensure_workspace(workspace: Path) -> None:
     library_path = workspace / "library.json"
     if not library_path.exists():
         write_json(library_path, {"version": TOOL_VERSION, "papers": []})
+
+
+def require_existing_workspace(workspace: Path) -> None:
+    if not workspace.is_dir() or not (workspace / "library.json").is_file():
+        raise FileNotFoundError(
+            f"Reading workspace is unavailable or not initialized: {workspace}. "
+            "Connect the drive or correct --workspace/PAPER_READER_WORKSPACE. "
+            "For a deliberately new library, run init or serve --create-workspace."
+        )
+    library = read_json(workspace / "library.json", None, strict=True)
+    if not isinstance(library, dict) or not isinstance(library.get("papers"), list):
+        raise ValueError("The workspace library.json is invalid; restore the original index rather than creating an empty library.")
 
 
 def infer_processing_fields(paper_dir: Path, metadata: dict[str, Any] | None = None) -> dict[str, str]:
@@ -1145,7 +1186,7 @@ def refresh_project_context_from_source(workspace: Path, project: Any, source_pa
     raw_path = str(source_path or current.get("source_path") or default_project_context_source(clean_project) or "").strip()
     if not raw_path:
         raise ValueError("source_path is required")
-    path = Path(raw_path).expanduser()
+    path = resolve_local_path(raw_path)
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"Project context source not found: {raw_path}")
     raw_text = path.read_text(encoding="utf-8", errors="ignore")
@@ -1206,7 +1247,7 @@ def count_paper_notes(paper_dir: Path) -> int:
 
 
 def duplicate_existing_summary(workspace: Path, paper: dict[str, Any]) -> dict[str, Any]:
-    paper_dir = workspace / paper.get("paper_dir", "")
+    paper_dir = paper_record_dir(workspace, paper)
     metadata = read_json(paper_dir / "metadata.json", {}) if paper_dir.exists() else {}
     return {
         "id": paper.get("id", ""),
@@ -1232,7 +1273,7 @@ def find_duplicate_paper_by_title(workspace: Path, title: Any, exclude_paper_id:
         paper_id = str(paper.get("id") or "")
         if exclude_paper_id and paper_id == exclude_paper_id:
             continue
-        paper_dir = workspace / paper.get("paper_dir", "")
+        paper_dir = paper_record_dir(workspace, paper)
         metadata = {}
         existing_key = str(paper.get("title_key") or "")
         if not existing_key:
@@ -1261,7 +1302,13 @@ def duplicate_paper_response(workspace: Path, title: str, source_name: str, exis
 
 
 def paper_record_dir(workspace: Path, paper: dict[str, Any]) -> Path:
-    return workspace / str(paper.get("paper_dir") or f"papers/{paper.get('id', '')}")
+    value = str(paper.get("paper_dir") or "")
+    if not value:
+        paper_id = str(paper.get("id") or "")
+        if not paper_id or paper_id in {".", ".."} or PureWindowsPath(paper_id).name != paper_id:
+            raise ValueError("The library entry has no valid paper directory or paper ID.")
+        value = f"papers/{paper_id}"
+    return stored_workspace_path(workspace, value)
 
 
 def paper_record_has_pdf(workspace: Path, paper: dict[str, Any]) -> bool:
@@ -3004,7 +3051,7 @@ def sync_candidate_annotations_to_library(workspace: Path, candidate_id: str) ->
     record = find_paper_record(workspace, paper_id)
     if not record:
         return 0
-    paper_dir = workspace / str(record.get("paper_dir") or "")
+    paper_dir = paper_record_dir(workspace, record)
     if not paper_dir.exists():
         return 0
     source_annotations = read_json(candidate_dir(workspace, candidate_id) / "annotations.json", {"annotations": []})
@@ -3027,7 +3074,7 @@ def sync_candidate_metadata_to_library(workspace: Path, candidate_id: str, data:
     record = find_paper_record(workspace, paper_id)
     if not record:
         return
-    paper_dir = workspace / str(record.get("paper_dir") or "")
+    paper_dir = paper_record_dir(workspace, record)
     if not paper_dir.exists():
         return
     metadata = read_json(paper_dir / "metadata.json", {})
@@ -3259,7 +3306,7 @@ def resume_interrupted_processing_tasks(workspace: Path) -> list[str]:
         paper_id = str(paper.get("id") or "").strip()
         if not paper_id:
             continue
-        paper_dir = workspace / str(paper.get("paper_dir") or f"papers/{paper_id}")
+        paper_dir = paper_record_dir(workspace, paper)
         if not paper_dir.exists():
             continue
         metadata = read_json(paper_dir / "metadata.json", {})
@@ -3301,7 +3348,7 @@ def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[
     record = find_paper_record(workspace, paper_id)
     if not record:
         raise RuntimeError("Saved paper did not appear in Library")
-    paper_dir = workspace / str(record.get("paper_dir") or "")
+    paper_dir = paper_record_dir(workspace, record)
     metadata = read_json(paper_dir / "metadata.json", {})
     project = str(data.get("project") or candidate.get("project") or "").strip()
     projects = normalize_project_list([project] if project else metadata_projects(metadata))
@@ -3376,7 +3423,7 @@ def load_library_raw(workspace: Path) -> dict[str, Any]:
 def load_library(workspace: Path) -> dict[str, Any]:
     library = load_library_raw(workspace)
     for paper in library["papers"]:
-        paper_dir = workspace / paper.get("paper_dir", "")
+        paper_dir = paper_record_dir(workspace, paper)
         metadata = normalized_metadata(paper_dir, read_json(paper_dir / "metadata.json", {})) if paper_dir.exists() else {}
         fields = infer_processing_fields(paper_dir, metadata)
         paper.setdefault("processing_mode", fields["processing_mode"])
@@ -3461,12 +3508,12 @@ def sync_library_from_metadata(workspace: Path, paper_id: str, paper_dir: Path, 
             "title_key": metadata.get("title_key") or normalize_title_key(metadata.get("title") or paper_id),
             "authors": authors,
             "institutions": institutions,
-            "paper_dir": str(paper_dir.relative_to(workspace)),
-            "metadata": str((paper_dir / "metadata.json").relative_to(workspace)),
-            "reader_md": str((paper_dir / "reader.md").relative_to(workspace)),
-            "annotated_md": str((paper_dir / "annotated.md").relative_to(workspace)),
-            "notes_md": str((paper_dir / "notes.md").relative_to(workspace)),
-            "source_pdf": str((paper_dir / "original.pdf").relative_to(workspace)) if (paper_dir / "original.pdf").exists() else "",
+            "paper_dir": paper_dir.relative_to(workspace).as_posix(),
+            "metadata": (paper_dir / "metadata.json").relative_to(workspace).as_posix(),
+            "reader_md": (paper_dir / "reader.md").relative_to(workspace).as_posix(),
+            "annotated_md": (paper_dir / "annotated.md").relative_to(workspace).as_posix(),
+            "notes_md": (paper_dir / "notes.md").relative_to(workspace).as_posix(),
+            "source_pdf": (paper_dir / "original.pdf").relative_to(workspace).as_posix() if (paper_dir / "original.pdf").exists() else "",
             "venue": venue,
             "year": year,
             "importance": metadata.get("importance", ""),
@@ -4443,7 +4490,7 @@ def sync_paper_tag_path(workspace: Path, paper_id: str, category_path: list[str]
     record = find_paper_record(workspace, paper_id)
     if not record:
         return
-    path = workspace / str(record.get("paper_dir") or "")
+    path = paper_record_dir(workspace, record)
     metadata = read_json(path / "metadata.json", {})
     tags = normalize_tag_paths(metadata.get("tags", record.get("tags", [])))
     if tag not in tags:
@@ -4474,7 +4521,7 @@ def mindmap_search_papers(workspace: Path, query: str, project: str = "collabora
         paper_id = str(paper.get("id") or "")
         if not paper_id:
             continue
-        paper_dir = workspace / str(paper.get("paper_dir") or "")
+        paper_dir = paper_record_dir(workspace, paper)
         haystack = " ".join(
             [
                 paper.get("title", ""),
@@ -4518,7 +4565,7 @@ def takeaway_nodes_for_paper(workspace: Path, paper_id: str, parent_id: str, cat
     record = find_paper_record(workspace, paper_id)
     if not record:
         return []
-    paper_dir = workspace / str(record.get("paper_dir") or "")
+    paper_dir = paper_record_dir(workspace, record)
     doc = load_takeaway_doc(paper_dir)
     nodes = []
     now = now_iso()
@@ -4674,7 +4721,7 @@ def apply_mindmap_sync_proposals(workspace: Path, proposals: list[dict[str, Any]
         record = find_paper_record(workspace, proposal.get("paper_id", ""))
         if not record:
             continue
-        paper_dir = workspace / str(record.get("paper_dir") or "")
+        paper_dir = paper_record_dir(workspace, record)
         metadata = read_json(paper_dir / "metadata.json", {})
         tags = normalize_tag_paths(metadata.get("tags", record.get("tags", [])))
         tag_values = normalize_tag_paths(proposal.get("to", ""))
@@ -5782,7 +5829,7 @@ def intake_feishu_paper(workspace: Path, data: dict[str, Any]) -> dict[str, Any]
                 metadata = prepare_pdf_brief_then_background(workspace, paper_id, paper_dir, {}, mode="deep")
                 return feishu_intake_response(workspace, paper_id, metadata, reused=True, local_source=True)
         if local_path:
-            pdf_path = Path(local_path).expanduser().resolve(strict=True)
+            pdf_path = resolve_local_path(local_path).resolve(strict=True)
             if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
                 raise ValueError("Choose an existing local PDF file, not a folder.")
             if attachment.get("size") and pdf_path.stat().st_size != attachment["size"]:
@@ -5805,7 +5852,7 @@ def aggregate_notes(workspace: Path) -> list[dict[str, Any]]:
         paper_id = str(paper.get("id") or "")
         if not paper_id:
             continue
-        paper_dir = workspace / paper.get("paper_dir", "")
+        paper_dir = paper_record_dir(workspace, paper)
         annotations = read_json(paper_dir / "annotations.json", {"annotations": []}).get("annotations", [])
         metadata = read_json(paper_dir / "metadata.json", {})
         title = metadata.get("title") or paper.get("title") or paper_id
@@ -6117,15 +6164,23 @@ def find_and_attach_pdf_to_existing_paper(workspace: Path, paper_id: str, paper_
 
 
 def find_mineru() -> str | None:
-    explicit = os.environ.get("PAPER_READER_MINERU")
+    explicit = env_value("PAPER_READER_MINERU")
     if explicit:
-        return explicit
+        command = shutil.which(explicit)
+        path = resolve_local_path(command or explicit)
+        if not path.is_file() or (os.name != "nt" and (path.suffix.lower() in {".bat", ".cmd", ".exe"} or not os.access(path, os.X_OK))):
+            raise RuntimeError("PAPER_READER_MINERU must point to an executable installed for this computer.")
+        return str(path)
+    sibling = Path(sys.executable).parent / ("mineru.exe" if os.name == "nt" else "mineru")
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
     found = shutil.which("mineru")
     if found:
         return found
-    wrapper = Path.home() / ".local" / "bin" / "mineru.bat"
-    if wrapper.exists():
-        return str(wrapper)
+    if os.name == "nt":
+        wrapper = Path.home() / ".local" / "bin" / "mineru.bat"
+        if wrapper.is_file():
+            return str(wrapper)
     return None
 
 
@@ -9402,8 +9457,8 @@ def prepare_pdf_brief_then_background(workspace: Path, paper_id: str, paper_dir:
 def ingest_pdf(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
     ensure_workspace(workspace)
-    pdf_path = Path(args.pdf).expanduser().resolve() if args.pdf else None
-    raw_md_path = Path(args.raw_md).expanduser().resolve() if args.raw_md else None
+    pdf_path = resolve_local_path(args.pdf) if args.pdf else None
+    raw_md_path = resolve_local_path(args.raw_md) if args.raw_md else None
     if not pdf_path and not raw_md_path:
         raise SystemExit("Provide a PDF path or --raw-md.")
     if pdf_path and not pdf_path.exists():
@@ -9504,7 +9559,10 @@ def init_workspace(args: argparse.Namespace) -> None:
     ensure_workspace(workspace)
     if not args.no_config:
         config_path = Path.cwd() / CONFIG_FILE
-        relative = os.path.relpath(workspace, Path.cwd())
+        try:
+            relative = Path(os.path.relpath(workspace, Path.cwd())).as_posix()
+        except ValueError:
+            relative = workspace.as_posix()
         write_json(config_path, {"workspace": relative, "created_at": now_iso(), "tool": "paper-reader-agent"})
         print(f"Wrote config: {config_path}")
     print(f"Workspace ready: {workspace}")
@@ -9512,8 +9570,22 @@ def init_workspace(args: argparse.Namespace) -> None:
 
 def doctor(args: argparse.Namespace) -> None:
     print(f"paper-reader-agent {TOOL_VERSION}")
-    print(f"Python: {sys.executable}")
+    print(f"Python: {sys.version.split()[0]} ({sys.executable})")
     print(f"Script: {Path(__file__).resolve()}")
+    workspace = resolve_workspace(args.workspace)
+    print(f"Default workspace: {workspace}")
+    try:
+        require_existing_workspace(workspace)
+        print("Workspace: ready")
+    except (OSError, ValueError) as exc:
+        print(f"Workspace: {exc}")
+    for module, package in (("pypdfium2", "pypdfium2"), ("PIL", "Pillow"), ("pypdf", "pypdf")):
+        print(f"Optional PDF dependency {package}: {'available' if importlib.util.find_spec(module) else 'not installed'}")
+    try:
+        executable = feishu_metadata.cli_command(env_value("PAPER_READER_LARK_CLI"))
+        print(f"Feishu CLI: {executable} (login must be configured on this computer)")
+    except RuntimeError as exc:
+        print(f"Feishu CLI: {exc}")
     mineru = find_mineru()
     print(f"MinerU: {mineru or 'not found'}")
     if mineru:
@@ -9522,24 +9594,16 @@ def doctor(args: argparse.Namespace) -> None:
             print(output.stdout.strip() or output.stderr.strip())
         except Exception as exc:  # noqa: BLE001
             print(f"MinerU version check failed: {exc}")
-    workspace = resolve_workspace(args.workspace)
-    print(f"Default workspace: {workspace}")
 
 
 def normalized_query_value(value: Any) -> str:
     return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
 
 
-def paper_record_dir(workspace: Path, paper: dict[str, Any]) -> Path:
-    path = Path(str(paper.get("paper_dir") or ""))
-    return path if path.is_absolute() else workspace / path
-
-
 def paper_record_artifact(workspace: Path, paper: dict[str, Any], field: str, filename: str) -> Path:
     value = str(paper.get(field) or "").strip()
     if value:
-        path = Path(value)
-        return path if path.is_absolute() else workspace / path
+        return stored_workspace_path(workspace, value)
     return paper_record_dir(workspace, paper) / filename
 
 
@@ -9641,6 +9705,7 @@ def render_paper_query_markdown(payload: dict[str, Any], output_path: Path | Non
 
 def query_papers_cli(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
+    require_existing_workspace(workspace)
     library = load_library_raw(workspace)
     if args.limit < 0:
         raise SystemExit("--limit must be zero or greater")
@@ -9709,8 +9774,7 @@ def query_papers_cli(args: argparse.Namespace) -> None:
 
     output_path = None
     if args.output:
-        requested_path = Path(args.output).expanduser()
-        output_path = requested_path if requested_path.is_absolute() else workspace / requested_path
+        output_path = resolve_local_path(args.output, base=workspace)
     content = render_paper_query_markdown(payload, output_path) if args.format == "markdown" else json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
     if output_path is None:
         print(content, end="")
@@ -9725,6 +9789,7 @@ def query_papers_cli(args: argparse.Namespace) -> None:
 
 def list_status(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
+    require_existing_workspace(workspace)
     library = load_library(workspace)
     print(f"Workspace: {workspace}")
     print(f"Papers: {len(library.get('papers', []))}")
@@ -9740,17 +9805,18 @@ def register_paper_cli(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
     ensure_workspace(workspace)
     tags = [tag.strip() for tag in (args.tags or "").split(",") if tag.strip()]
-    result = register_paper_in_library(workspace, Path(args.pdf).expanduser().resolve(), paper_id=args.paper_id, title=args.title, tags=tags)
+    result = register_paper_in_library(workspace, resolve_local_path(args.pdf), paper_id=args.paper_id, title=args.title, tags=tags)
     print(f"Registered paper: {result['metadata'].get('title')}")
     print(f"Paper ID: {result['paper_id']}")
 
 
 def process_paper_cli(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
+    require_existing_workspace(workspace)
     record = find_paper_record(workspace, args.paper_id)
     if not record:
         raise SystemExit(f"Unknown paper: {args.paper_id}")
-    paper_dir = workspace / record.get("paper_dir", "")
+    paper_dir = paper_record_dir(workspace, record)
     options = {"backend": args.backend, "method": args.method, "lang": args.lang, "start": args.start, "end": args.end}
     metadata = process_paper_skim(workspace, args.paper_id, paper_dir, options) if args.mode == "skim" else process_paper_deep(workspace, args.paper_id, paper_dir, options)
     print(f"Processed paper: {metadata.get('title')}")
@@ -9760,6 +9826,7 @@ def process_paper_cli(args: argparse.Namespace) -> None:
 
 def refresh_citations_cli(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
+    require_existing_workspace(workspace)
     library = load_library(workspace)
     targets = [args.paper_id] if args.paper_id else [paper.get("id") for paper in library.get("papers", [])]
     refreshed = 0
@@ -9770,7 +9837,7 @@ def refresh_citations_cli(args: argparse.Namespace) -> None:
         if not record:
             print(f"Skipping unknown paper: {paper_id}")
             continue
-        paper_dir = workspace / record.get("paper_dir", "")
+        paper_dir = paper_record_dir(workspace, record)
         metadata = refresh_paper_citations(workspace, paper_id, paper_dir)
         print(f"{paper_id}: {metadata.get('citation_count', '')} ({metadata.get('citation_source', '')})")
         refreshed += 1
@@ -9779,6 +9846,7 @@ def refresh_citations_cli(args: argparse.Namespace) -> None:
 
 def rebuild_outputs(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
+    require_existing_workspace(workspace)
     library = load_library(workspace)
     paper_ids = [args.paper_id] if args.paper_id else [paper.get("id") for paper in library.get("papers", [])]
     rebuilt = 0
@@ -9789,7 +9857,7 @@ def rebuild_outputs(args: argparse.Namespace) -> None:
         if not paper_record:
             print(f"Skipping unknown paper: {paper_id}")
             continue
-        paper_dir = workspace / paper_record.get("paper_dir", "")
+        paper_dir = paper_record_dir(workspace, paper_record)
         segments = load_segments(paper_dir)
         if not segments:
             print(f"Skipping paper without segments: {paper_id}")
@@ -9854,7 +9922,9 @@ class ReaderHandler(BaseHTTPRequestHandler):
         library = read_library_index(self.workspace)
         for paper in library.get("papers", []):
             if isinstance(paper, dict) and paper.get("id") == paper_id and paper.get("paper_dir"):
-                registered = (self.workspace / paper["paper_dir"]).resolve()
+                registered = paper_record_dir(self.workspace, paper).resolve()
+                if not registered.is_relative_to(self.workspace.resolve()):
+                    raise ValueError("The registered paper directory resolves outside the reading workspace.")
                 return registered if registered.is_dir() else None
         papers_root = (self.workspace / "papers").resolve()
         direct = (papers_root / paper_id).resolve()
@@ -10379,7 +10449,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                     pdf_url = str(data.get("pdf_url") or "").strip()
                     local_pdf_path = str(data.get("local_pdf_path") or "").strip()
                     if local_pdf_path:
-                        source_path = Path(local_pdf_path).expanduser().resolve()
+                        source_path = resolve_local_path(local_pdf_path)
                         if not source_path.exists() or not source_path.is_file():
                             raise FileNotFoundError(f"Local PDF not found: {source_path}")
                         filename = str(data.get("filename") or source_path.name)
@@ -10602,7 +10672,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 record = find_paper_record(self.workspace, proposal.get("paper_id", ""))
                 if not record:
                     continue
-                paper_dir = self.workspace / record.get("paper_dir", "")
+                paper_dir = paper_record_dir(self.workspace, record)
                 metadata = read_json(paper_dir / "metadata.json", {})
                 tags = normalize_tag_paths(metadata.get("tags", record.get("tags", [])))
                 tag = normalize_tag_paths(proposal.get("to", ""))
@@ -10700,7 +10770,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 if pdf_value and pdf_value != DEFAULT_PDF_LIBRARY_PATH:
                     result = register_paper_in_library(
                         self.workspace,
-                        Path(pdf_value).expanduser().resolve(),
+                        resolve_local_path(pdf_value),
                         paper_id=str(data.get("paper_id") or "").strip() or None,
                         title=title_value or None,
                         tags=tags,
@@ -11030,18 +11100,20 @@ class ReaderHandler(BaseHTTPRequestHandler):
 
 def serve(args: argparse.Namespace) -> None:
     workspace = resolve_workspace(args.workspace)
-    ensure_workspace(workspace)
-    resumed = resume_interrupted_processing_tasks(workspace)
+    if not getattr(args, "create_workspace", False) or (workspace / "library.json").exists():
+        require_existing_workspace(workspace)
     ReaderHandler.workspace = workspace
     server = ThreadingHTTPServer((args.host, args.port), ReaderHandler)
-    url = f"http://{args.host}:{args.port}/"
-    print(f"Serving workspace: {workspace}")
-    print(f"Reader URL: {url}")
-    if resumed:
-        print(f"Resumed interrupted processing for {len(resumed)} paper(s): {', '.join(resumed)}")
-    if args.open:
-        webbrowser.open(url)
     try:
+        ensure_workspace(workspace)
+        resumed = resume_interrupted_processing_tasks(workspace)
+        url = f"http://{args.host}:{server.server_address[1]}/"
+        print(f"Serving workspace: {workspace}")
+        print(f"Reader URL: {url}")
+        if resumed:
+            print(f"Resumed interrupted processing for {len(resumed)} paper(s): {', '.join(resumed)}")
+        if args.open:
+            webbrowser.open(url)
         server.serve_forever()
     except KeyboardInterrupt:
         print("Stopping server...")
@@ -11091,6 +11163,7 @@ def build_parser() -> argparse.ArgumentParser:
     serve_cmd.add_argument("--host", default="127.0.0.1")
     serve_cmd.add_argument("--port", type=int, default=8765)
     serve_cmd.add_argument("--open", action="store_true", help="Open the reader in the browser")
+    serve_cmd.add_argument("--create-workspace", action="store_true", help="Explicitly initialize a new workspace instead of requiring an existing library")
     serve_cmd.set_defaults(func=serve)
 
     doctor_cmd = sub.add_parser("doctor", help="Check tool and MinerU availability")

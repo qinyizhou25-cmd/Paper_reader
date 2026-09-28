@@ -1,0 +1,5 @@
+# Optional PDF previews and page-count helpers; not needed by the core reader.
+# This does not install MinerU or any PDF-to-Markdown conversion service.
+pypdfium2
+Pillow
+pypdf
