@@ -3,10 +3,42 @@ const state = {
   tagDictionary: { paper_tags: [], note_tags: [], aliases: {}, frames: [] },
   libraryUpload: { active: false, total: 0, completed: 0, files: [], message: "", error: "" },
   currentPaperId: null,
+  paperTabs: [],
+  paperSessions: new Map(),
+  paperLoadVersion: 0,
+  paperLoadingId: "",
+  translationConfig: { auto_start: false },
+  translationJobs: new Map(),
+  readerBackgroundTimer: null,
+  readerBackgroundVersion: 0,
+  translationQueue: { open: false, loading: false, data: null, error: "", timer: null },
+  processingQueue: { open: false, loading: false, data: null, error: "", timer: null },
+  feishuConfig: { enabled: false, auto_sync: false },
+  feishuIntake: { records: [], record: null, localPaper: null, fileToken: "", localPath: "", brief: "raw text_中文",
+    loading: false, busy: false, error: "", statusError: "", message: "", hasMore: false, version: 0 },
+  feishuSyncByPaper: new Map(),
+  feishuPanelOpen: false,
+  feishuPollTimer: null,
+  feishuPublication: { paperId: "", title: "", version: 0, loading: false, sending: false,
+    preview: null, publication: null, error: "", timer: null },
+  libraryLoaded: false,
+  libraryDirty: true,
+  allNotesLoaded: false,
+  allNotesDirty: true,
+  allNotesPromise: null,
+  libraryPage: 0,
+  libraryFilterTimer: null,
+  metadataDrafts: new Map(),
+  thinkingDirty: false,
+  takeawayDirty: false,
+  drawerInitialValue: "",
   payload: null,
   references: {},
   figures: {},
   annotations: [],
+  readingTeacher: emptyReadingTeacher(),
+  expandedMarginNotes: new Set(),
+  collapsedDefinitionNotes: new Set(),
   thinking: null,
   takeawayDoc: { version: 1, blocks: [], updated_at: "" },
   allNotes: [],
@@ -15,6 +47,7 @@ const state = {
   pendingThinkingAnnotation: null,
   currentSelection: null,
   referenceLoads: {},
+  referenceIntakeDrafts: {},
   selectedNoteFilters: [],
   selectedNoteProjects: [],
   notesPreview: { paperId: "", annotationId: "", segmentId: "", payload: null, loading: false, error: "" },
@@ -76,11 +109,11 @@ const state = {
   libraryTableScroll: { tableTop: 0, tableLeft: 0, rootLeft: 0, windowY: 0 },
   libraryScrollSnapshots: {},
   workspaceScrollByPaper: {},
+  workspaceAnchorsByPaper: {},
+  stopScrollRestore: null,
   workspaceMode: "split",
   paperMapCollapsed: false,
   paperMapTab: "map",
-  takeawayPreviousWorkspaceMode: "",
-  takeawayPreviousPaperMapCollapsed: null,
   collapsedOutlineIds: new Set(),
   currentOutlineId: "",
   presentationReportOpen: false,
@@ -103,11 +136,16 @@ const state = {
   takeawayDragBlockId: "",
   takeawayArrangePreview: null,
   thinkingTab: "writing",
+  thinkingComposerMode: "chat",
+  manualOutputDraft: { prompt: "", content: "" },
   chatMode: "source",
   chatDraft: "",
   chatSelectionDraft: null,
   chatUseProjectContext: false,
+  chatScroll: { top: 0, atEnd: true },
+  chatError: "",
   chatSending: false,
+  readingNarrativeGenerating: false,
   sensemakingWidth: null,
   reportWidth: null,
   reportResizeInitialized: false,
@@ -125,6 +163,7 @@ const state = {
 
 const sidebarWidthStorageKey = "paperReader.sidebarWidth";
 const sensemakingWidthStorageKey = "paperReader.sensemakingWidth";
+const readerWidthStorageKey = "paperReader.readerWidth";
 const reportWidthStorageKey = "paperReader.reportWidth";
 const paperMapCollapsedStorageKey = "paperReader.paperMapCollapsed";
 const libraryDensityStorageKey = "paperReader.libraryDensity";
@@ -136,6 +175,260 @@ const libraryTitleCollapsedStorageKey = "paperReader.libraryTitlesCollapsed";
 const libraryPreviewThumbsStorageKey = "paperReader.libraryPreviewThumbs";
 const libraryCustomProjectsStorageKey = "paperReader.customProjects";
 const libraryScrollStorageKey = "paperReader.libraryScrollSnapshots";
+const paperTabsStorageKey = "paperReader.openPapers.v1";
+const paperCacheLimit = 8;
+const paperCacheMaxAge = 60000;
+const libraryPageSize = 40;
+
+const paperSessionFields = [
+  "payload", "annotations", "thinking", "takeawayDoc", "references", "figures",
+  "readingProgress", "readingProgressDirty", "thinkingDirty", "takeawayDirty",
+  "workspaceMode", "paperMapTab", "collapsedOutlineIds", "collapsedTakeawayBlockIds",
+  "takeawayUndoStack", "takeawayRedoStack", "takeawayDocVersion",
+  "takeawaySelectedBlockIds", "takeawayLastSelectedBlockId", "takeawaySelectionMode",
+  "chatDraft", "chatSelectionDraft", "chatMode", "chatUseProjectContext", "chatScroll", "chatError",
+  "thinkingComposerMode", "manualOutputDraft",
+  "thinkingTab", "presentationReportOpen", "referenceIntakeDrafts",
+  "readingTeacher", "expandedMarginNotes", "collapsedDefinitionNotes",
+];
+
+function paperSession(paperId) {
+  if (!state.paperSessions.has(paperId)) {
+    state.paperSessions.set(paperId, { writes: new Map(), loadedAt: 0, lastUsed: Date.now() });
+  }
+  return state.paperSessions.get(paperId);
+}
+
+function capturePaperSession() {
+  if (!state.currentPaperId || !state.payload) return;
+  const session = paperSession(state.currentPaperId);
+  for (const key of paperSessionFields) session[key] = state[key];
+  session.payload.annotations = { ...(session.payload.annotations || {}), annotations: state.annotations };
+  session.payload.thinking = state.thinking;
+  session.payload.takeaway_doc = state.takeawayDoc;
+  session.payload.reading_progress = state.readingProgress;
+  session.lastUsed = Date.now();
+}
+
+function prunePaperCache() {
+  const candidates = [...state.paperSessions.entries()]
+    .filter(([id, session]) => id !== state.currentPaperId && !session.thinkingDirty && !session.takeawayDirty
+      && !hasThinkingComposerDraft(session)
+      && !session.readingProgressDirty && ![...session.writes.values()].some(write => write.pending || write.dirty))
+    .sort((a, b) => a[1].lastUsed - b[1].lastUsed);
+  while (state.paperSessions.size > paperCacheLimit && candidates.length) {
+    state.paperSessions.delete(candidates.shift()[0]);
+  }
+}
+
+function persistPaperTabs() {
+  const positions = {};
+  const modes = {};
+  for (const id of state.paperTabs) {
+    positions[id] = state.workspaceScrollByPaper[id] || 0;
+    modes[id] = id === state.currentPaperId ? state.workspaceMode : state.paperSessions.get(id)?.workspaceMode || "read";
+  }
+  try {
+    localStorage.setItem(paperTabsStorageKey, JSON.stringify({
+      tabs: state.paperTabs, active: state.currentPaperId, positions, modes,
+      anchors: Object.fromEntries(state.paperTabs.filter(id => state.workspaceAnchorsByPaper[id])
+        .map(id => [id, state.workspaceAnchorsByPaper[id]])),
+    }));
+  } catch (error) {
+    console.error("Could not persist paper tabs", error);
+    toast("Tab positions could not be saved. Your saved notes are unaffected.");
+  }
+}
+
+function restorePaperTabs() {
+  const raw = localStorage.getItem(paperTabsStorageKey);
+  if (!raw) return;
+  try {
+    const saved = JSON.parse(raw);
+    const known = new Set((state.library?.papers || []).map(paper => paper.id));
+    state.paperTabs = [...new Set((Array.isArray(saved.tabs) ? saved.tabs : []).filter(id => known.has(id)))];
+    state.currentPaperId = state.paperTabs.includes(saved.active) ? saved.active : state.paperTabs[0] || null;
+    for (const id of state.paperTabs) {
+      const y = Number(saved.positions?.[id]);
+      if (Number.isFinite(y) && y >= 0) state.workspaceScrollByPaper[id] = y;
+      const anchor = saved.anchors?.[id];
+      if (anchor && typeof anchor.segmentId === "string" && Number.isFinite(anchor.offset)) state.workspaceAnchorsByPaper[id] = anchor;
+      if (["read", "split", "think"].includes(saved.modes?.[id])) paperSession(id).workspaceMode = saved.modes[id];
+    }
+  } catch (error) {
+    console.error("Could not restore paper tabs", error);
+    toast("Saved tabs could not be restored. Open papers from Library.");
+  }
+}
+
+function renderPaperTabs() {
+  const root = qs("#paperTabs");
+  if (!root) return;
+  const focusedId = document.activeElement?.dataset?.paperTab;
+  root.innerHTML = state.paperTabs.map(id => {
+    const paper = state.library?.papers?.find(item => item.id === id) || { id };
+    const title = paperTitle(paper);
+    const active = id === state.currentPaperId;
+    return `<div class="paper-tab ${active ? "active" : ""}" role="presentation">
+      <button type="button" role="tab" aria-selected="${active}" aria-controls="readerView"
+        data-paper-tab="${escapeHtml(id)}" title="${escapeHtml(title)}">${escapeHtml(title)}</button>
+      <button type="button" class="paper-tab-close" data-close-paper-tab="${escapeHtml(id)}"
+        aria-label="Close ${escapeHtml(title)}" title="Close tab (keeps all reading data)">×</button>
+    </div>`;
+  }).join("");
+  if (focusedId) root.querySelector(`[data-paper-tab="${cssEscape(focusedId)}"]`)?.focus({ preventScroll: true });
+  const status = qs("#paperLoadStatus");
+  if (status) status.textContent = state.paperLoadingId ? "Opening paper…" : state.paperTabs.length ? `${state.paperTabs.length} open` : "Open a paper from Library";
+}
+
+async function closePaperTab(paperId) {
+  try {
+    const index = state.paperTabs.indexOf(paperId);
+    if (index < 0) return;
+    if (state.paperLoadingId === paperId && state.currentPaperId !== paperId) {
+      state.paperLoadVersion += 1;
+      state.paperLoadingId = "";
+      qs("#readerView").inert = false;
+    }
+    if (state.currentPaperId === paperId) {
+      await flushCurrentPaperEdits();
+      const next = state.paperTabs[index + 1] || state.paperTabs[index - 1];
+      if (next) {
+        if (!await loadPaper(next)) return;
+      } else {
+        state.paperLoadVersion += 1;
+        disconnectReadingProgressTracker();
+        capturePaperSession();
+        state.currentPaperId = null;
+        state.payload = null;
+        state.annotations = [];
+        state.thinking = null;
+        state.figures = {};
+        state.references = {};
+        renderReader();
+        renderSidebar();
+        activateView("library");
+      }
+    }
+    state.paperTabs = state.paperTabs.filter(id => id !== paperId);
+    persistPaperTabs();
+    renderPaperTabs();
+    renderPaperSelect();
+  } catch (error) {
+    toast(`Tab kept open: ${error.message}`);
+  }
+}
+
+function queuePaperWrite(paperId, kind, data) {
+  const session = paperSession(paperId);
+  let write = session.writes.get(kind);
+  if (!write) {
+    write = { pending: 0, dirty: false, revision: 0, promise: null, error: null, body: "" };
+    session.writes.set(kind, write);
+  }
+  write.body = JSON.stringify(data);
+  const body = write.body;
+  const revision = ++write.revision;
+  const previous = write.promise;
+  write.pending += 1;
+  write.dirty = true;
+  renderReaderSaveStatus();
+  // A later snapshot can retry a failed write, but the failure stays visible
+  // and the tab cannot be discarded until its latest snapshot is saved.
+  const ready = previous ? previous.catch(() => undefined) : Promise.resolve();
+  const promise = ready.then(() => api(`/api/papers/${encodeURIComponent(paperId)}/${kind}`, {
+    method: "POST", body,
+  }));
+  write.promise = promise;
+  promise.then(() => {
+    write.pending -= 1;
+    if (write.revision === revision) {
+      write.dirty = false;
+      write.error = null;
+    }
+    renderReaderSaveStatus();
+  }, error => {
+    write.pending -= 1;
+    write.error = error;
+    renderReaderSaveStatus();
+    console.error(`Could not save ${kind} for ${paperId}`, error);
+    if (paperId === state.currentPaperId) {
+      setThinkingSaveState("Unsaved — retry before closing", "error");
+      toast(`Save failed: ${error.message}. Keep this tab open and retry.`);
+    }
+  });
+  return promise;
+}
+
+function renderReaderSaveStatus() {
+  const root = qs("#readerSaveStatus");
+  if (!root) return;
+  const writes = [...(state.paperSessions.get(state.currentPaperId)?.writes?.values() || [])];
+  const error = writes.find(write => write.error);
+  const saving = writes.some(write => write.pending);
+  const dirty = state.thinkingDirty || state.takeawayDirty || state.metadataDrafts.has(state.currentPaperId)
+    || writes.some(write => write.dirty) || noteDrawerHasChanges() || hasThinkingComposerDraft();
+  const message = !state.currentPaperId ? "" : error ? "Unsaved — retry before closing"
+    : saving ? "Saving locally…" : dirty ? "Unsaved changes" : "Saved locally";
+  root.dataset.state = error ? "error" : saving ? "saving" : dirty ? "pending" : "saved";
+  if (root.textContent !== message) root.textContent = message;
+  refreshSavedDefinitionStatuses();
+}
+
+function hasThinkingComposerDraft(session = state) {
+  return Boolean(session.chatDraft || session.manualOutputDraft?.prompt || session.manualOutputDraft?.content);
+}
+
+function hasUnsavedPaperChanges() {
+  return state.thinkingDirty || state.takeawayDirty || noteDrawerHasChanges() || hasThinkingComposerDraft()
+    || state.metadataDrafts.size > 0
+    || [...state.paperSessions.entries()].some(([id, session]) => (id !== state.currentPaperId && hasThinkingComposerDraft(session))
+      || [...session.writes.values()].some(write => write.pending || write.dirty));
+}
+
+async function flushCurrentPaperEdits() {
+  if (state.chatSending || state.readingNarrativeGenerating) throw new Error("Wait for the current AI request to finish before switching papers.");
+  if (noteDrawerHasChanges()) await savePendingAnnotation(true);
+  const paperId = state.currentPaperId;
+  if (!paperId || !state.payload) return;
+  tickReadingProgress({ skipSchedule: true });
+  if (state.thinkingSaveTimer) clearTimeout(state.thinkingSaveTimer);
+  if (state.takeawaySaveTimer) clearTimeout(state.takeawaySaveTimer);
+  state.thinkingSaveTimer = null;
+  state.takeawaySaveTimer = null;
+  if (state.thinkingDirty) await saveThinking({ silent: true });
+  if (state.takeawayDirty) await saveTakeawayDoc({ silent: true });
+  await flushReadingProgress({ silent: true, strict: true });
+  const session = paperSession(paperId);
+  for (const [kind, write] of session.writes) {
+    if (write.error && !write.pending) await queuePaperWrite(paperId, kind, JSON.parse(write.body));
+    else if (write.promise) await write.promise;
+  }
+  if (noteDrawerHasChanges()) throw new Error("Save the open note before switching papers.");
+  capturePaperSession();
+}
+
+async function exportReadingData(format) {
+  const paperId = state.currentPaperId;
+  if (!paperId) return;
+  try {
+    if (hasThinkingComposerDraft()) throw new Error("Finish or clear the chat/paste draft before exporting. Unsubmitted drafts are not saved reading data.");
+    await flushCurrentPaperEdits();
+    if (paperId !== state.currentPaperId) return;
+    const endpoint = format === "json" ? "reading-data" : "notes-md";
+    const response = await fetch(`/api/papers/${encodeURIComponent(paperId)}/${endpoint}`);
+    if (!response.ok) throw new Error(`Export failed (${response.status})`);
+    const url = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${paperId}-reading.${format === "json" ? "json" : "md"}`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    toast("Original reading data exported — no AI summary.");
+  } catch (error) {
+    toast(`Export failed: ${error.message}`);
+  }
+}
 
 const defaultNoteTags = [];
 const paperBriefBlockId = "paper-brief";
@@ -822,17 +1115,48 @@ function toast(message) {
 
 function applySidebarWidth(width) {
   const viewportLimit = Math.max(240, Math.min(620, Math.floor(window.innerWidth * 0.48)));
-  const clamped = Math.max(220, Math.min(viewportLimit, Math.round(Number(width) || 300)));
+  const clamped = Math.max(200, Math.min(viewportLimit, Math.round(Number(width) || 220)));
   document.documentElement.style.setProperty("--sidebar-width", `${clamped}px`);
   return clamped;
 }
 
 function applySensemakingWidth(width) {
-  const viewportLimit = Math.max(320, Math.min(900, Math.floor(window.innerWidth * 0.66)));
-  const clamped = Math.max(320, Math.min(viewportLimit, Math.round(Number(width) || 440)));
+  const availableWidth = qs(".reader-workspace")?.clientWidth || window.innerWidth;
+  const viewportLimit = Math.max(280, Math.floor(availableWidth * 0.42));
+  const clamped = Math.max(280, Math.min(viewportLimit, Math.round(Number(width) || 340)));
   state.sensemakingWidth = clamped;
   document.documentElement.style.setProperty("--sensemaking-width", `${clamped}px`);
   return clamped;
+}
+
+function applyReaderWidth(width) {
+  if (!["comfortable", "wide", "full"].includes(width)) {
+    console.warn("Unknown reading text width preference; using Wide.", width);
+    width = "wide";
+  }
+  qs("#documentRoot").dataset.readerWidth = width;
+  qs("#readerWidth").value = width;
+  return width;
+}
+
+function initReaderWidth() {
+  let width = "wide";
+  try {
+    width = localStorage.getItem(readerWidthStorageKey) || width;
+  } catch (error) {
+    console.warn("Could not load the reading text width preference.", error);
+    toast("Text width preference could not be loaded.");
+  }
+  applyReaderWidth(width);
+  qs("#readerWidth").addEventListener("change", event => {
+    const nextWidth = applyReaderWidth(event.target.value);
+    try {
+      localStorage.setItem(readerWidthStorageKey, nextWidth);
+    } catch (error) {
+      console.warn("Could not save the reading text width preference.", error);
+      toast("Text width changed, but could not be saved for next time.");
+    }
+  });
 }
 
 function applyReportWidth(width) {
@@ -1010,6 +1334,150 @@ function displayText(text, options = {}) {
   return options.trim === false ? cleaned : cleaned.trim();
 }
 
+function isEscapedAt(text, index) {
+  let slashes = 0;
+  for (let position = index - 1; position >= 0 && text[position] === "\\"; position -= 1) slashes += 1;
+  return slashes % 2 === 1;
+}
+
+function findUnescapedDelimiter(text, delimiter, start) {
+  let index = start;
+  while (index < text.length) {
+    index = text.indexOf(delimiter, index);
+    if (index < 0) return -1;
+    if (!isEscapedAt(text, index) && !(delimiter === "$" && text[index + 1] === "$")) return index;
+    index += delimiter.length;
+  }
+  return -1;
+}
+
+function latexEnvironmentAt(text, index) {
+  const start = String(text || "").slice(index).match(/^\\begin\{([A-Za-z*]+)\}/);
+  if (!start) return null;
+  const environment = start[1];
+  const allowed = new Set(["equation", "equation*", "align", "align*", "aligned", "gather", "gather*", "gathered", "multline", "multline*", "split", "cases", "matrix", "pmatrix", "bmatrix", "vmatrix", "Vmatrix", "array"]);
+  if (!allowed.has(environment)) return null;
+  const expressionStart = index + start[0].length;
+  const endToken = `\\end{${environment}}`;
+  const endStart = text.indexOf(endToken, expressionStart);
+  if (endStart < 0) return null;
+  return { environment, expressionStart, expressionEnd: endStart, end: endStart + endToken.length };
+}
+
+function normalizeMathExpression(expression, environment = "") {
+  const body = String(expression || "").trim();
+  if (!environment) return body;
+  if (/^equation\*?$/.test(environment)) return body;
+  if (/^align\*?$/.test(environment)) return `\\begin{aligned}${body}\\end{aligned}`;
+  if (/^(gather|multline)\*?$/.test(environment)) return `\\begin{gathered}${body}\\end{gathered}`;
+  return `\\begin{${environment}}${body}\\end{${environment}}`;
+}
+
+function isLikelyDollarMath(expression) {
+  const trimmed = String(expression || "").trim();
+  if (!trimmed || /\n/.test(trimmed)) return false;
+  if (/^\d+(?:[.,]\d+)?$/.test(trimmed)) return false;
+  if (/[\\_^{}=<>+\-*/]|[∑∫√∞≈≠≤≥±×÷]/.test(trimmed)) return true;
+  if (/\b(?:frac|sum|int|lim|sqrt|alpha|beta|gamma|delta|theta|lambda|mu|sigma|mathbb|mathcal|mathrm|mathbf|left|right)\b/i.test(trimmed)) return true;
+  if (/^[A-Za-z][A-Za-z0-9']*$/.test(trimmed)) return true;
+  return trimmed.length <= 48 && /[A-Za-z]/.test(trimmed) && /\d/.test(trimmed);
+}
+
+function splitMathFragments(text) {
+  const raw = String(text ?? "");
+  const parts = [];
+  let cursor = 0;
+  let index = 0;
+  const pushText = end => {
+    if (end > cursor) parts.push({ type: "text", text: raw.slice(cursor, end) });
+  };
+  const pushMath = (start, expressionStart, expressionEnd, end, display) => {
+    pushText(start);
+    parts.push({ type: "math", raw: raw.slice(start, end), expression: raw.slice(expressionStart, expressionEnd), display });
+    cursor = end;
+    index = end;
+  };
+  const pushEnvironmentMath = (start, environmentInfo) => {
+    pushText(start);
+    parts.push({
+      type: "math",
+      raw: raw.slice(start, environmentInfo.end),
+      expression: normalizeMathExpression(raw.slice(environmentInfo.expressionStart, environmentInfo.expressionEnd), environmentInfo.environment),
+      display: true,
+    });
+    cursor = environmentInfo.end;
+    index = environmentInfo.end;
+  };
+  while (index < raw.length) {
+    if (raw.startsWith("\\begin{", index) && !isEscapedAt(raw, index)) {
+      const environmentInfo = latexEnvironmentAt(raw, index);
+      if (environmentInfo) {
+        pushEnvironmentMath(index, environmentInfo);
+        continue;
+      }
+    }
+    if (raw.startsWith("$$", index) && !isEscapedAt(raw, index)) {
+      const close = findUnescapedDelimiter(raw, "$$", index + 2);
+      if (close > index + 2) {
+        pushMath(index, index + 2, close, close + 2, true);
+        continue;
+      }
+    }
+    if (raw.startsWith("\\[", index) && !isEscapedAt(raw, index)) {
+      const close = findUnescapedDelimiter(raw, "\\]", index + 2);
+      if (close > index + 2) {
+        pushMath(index, index + 2, close, close + 2, true);
+        continue;
+      }
+    }
+    if (raw.startsWith("\\(", index) && !isEscapedAt(raw, index)) {
+      const close = findUnescapedDelimiter(raw, "\\)", index + 2);
+      if (close > index + 2) {
+        pushMath(index, index + 2, close, close + 2, false);
+        continue;
+      }
+    }
+    if (raw[index] === "$" && raw[index + 1] !== "$" && !isEscapedAt(raw, index)) {
+      const close = findUnescapedDelimiter(raw, "$", index + 1);
+      if (close > index + 1 && isLikelyDollarMath(raw.slice(index + 1, close))) {
+        pushMath(index, index + 1, close, close + 1, false);
+        continue;
+      }
+    }
+    index += 1;
+  }
+  pushText(raw.length);
+  return parts;
+}
+
+function displayTextPreservingMath(text, options = {}) {
+  const raw = options.trim === false ? String(text ?? "") : String(text ?? "").trim();
+  return splitMathFragments(raw).map(part => part.type === "math" ? part.raw : displayText(part.text, { trim: false })).join("");
+}
+
+function renderMathFragment(part) {
+  const fallback = `<span class="math-fallback">${escapeHtml(part.raw)}</span>`;
+  const renderer = window.katex?.renderToString;
+  if (typeof renderer !== "function") return fallback;
+  try {
+    const html = renderer(String(part.expression || "").trim(), {
+      displayMode: Boolean(part.display),
+      throwOnError: false,
+      strict: "ignore",
+      trust: false,
+      output: "htmlAndMathml",
+    });
+    return `<span class="${part.display ? "math-display" : "math-inline"}" data-annotation-source-length="${part.raw.length}">${html}</span>`;
+  } catch (error) {
+    return fallback;
+  }
+}
+
+function renderInlineContent(text, options, renderTextPart) {
+  const cleaned = displayTextPreservingMath(text, { trim: options?.trim !== false });
+  return splitMathFragments(cleaned).map(part => part.type === "math" ? renderMathFragment(part) : renderTextPart(part.text)).join("");
+}
+
 function extractReferenceNumbers(label) {
   const numbers = [];
   for (const part of String(label || "").split(",")) {
@@ -1058,6 +1526,115 @@ function markdownImageInfo(text) {
   return match ? { alt: match[1] || "Paper image", src: match[2] || "" } : null;
 }
 
+function stripTranslationImages(text) {
+  return String(text || "")
+    .replace(/!\[(?:\\.|[^\]\\])*\]\((?:\\.|[^\\()]|\([^()]*\))*\)/g, " ")
+    .replace(/<img\b[^>]*>/gi, " ");
+}
+
+function translationMathParts(text) {
+  const raw = String(text || "");
+  const protectedRanges = [];
+  const fences = /^[ \t]*(`{3,}|~{3,})[^\r\n]*(?:\r?\n|$)/gm;
+  let fence;
+  while ((fence = fences.exec(raw))) {
+    const close = new RegExp(`^[ \\t]*${fence[1][0]}{${fence[1].length},}[ \\t]*$`, "gm");
+    close.lastIndex = fences.lastIndex;
+    const end = close.exec(raw);
+    const endOffset = end ? close.lastIndex : raw.length;
+    protectedRanges.push({ start: fence.index, end: endOffset });
+    fences.lastIndex = endOffset;
+  }
+  for (const match of raw.matchAll(/(`+)([\s\S]*?)\1(?!`)/g)) {
+    if (!isEscapedAt(raw, match.index)) protectedRanges.push({ start: match.index, end: match.index + match[0].length });
+  }
+  for (const match of raw.matchAll(/`+/g)) {
+    if (!isEscapedAt(raw, match.index) && !protectedRanges.some(range => match.index >= range.start && match.index < range.end)) {
+      protectedRanges.push({ start: match.index, end: raw.length });
+      break;
+    }
+  }
+  let offset = 0;
+  return splitMathFragments(raw).flatMap(part => {
+    const start = offset;
+    offset += (part.type === "math" ? part.raw : part.text).length;
+    if (part.type !== "math" || protectedRanges.some(range => start < range.end && offset > range.start)) return [];
+    if (part.raw.startsWith("$") && !part.display && /^\s*\d/.test(part.expression)
+      && /^\d/.test(raw.slice(offset))) return [];
+    return [{ ...part, start, end: offset }];
+  });
+}
+
+function omitTextRanges(text, omissions) {
+  let result = "";
+  let cursor = 0;
+  for (const range of omissions) {
+    result += text.slice(cursor, range.start);
+    cursor = range.end;
+  }
+  return result + text.slice(cursor);
+}
+
+function isMathOnlyText(text, parts = translationMathParts(text)) {
+  if (!parts.length) return false;
+  const remainder = omitTextRanges(text, parts).replace(/\\(?:tag|label)\*?\s*\{[^{}]*\}/g, "");
+  return !remainder.replace(/[\s\d()[\]{}.,;:!?+=\-–—，。；：！？]/gu, "");
+}
+
+function comparableMath(expression) {
+  return String(expression || "").replace(/\\(?:tag|label)\*?\s*\{[^{}]*\}/g, "")
+    .replace(/\\(?:left|right)\b/g, "").replace(/\s+/g, "");
+}
+
+function translationPresentation(segment) {
+  const raw = displayTextPreservingMath(segment?.translation || "", { trim: false });
+  if (segment?.kind === "code" || !/[$\\]/.test(segment?.markdown || "") || !/[$\\]/.test(raw)) return { text: raw, omissions: [] };
+  const source = stripTranslationImages(displayTextPreservingMath(segment?.markdown || "", { trim: false }));
+  const sourceParts = translationMathParts(source);
+  if (!sourceParts.length) return { text: raw, omissions: [] };
+  const translatedParts = translationMathParts(raw);
+  const mathOnlySource = isMathOnlyText(source, sourceParts);
+  const originals = new Set(sourceParts.filter(part => part.display || mathOnlySource).map(part => comparableMath(part.expression)));
+  if (isMathOnlyText(stripTranslationImages(raw)) && (mathOnlySource
+    || translatedParts.every(part => originals.has(comparableMath(part.expression))))) {
+    return { text: "", omissions: [{ start: 0, end: raw.length }] };
+  }
+  const omissions = translatedParts.filter(part => part.display && originals.has(comparableMath(part.expression)))
+    .map(({ start, end }) => {
+      const number = raw.slice(end).match(/^[ \t]*(?:\r?\n[ \t]*)?[(（]\d+[a-z]?[)）](?=[ \t]*(?:\r?\n|$))/i);
+      return { start, end: end + (number?.[0].length || 0) };
+    });
+  return { text: omitTextRanges(raw, omissions), omissions };
+}
+
+function displayedOffset(originalOffset, omissions) {
+  return originalOffset - omissions.reduce((removed, range) =>
+    removed + Math.max(0, Math.min(originalOffset, range.end) - range.start), 0);
+}
+
+function originalTranslationOffset(segment, offset, edge) {
+  const { omissions } = translationPresentation(segment);
+  let removed = 0;
+  for (const range of omissions) {
+    const boundary = range.start - removed;
+    if (offset < boundary || (offset === boundary && edge === "end")) break;
+    removed += range.end - range.start;
+  }
+  return offset + removed;
+}
+
+function annotationDisplayRanges(raw, annotations, target, omissions = []) {
+  // Keep stored ranges in the original text; only project their visible endpoints.
+  const ranges = annotations.map(annotation => {
+    const range = normalizedAnnotationRange(annotation, raw, target);
+    return { annotation, range: range && {
+      start: displayedOffset(range.start, omissions), end: displayedOffset(range.end, omissions),
+    } };
+  }).filter(item => item.range && item.range.end > item.range.start)
+    .sort((a, b) => a.range.start - b.range.start || a.range.end - b.range.end);
+  return { text: omitTextRanges(raw, omissions), ranges };
+}
+
 function annotationMediaSrc(annotation, paperId = state.currentPaperId) {
   if (annotation?.media_src) return assetUrlForPaper(paperId, annotation.media_src);
   const direct = markdownImageInfo(annotation?.quote || "");
@@ -1079,9 +1656,28 @@ function linkFigures(htmlText) {
   }).join("");
 }
 
+function autolinkPlainUrlsAndDois(htmlText) {
+  const linkToken = token => {
+    let clean = String(token || "");
+    let trailing = "";
+    while (clean && /[.,);\]]/.test(clean.at(-1))) {
+      trailing = clean.at(-1) + trailing;
+      clean = clean.slice(0, -1);
+    }
+    const href = /^https?:\/\//i.test(clean) ? clean : `https://doi.org/${clean}`;
+    return `<a href="${escapeHtml(href)}" target="_blank" rel="noreferrer">${escapeHtml(clean)}</a>${escapeHtml(trailing)}`;
+  };
+  return String(htmlText || "").split(/(<a\b[^>]*>.*?<\/a>|<[^>]+>)/gi).map(part => {
+    if (!part || part.startsWith("<")) return part;
+    return part.replace(/(?<![\w/])(https?:\/\/[^\s<]+|10\.\d{4,9}\/[^\s<]+)/gi, match => linkToken(match));
+  }).join("");
+}
+
 function inlineMarkdown(text, options = {}) {
-  let safe = escapeHtml(displayText(text, { trim: options.trim !== false }));
+  return renderInlineContent(text, options, rawPart => {
+  let safe = escapeHtml(displayText(options.images === false ? stripTranslationImages(rawPart) : rawPart, { trim: false }));
   safe = safe.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
+    if (options.images === false) return "";
     const url = assetUrl(src);
     if (!url) return match;
     return `<button class="paper-figure-image" data-figure-src="${escapeHtml(url)}" title="${escapeHtml(alt || "Open figure")}"><img src="${escapeHtml(url)}" alt="${escapeHtml(alt || "Paper figure")}" loading="lazy"></button>`;
@@ -1090,9 +1686,11 @@ function inlineMarkdown(text, options = {}) {
   safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   safe = safe.replace(/\*([^*]+)\*/g, "<em>$1</em>");
   safe = safe.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  safe = autolinkPlainUrlsAndDois(safe);
   if (options.citations) safe = linkCitations(safe);
   safe = linkFigures(safe);
   return safe;
+  });
 }
 
 function getAnnotationsFor(paragraphId) {
@@ -1101,6 +1699,10 @@ function getAnnotationsFor(paragraphId) {
 
 function mediaAnnotationsFor(paragraphId) {
   return getAnnotationsFor(paragraphId).filter(item => ["media", "table"].includes(item.target));
+}
+
+function isTeacherDefinition(annotation) {
+  return annotation?.origin?.kind === "reading-teacher" && annotation.origin.content_type === "definition";
 }
 
 function annotationKindLabel(annotation) {
@@ -1192,7 +1794,7 @@ function normalizedAnnotationRange(annotation, text, target) {
     const end = Math.max(start, Math.min(raw.length, Number(directRange.end)));
     if (end > start) return { start, end };
   }
-  if (isDirectTarget && annotation.quote) return rangeForQuote(raw, displayText(annotation.quote)) || { start: 0, end: raw.length };
+  if (isDirectTarget && annotation.quote) return rangeForQuote(raw, displayTextPreservingMath(annotation.quote)) || { start: 0, end: raw.length };
   if (isDirectTarget && annotation.color) return { start: 0, end: raw.length };
   return null;
 }
@@ -1204,11 +1806,8 @@ function inlineThinkingNoteChip(annotation) {
 }
 
 function splitInlineHtmlWithHighlights(text, annotations, target, options = {}) {
-  const raw = displayText(text, { trim: false });
-  const ranges = annotations
-    .map(annotation => ({ annotation, range: normalizedAnnotationRange(annotation, raw, target) }))
-    .filter(item => item.range && item.range.end > item.range.start)
-    .sort((a, b) => a.range.start - b.range.start || a.range.end - b.range.end);
+  const { text: raw, ranges } = annotationDisplayRanges(displayTextPreservingMath(text, { trim: false }),
+    annotations, target, options.omissions);
   if (!ranges.length) return inlineMarkdown(raw, options);
   const parts = [];
   let cursor = 0;
@@ -1226,22 +1825,30 @@ function splitInlineHtmlWithHighlights(text, annotations, target, options = {}) 
   return parts.join("");
 }
 
-function applyHighlights(text, paragraphId, target) {
-  return splitInlineHtmlWithHighlights(text, effectiveAnnotationsFor(paragraphId, target), target, { citations: target === "source" });
+function applyHighlights(text, paragraphId, target, options = {}) {
+  return splitInlineHtmlWithHighlights(text, effectiveAnnotationsFor(paragraphId, target), target, {
+    ...options, citations: target === "source", images: target !== "translation",
+  });
 }
 
 function isHtmlTable(text) {
   return /<table[\s>]/i.test(String(text || ""));
 }
 
-function renderHtmlTable(text) {
+function isTextTableSegment(segment) {
+  const text = String(segment.markdown || "");
+  return isHtmlTable(text) || text.includes("\n|")
+    || (segment.kind === "table" && !markdownImageInfo(text));
+}
+
+function renderHtmlTable(text, options = {}) {
   const raw = String(text || "");
   const tableStart = raw.search(/<table[\s>]/i);
   const caption = tableStart > 0 ? displayText(raw.slice(0, tableStart)) : "";
   const parser = new DOMParser();
   const doc = parser.parseFromString(raw, "text/html");
   const table = doc.querySelector("table");
-  if (!table) return `<pre class="source-text">${escapeHtml(displayText(text))}</pre>`;
+  if (!table) return `<pre class="source-text">${escapeHtml(displayTextPreservingMath(text))}</pre>`;
   const rows = Array.from(table.querySelectorAll("tr")).map(row => {
     const cells = Array.from(row.children).filter(cell => /^(td|th)$/i.test(cell.tagName));
     const html = cells.map(cell => {
@@ -1249,12 +1856,12 @@ function renderHtmlTable(text) {
       const rowspan = Math.max(1, Math.min(20, Number(cell.getAttribute("rowspan") || 1)));
       const colspan = Math.max(1, Math.min(20, Number(cell.getAttribute("colspan") || 1)));
       const attrs = `${rowspan > 1 ? ` rowspan="${rowspan}"` : ""}${colspan > 1 ? ` colspan="${colspan}"` : ""}`;
-      return `<${tag}${attrs}>${escapeHtml(displayText(cell.textContent))}</${tag}>`;
+      return `<${tag}${attrs}>${inlineMarkdown(cell.textContent, { ...options, citations: true })}</${tag}>`;
     }).join("");
     return html ? `<tr>${html}</tr>` : "";
   }).filter(Boolean).join("");
-  if (!rows) return `<pre class="source-text">${escapeHtml(displayText(text))}</pre>`;
-  return `${caption ? `<div class="table-caption source-text">${inlineMarkdown(caption, { citations: true })}</div>` : ""}<div class="table-wrap"><table class="paper-table">${rows}</table></div>`;
+  if (!rows) return `<pre class="source-text">${escapeHtml(displayTextPreservingMath(text))}</pre>`;
+  return `${caption ? `<div class="table-caption source-text">${inlineMarkdown(caption, { ...options, citations: true })}</div>` : ""}<div class="table-wrap"><table class="paper-table">${rows}</table></div>`;
 }
 
 const tableTranslationMap = {
@@ -1497,8 +2104,8 @@ function translateTableText(text) {
 function translatedTableFromTranslation(translation) {
   const raw = String(translation || "").trim();
   if (!raw || !/[\u4e00-\u9fff]/.test(raw)) return "";
-  if (isHtmlTable(raw)) return renderHtmlTable(raw);
-  if (raw.includes("\n|")) return renderPipeTable(raw);
+  if (isHtmlTable(raw)) return renderHtmlTable(raw, { images: false });
+  if (raw.includes("\n|")) return renderPipeTable(raw, { images: false });
   return "";
 }
 
@@ -1517,7 +2124,7 @@ function translatedHtmlTable(text) {
       const rowspan = Math.max(1, Math.min(20, Number(cell.getAttribute("rowspan") || 1)));
       const colspan = Math.max(1, Math.min(20, Number(cell.getAttribute("colspan") || 1)));
       const attrs = `${rowspan > 1 ? ` rowspan="${rowspan}"` : ""}${colspan > 1 ? ` colspan="${colspan}"` : ""}`;
-      return `<${tag}${attrs}>${escapeHtml(translateTableText(cell.textContent))}</${tag}>`;
+      return `<${tag}${attrs}>${inlineMarkdown(translateTableText(cell.textContent), { citations: true })}</${tag}>`;
     }).join("");
     return html ? `<tr>${html}</tr>` : "";
   }).filter(Boolean).join("");
@@ -1530,7 +2137,7 @@ function tableTranslationNoteHtml(translation) {
     .replace(/^\s*参考文献[：:]\s*/i, "")
     .trim();
   if (!withoutTables || !/[\u4e00-\u9fff]/.test(withoutTables)) return "";
-  return `<div class="table-translation-note">${inlineMarkdown(withoutTables)}</div>`;
+  return `<div class="table-translation-note">${inlineMarkdown(withoutTables, { images: false })}</div>`;
 }
 
 function renderTableTranslation(paragraph) {
@@ -1541,14 +2148,14 @@ function renderTableTranslation(paragraph) {
   return `<div class="translation table-translation"><div class="translation-label">中文表格</div>${translatedFromModel || note}</div>`;
 }
 
-function renderPipeTable(text) {
+function renderPipeTable(text, options = {}) {
   const rows = String(text || "").split("\n")
     .map(line => line.trim())
     .filter(line => line.startsWith("|"))
-    .map(line => line.replace(/^\||\|$/g, "").split("|").map(cell => displayText(cell)));
+    .map(line => line.replace(/^\||\|$/g, "").split("|").map(cell => displayTextPreservingMath(cell)));
   const filtered = rows.filter(cells => !cells.every(cell => /^:?-{3,}:?$/.test(cell)));
-  if (!filtered.length) return `<pre class="source-text">${escapeHtml(displayText(text))}</pre>`;
-  const body = filtered.map((cells, rowIndex) => `<tr>${cells.map(cell => `${rowIndex === 0 ? "<th>" : "<td>"}${escapeHtml(cell)}${rowIndex === 0 ? "</th>" : "</td>"}`).join("")}</tr>`).join("");
+  if (!filtered.length) return `<pre class="source-text">${escapeHtml(displayTextPreservingMath(text))}</pre>`;
+  const body = filtered.map((cells, rowIndex) => `<tr>${cells.map(cell => `${rowIndex === 0 ? "<th>" : "<td>"}${inlineMarkdown(cell, { ...options, citations: true })}${rowIndex === 0 ? "</th>" : "</td>"}`).join("")}</tr>`).join("");
   return `<div class="table-wrap"><table class="paper-table">${body}</table></div>`;
 }
 
@@ -1571,7 +2178,13 @@ function wrapMediaImageButtons(segment, html) {
 }
 
 function paperTitle(entry) {
-  return entry.title || entry.id || "Untitled";
+  return cleanPaperTitle(entry.title || entry.id || "Untitled");
+}
+
+function cleanPaperTitle(title) {
+  return String(title || "").replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    .replace(/<img\b[^>]*>/gi, " ").replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/, "").replace(/\s+/g, " ").trim();
 }
 
 function paperPreviewImage(paper = {}) {
@@ -1596,11 +2209,15 @@ function processingMode(paperOrMetadata = {}) {
 
 function processingLabel(paperOrMetadata = {}) {
   const mode = processingMode(paperOrMetadata);
-  return ({ "library-only": "Not parsed", skim: "Parsed + brief", deep: "Parsed + brief", "reference-card": "Reference card" })[mode] || mode;
+  return ({ "library-only": "Not parsed", skim: "Saved skim", deep: "Full text", "reference-card": "Reference card" })[mode] || mode;
 }
 
 function processingStatus(paperOrMetadata = {}) {
   return paperOrMetadata.processing_status || (processingMode(paperOrMetadata) === "deep" ? "ready" : "not_processed");
+}
+
+function paperParsingPending(metadata = {}) {
+  return ["processing", "processing_queued", "paper_brief_processing", "paper_brief_ready"].includes(processingStatus(metadata));
 }
 
 function parseTimeMs(value) {
@@ -1672,6 +2289,14 @@ function normalizeTitleKey(title) {
     .replace(/[^\p{L}\p{N}]/gu, "");
 }
 
+function normalizeTitleKeyWithoutLeadingArticles(title) {
+  return String(title || "")
+    .normalize("NFKC")
+    .toLocaleLowerCase()
+    .replace(/^\s*(the|a|an)\s+/, "")
+    .replace(/[^\p{L}\p{N}]/gu, "");
+}
+
 function titleKeyUsable(titleKey) {
   const cjkCount = Array.from(String(titleKey || "")).filter(char => /[\u4e00-\u9fff]/.test(char)).length;
   return String(titleKey || "").length >= 12 || cjkCount >= 6;
@@ -1680,10 +2305,12 @@ function titleKeyUsable(titleKey) {
 function libraryDuplicateByTitle(title, excludePaperId = "") {
   const titleKey = normalizeTitleKey(title);
   if (!titleKeyUsable(titleKey)) return null;
+  const comparableTitleKey = normalizeTitleKeyWithoutLeadingArticles(title);
   return (state.library?.papers || []).find(paper => {
     if (excludePaperId && paper.id === excludePaperId) return false;
     const paperKey = paper.title_key || normalizeTitleKey(paperTitle(paper));
-    return paperKey && paperKey === titleKey;
+    const comparablePaperKey = normalizeTitleKeyWithoutLeadingArticles(paperTitle(paper));
+    return (paperKey && paperKey === titleKey) || (titleKeyUsable(comparableTitleKey) && comparablePaperKey === comparableTitleKey);
   }) || null;
 }
 
@@ -1718,7 +2345,7 @@ function ensureReadingProgressSegment(segmentId) {
 }
 
 function readingAnnotationCounts(segmentId) {
-  const annotations = (state.annotations || []).filter(annotation => annotation.segment_id === segmentId);
+  const annotations = (state.annotations || []).filter(annotation => annotation.segment_id === segmentId && !isTeacherDefinition(annotation));
   return {
     highlight_count: annotations.length,
     note_count: annotations.filter(annotation => String(annotation.note || "").trim()).length,
@@ -1964,13 +2591,14 @@ function normalizeThinkingData(data = {}, options = {}) {
   thinking.explain.content = String(thinking.explain.content || "");
   thinking.explain.updated_at = String(thinking.explain.updated_at || "");
   thinking.blocks = Array.isArray(thinking.blocks) ? thinking.blocks.map((block, index) => {
-    const mode = ["source", "free"].includes(String(block?.mode || "")) ? String(block.mode) : "";
+    const mode = ["source", "free", "reading_narrative"].includes(String(block?.mode || "")) ? String(block.mode) : "";
     const model = String(block?.model || "");
     const isAgentBlock = Boolean(mode || model);
     const rawTitle = String(block?.title || "").trim();
     const defaultAgentTitles = new Set(["AI output", "Source-grounded answer", "Free reflection answer", "Source-grounded", "Free reflection"]);
     const title = isAgentBlock && defaultAgentTitles.has(rawTitle) ? "" : (rawTitle || (isAgentBlock ? "" : "AI output"));
     return {
+      ...block,
       id: String(block?.id || `tb-${index + 1}`),
       type: String(block?.type || "ai_output"),
       title,
@@ -1978,6 +2606,13 @@ function normalizeThinkingData(data = {}, options = {}) {
       prompt: String(block?.prompt || ""),
       mode,
       model,
+      context_mode: String(block?.context_mode || ""),
+      context_chars: Number(block?.context_chars || 0),
+      project_context: block?.project_context && typeof block.project_context === "object" ? {
+        project: String(block.project_context.project || ""),
+        card_count: Number(block.project_context.card_count || 0),
+        source_path: String(block.project_context.source_path || ""),
+      } : null,
       status: String(block?.status || ""),
       source_refs: normalizeSourceRefs(block?.source_refs || []),
       selection_refs: normalizeSelectionRefs(block?.selection_refs || []),
@@ -1985,10 +2620,10 @@ function normalizeThinkingData(data = {}, options = {}) {
       updated_at: block?.updated_at || new Date().toISOString(),
     };
   }).filter(block => block.title.trim() || block.content.trim() || block.prompt.trim()) : [];
-  const blockIds = new Set(thinking.blocks.map(block => block.id));
   thinking.annotations = Array.isArray(thinking.annotations) ? thinking.annotations
-    .filter(item => item && (blockIds.has(String(item.block_id || "")) || String(item.block_id || "") === paperBriefBlockId))
+    .filter(item => item && typeof item === "object")
     .map(item => ({
+      ...item,
       id: String(item.id || `ta-${Date.now().toString(36)}`),
       block_id: String(item.block_id || ""),
       type: String(item.type || "range"),
@@ -2003,13 +2638,14 @@ function normalizeThinkingData(data = {}, options = {}) {
       updated_at: item.updated_at || new Date().toISOString(),
     })) : [];
   thinking.report_thoughts = Array.isArray(thinking.report_thoughts) ? thinking.report_thoughts.map((item, index) => ({
+    ...item,
     id: String(item?.id || `rt-${Date.now().toString(36)}-${index}`),
     group: String(item?.group || "sensemaking-gap"),
     note: String(item?.note || ""),
     created_at: item?.created_at || new Date().toISOString(),
     updated_at: item?.updated_at || new Date().toISOString(),
   })).filter(item => item.note.trim()) : [];
-  if (!thinking.explain.content.trim() && options.seed !== false) thinking.explain.content = buildExplainSeedMarkdown();
+  if (!thinking.explain.content.trim() && options.seed === true) thinking.explain.content = buildExplainSeedMarkdown();
   return thinking;
 }
 
@@ -2039,6 +2675,7 @@ function buildExplainSeedMarkdown() {
 }
 
 function setThinkingSaveState(message, kind = "") {
+  renderReaderSaveStatus();
   const node = qs("#thinkingSaveState");
   if (!node) return;
   node.textContent = message;
@@ -2046,6 +2683,7 @@ function setThinkingSaveState(message, kind = "") {
 }
 
 function scheduleThinkingSave(delay = 500) {
+  state.thinkingDirty = true;
   if (state.thinkingSaveTimer) clearTimeout(state.thinkingSaveTimer);
   setThinkingSaveState("Editing...", "pending");
   state.thinkingSaveTimer = setTimeout(() => {
@@ -2059,47 +2697,105 @@ function scheduleThinkingSave(delay = 500) {
 
 async function saveThinking(options = {}) {
   if (!state.currentPaperId || !state.thinking) return;
+  const paperId = state.currentPaperId;
+  const thinking = state.thinking;
+  const snapshot = JSON.stringify(thinking);
+  state.thinkingDirty = true;
   setThinkingSaveState("Saving...", "saving");
-  const response = await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/thinking`, {
-    method: "POST",
-    body: JSON.stringify(state.thinking),
-  });
-  state.thinking = normalizeThinkingData(response.thinking || state.thinking, { seed: false });
-  if (state.payload) state.payload.thinking = state.thinking;
-  setThinkingSaveState("Saved", "saved");
-  if (!options.silent) toast("Thinking saved");
+  const response = await queuePaperWrite(paperId, "thinking", thinking);
+  if (paperId === state.currentPaperId && JSON.stringify(state.thinking) === snapshot) {
+    state.thinking = normalizeThinkingData(response.thinking || thinking, { seed: false });
+    state.thinkingDirty = false;
+    if (state.payload) state.payload.thinking = state.thinking;
+    setThinkingSaveState("Saved", "saved");
+    capturePaperSession();
+  }
+  state.allNotesDirty = true;
+  if (!options.silent) toast("Notes saved");
 }
 
 async function loadLibrary() {
+  const initial = !state.libraryLoaded;
   const data = await api("/api/library");
   state.library = data.library;
+  state.translationConfig = data.translation_config || { auto_start: false };
+  state.feishuConfig = data.feishu_config || { enabled: false, auto_sync: false };
+  if (qs("#openFeishuIntake")) qs("#openFeishuIntake").hidden = !state.feishuConfig.enabled;
+  state.libraryLoaded = true;
+  state.libraryDirty = true;
   if (data.tag_dictionary) state.tagDictionary = data.tag_dictionary;
   state.projectContexts = data.project_contexts || { version: 1, contexts: {} };
   qs("#workspaceLabel").textContent = data.workspace || "Local workspace";
-  renderPaperSelect();
   const paperIds = new Set((state.library.papers || []).map(paper => paper.id));
-  if (!state.currentPaperId || !paperIds.has(state.currentPaperId)) {
-    state.currentPaperId = state.library.papers.length ? state.library.papers[0].id : null;
+  if (initial) {
+    const savedTabs = localStorage.getItem(paperTabsStorageKey);
+    restorePaperTabs();
+    const firstId = state.currentPaperId || (!savedTabs ? state.library.papers[0]?.id : null);
+    state.currentPaperId = null;
+    renderPaperTabs();
+    renderPaperSelect();
+    if (firstId) await loadPaper(firstId);
+    else activateView("library");
+  } else {
+    state.paperTabs = state.paperTabs.filter(id => paperIds.has(id));
+    for (const [id, session] of state.paperSessions) {
+      const paper = state.library.papers.find(item => item.id === id);
+      if (paper && session.payload?.metadata && paper.updated_at !== session.libraryUpdatedAt) session.loadedAt = 0;
+    }
+    if (state.currentPaperId && !paperIds.has(state.currentPaperId)) {
+      disconnectReadingProgressTracker();
+      state.currentPaperId = null;
+      state.payload = null;
+      state.annotations = [];
+      state.thinking = null;
+      renderReader();
+      renderSidebar();
+    }
+    renderPaperTabs();
+    renderPaperSelect();
   }
-  if (state.currentPaperId) await loadPaper(state.currentPaperId);
-  else {
-    state.payload = null;
-    state.annotations = [];
-    state.thinking = null;
-    state.references = {};
-    state.figures = {};
-    renderSidebar();
-    renderReader();
-  }
-  await loadAllNotes();
-  renderLibrary();
+  state.allNotesDirty = true;
+  if (document.body.dataset.activeView === "library") renderLibrary();
+  if (document.body.dataset.activeView === "notes") await loadAllNotes();
 }
 
 async function loadAllNotes() {
-  const data = await api("/api/notes");
-  state.allNotes = data.notes || [];
-  renderNotes();
-  renderSidebar();
+  if (state.allNotesPromise) return state.allNotesPromise;
+  if (state.allNotesLoaded && !state.allNotesDirty) return;
+  state.allNotesDirty = false;
+  state.allNotesPromise = (async () => {
+    try {
+      const data = await api("/api/notes");
+      state.allNotes = data.notes || [];
+      state.allNotesLoaded = true;
+      if (document.body.dataset.activeView === "notes") {
+        renderNotes();
+        renderSidebar();
+      }
+    } catch (error) {
+      state.allNotesDirty = true;
+      throw error;
+    } finally {
+      state.allNotesPromise = null;
+    }
+  })();
+  return state.allNotesPromise;
+}
+
+function invalidatePaperCache(paperId) {
+  const session = state.paperSessions.get(paperId);
+  if (session) session.loadedAt = 0;
+  state.notesPreviewCache.delete(paperId);
+}
+
+function referenceHints(segments) {
+  const references = {};
+  for (const segment of segments) {
+    if (!(segment.section_path || []).some(title => /references|bibliography/i.test(title))) continue;
+    const match = String(segment.markdown || "").match(/^\s*\[?(\d+)\]?[.)]?\s+/);
+    if (match) references[match[1]] = { number: match[1], raw: segment.markdown };
+  }
+  return references;
 }
 
 function noteSortTimestamp(note) {
@@ -2138,6 +2834,8 @@ function shouldRenderNotesImmediately() {
 }
 
 function refreshAllNotesInBackground(delay = 250) {
+  state.allNotesDirty = true;
+  if (document.body.dataset.activeView !== "notes") return;
   if (state.allNotesRefreshTimer) clearTimeout(state.allNotesRefreshTimer);
   state.allNotesRefreshTimer = setTimeout(() => {
     state.allNotesRefreshTimer = null;
@@ -4272,12 +4970,16 @@ function renderMindmapSearchResults() {
 
 function renderPaperSelect() {
   const select = qs("#paperSelect");
+  if (!select) return;
   select.innerHTML = "";
   if (!state.library?.papers?.length) {
     select.innerHTML = '<option>No papers imported</option>';
     return;
   }
-  for (const paper of state.library.papers) {
+  select.innerHTML = '<option value="">Open from Library…</option>';
+  for (const id of state.paperTabs) {
+    const paper = state.library.papers.find(item => item.id === id);
+    if (!paper) continue;
     const option = document.createElement("option");
     option.value = paper.id;
     option.textContent = paperTitle(paper);
@@ -4286,41 +4988,104 @@ function renderPaperSelect() {
   }
 }
 
-async function loadPaper(paperId) {
-  saveWorkspaceScrollPosition();
-  flushReadingProgress({ immediate: true, silent: true });
-  if (state.workspaceMetadataEditor.open && state.workspaceMetadataEditor.paperId && state.workspaceMetadataEditor.paperId !== paperId) {
+async function loadPaper(paperId, options = {}) {
+  if (!paperId) return false;
+  const version = ++state.paperLoadVersion;
+  state.paperLoadingId = paperId;
+  renderPaperTabs();
+  qs("#readerView").inert = true;
+  try {
+    await flushCurrentPaperEdits();
+    if (version !== state.paperLoadVersion) return false;
+    saveWorkspaceScrollPosition();
+    capturePaperSession();
+    const session = paperSession(paperId);
+    const fresh = !options.force && session.payload && Date.now() - session.loadedAt < paperCacheMaxAge;
+    if (paperId === state.currentPaperId && fresh) return true;
+    if (!fresh) {
+      const payload = await api(`/api/papers/${encodeURIComponent(paperId)}`);
+      if (version !== state.paperLoadVersion) return false;
+      Object.assign(session, {
+        payload,
+        annotations: payload.annotations?.annotations || [],
+        thinking: normalizeThinkingData(payload.thinking || {}, { seed: false }),
+        takeawayDoc: normalizeTakeawayDoc(payload.takeaway_doc || {}),
+        readingProgress: normalizeReadingProgress(payload.reading_progress || {}),
+        references: referenceHints(payload.segments || []),
+        readingProgressDirty: false, thinkingDirty: false, takeawayDirty: false,
+        loadedAt: Date.now(),
+        readingTeacher: emptyReadingTeacher(session.readingTeacher?.enabled !== false),
+        libraryUpdatedAt: state.library?.papers?.find(item => item.id === paperId)?.updated_at,
+      });
+      // Reference enrichment is independent of displaying the paper body.
+      session.referencePromise = api(`/api/papers/${encodeURIComponent(paperId)}/references`).then(index => {
+        session.references = { ...session.references, ...(index.references || {}) };
+        if (state.currentPaperId === paperId && state.paperSessions.get(paperId) === session) state.references = session.references;
+      }).catch(error => {
+        console.error(`Reference index failed for ${paperId}`, error);
+        if (state.currentPaperId === paperId) toast(`References unavailable: ${error.message}`);
+      });
+    }
+    if (version !== state.paperLoadVersion) return false;
+    disconnectReadingProgressTracker();
+    closeDrawer({ saved: true });
+    closeFigureModal();
+    closeReferenceModal();
+    state.currentSelection = null;
+    state.currentPaperId = paperId;
+    const defaults = {
+      workspaceMode: "read", paperMapTab: "map", collapsedOutlineIds: new Set(),
+      collapsedTakeawayBlockIds: new Set(), takeawayUndoStack: [], takeawayRedoStack: [],
+      takeawayDocVersion: 0, takeawaySelectedBlockIds: new Set(), takeawayLastSelectedBlockId: "",
+      takeawaySelectionMode: false, chatDraft: "", chatSelectionDraft: null, chatMode: "source",
+      chatUseProjectContext: false, thinkingTab: "writing", presentationReportOpen: false,
+      chatScroll: { top: 0, atEnd: true }, chatError: "",
+      thinkingComposerMode: "chat", manualOutputDraft: { prompt: "", content: "" },
+      referenceIntakeDrafts: {},
+      expandedMarginNotes: new Set(),
+      collapsedDefinitionNotes: new Set(),
+    };
+    for (const key of paperSessionFields) {
+      if (Object.prototype.hasOwnProperty.call(session, key)) state[key] = session[key];
+      else if (Object.prototype.hasOwnProperty.call(defaults, key)) state[key] = defaults[key];
+    }
+    state.figures = mergeFigureFallbacks(buildFigureIndex(state.payload.segments || []), state.payload.figure_fallbacks || {});
+    state.referenceLoads = {};
+    state.takeawayHistoryRestoring = false;
+    state.takeawayDragBlockId = "";
+    state.takeawayArrangePreview = null;
     state.workspaceMetadataEditor = { open: false, saving: false, paperId: "", projects: [], tags: [], importance: 0 };
+    const savedTakeawayTab = qs('[data-reader-side-pane="takeaway"]');
+    if (savedTakeawayTab) savedTakeawayTab.hidden = !state.takeawayDoc.blocks.length;
+    if (!state.takeawayDoc.blocks.length) state.presentationReportOpen = false;
+    session.lastUsed = Date.now();
+    if (!state.paperTabs.includes(paperId)) state.paperTabs.push(paperId);
+    renderPaperSelect();
+    renderSidebar();
+    renderReader();
+    setWorkspaceMode(state.workspaceMode);
+    setReaderSidePane(state.presentationReportOpen ? "takeaway" : "sensemaking");
+    if (state.presentationReportOpen) renderPresentationPanel(state.payload?.outline || {});
+    restoreWorkspaceScrollPosition();
+    capturePaperSession();
+    persistPaperTabs();
+    prunePaperCache();
+    return true;
+  } catch (error) {
+    console.error("Paper switch failed", error);
+    toast(`Could not open paper: ${error.message}. Your current paper is kept open.`);
+    return false;
+  } finally {
+    if (version === state.paperLoadVersion) {
+      state.paperLoadingId = "";
+      qs("#readerView").inert = false;
+      renderPaperTabs();
+      watchReaderBackground();
+      watchFeishuMetadata();
+      if (state.payload && state.readingTeacher.needsRefresh) refreshReadingTeacher();
+      if (state.currentPaperId) scheduleReadingTeacher(state.currentPaperId);
+    }
   }
-  state.currentPaperId = paperId;
-  state.payload = await api(`/api/papers/${encodeURIComponent(paperId)}`);
-  const referenceIndex = await api(`/api/papers/${encodeURIComponent(paperId)}/references`);
-  state.references = referenceIndex.references || {};
-  state.figures = buildFigureIndex(state.payload.segments || []);
-  state.paperMapTab = "map";
-  state.annotations = state.payload.annotations?.annotations || [];
-  state.thinking = normalizeThinkingData(state.payload.thinking || {});
-  if (state.takeawaySaveTimer) clearTimeout(state.takeawaySaveTimer);
-  state.takeawaySaveTimer = null;
-  state.takeawayDocVersion = 0;
-  state.takeawaySaveInFlight = false;
-  state.takeawaySaveQueued = false;
-  state.takeawayUndoStack = [];
-  state.takeawayRedoStack = [];
-  state.takeawayHistoryRestoring = false;
-  state.collapsedOutlineIds = new Set();
-  state.collapsedTakeawayBlockIds = new Set();
-  state.takeawaySelectedBlockIds = new Set();
-  state.takeawayLastSelectedBlockId = "";
-  state.takeawayDragBlockId = "";
-  state.takeawayDoc = normalizeTakeawayDoc(state.payload.takeaway_doc || {});
-  state.readingProgress = normalizeReadingProgress(state.payload.reading_progress || {});
-  renderPaperSelect();
-  renderSidebar();
-  renderReader();
-  setWorkspaceMode(state.workspaceMode);
-  renderPresentationPanel(state.payload?.outline || {});
-  renderNotes();
 }
 
 function disconnectReadingProgressTracker() {
@@ -4335,7 +5100,7 @@ function disconnectReadingProgressTracker() {
 }
 
 function canTrackReadingProgress() {
-  return Boolean(state.currentPaperId && state.payload && document.body.dataset.activeView === "reader" && state.workspaceMode !== "think" && !document.hidden);
+  return Boolean(state.currentPaperId && state.payload && !state.paperLoadingId && document.body.dataset.activeView === "reader" && state.workspaceMode !== "think" && !document.hidden);
 }
 
 function tickReadingProgress(options = {}) {
@@ -4387,7 +5152,9 @@ function initReadingProgressTracker() {
 function scheduleReadingProgressSave(delay = 4500) {
   if (!state.currentPaperId || !state.readingProgressDirty) return;
   if (state.readingSaveTimer) clearTimeout(state.readingSaveTimer);
-  state.readingSaveTimer = setTimeout(() => flushReadingProgress({ silent: true }), delay);
+  state.readingSaveTimer = setTimeout(() => {
+    flushReadingProgress({ silent: true }).catch(error => console.error("Reading progress save failed", error));
+  }, delay);
 }
 
 async function flushReadingProgress(options = {}) {
@@ -4399,12 +5166,9 @@ async function flushReadingProgress(options = {}) {
   const payload = { segments: state.readingProgress?.segments || {} };
   state.readingProgressDirty = false;
   try {
-    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/reading-progress`, {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
+    const response = await queuePaperWrite(paperId, "reading-progress", payload);
     if (paperId !== state.currentPaperId) return;
-    state.readingProgress = normalizeReadingProgress(response.reading_progress || state.readingProgress);
+    if (!state.readingProgressDirty) state.readingProgress = normalizeReadingProgress(response.reading_progress || state.readingProgress);
     if (response.metadata && state.payload?.metadata) Object.assign(state.payload.metadata, response.metadata);
     const paper = state.library?.papers?.find(item => item.id === paperId);
     if (paper && response.metadata) Object.assign(paper, response.metadata);
@@ -4412,8 +5176,10 @@ async function flushReadingProgress(options = {}) {
     applyReadingProgressDecorations();
     if (!options.silent) toast("Reading progress saved");
   } catch (error) {
-    state.readingProgressDirty = true;
-    if (!options.silent) toast(`Reading progress save failed: ${error.message}`);
+    if (paperId === state.currentPaperId) state.readingProgressDirty = true;
+    paperSession(paperId).readingProgressDirty = true;
+    if (options.strict) throw error;
+    toast(`Reading progress save failed: ${error.message}`);
   }
 }
 
@@ -4491,25 +5257,55 @@ function updateCurrentOutlineHint(outlineItems = state.payload?.outline?.outline
 
 function buildFigureIndex(segments) {
   const figures = {};
-  let pendingImage = null;
+  let pendingImages = [];
   for (const segment of segments) {
     const markdown = segment.markdown || "";
-    const imageMatch = markdown.match(/!\[[^\]]*\]\(([^)]+)\)/);
-    if (imageMatch) pendingImage = { src: assetUrl(imageMatch[1]), segment_id: segment.id };
+    const images = [...markdown.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)]
+      .map(match => ({ src: assetUrl(match[1]), segment_id: segment.id }));
+    pendingImages.push(...images);
     const captionMatch = displayText(markdown).match(/(?:^|\n)\s*(?:fig(?:ure)?\.?)\s*(\d+)(?:\s*(?:[.\-]\s*)?\(?[a-z]\)?)?\s*[:.]\s*(.+)/is);
     if (captionMatch) {
       const number = captionMatch[1];
+      const previous = figures[number];
+      const parts = [...new Map([...(previous?.images || []), ...pendingImages].map(image => [image.src, image])).values()];
       figures[number] = {
         number,
-        src: pendingImage?.src || "",
-        image_segment_id: pendingImage?.segment_id || "",
-        caption_segment_id: segment.id,
-        caption: markdown,
+        src: parts[0]?.src || "",
+        images: parts,
+        image_segment_id: parts[0]?.segment_id || "",
+        image_segment_ids: [...new Set(parts.map(image => image.segment_id))],
+        caption_segment_id: previous?.caption_segment_id || segment.id,
+        caption_segment_ids: [...(previous?.caption_segment_ids || []), segment.id],
+        caption: previous?.caption && previous.caption !== markdown ? `${previous.caption}\n${markdown}` : markdown,
+        page: segment.page || previous?.page || null,
       };
-      pendingImage = null;
+      pendingImages = [];
+    } else if (!images.length && String(markdown).trim()) {
+      pendingImages = [];
     }
   }
   return figures;
+}
+
+function mergeFigureFallbacks(figures, fallbacks) {
+  const result = { ...(figures || {}) };
+  for (const [number, fallback] of Object.entries(fallbacks || {})) {
+    if (!fallback?.src) continue;
+    const existing = result[number] || { number };
+    if (existing.src && !fallback.replace_existing) continue;
+    result[number] = {
+      ...existing,
+      number: existing.number || fallback.number || number,
+      src: assetUrlForPaper(state.currentPaperId, fallback.src),
+      images: [{ src: assetUrlForPaper(state.currentPaperId, fallback.src), segment_id: existing.image_segment_id || "" }],
+      image_segment_id: existing.image_segment_id || "",
+      caption_segment_id: existing.caption_segment_id || fallback.caption_segment_id || "",
+      caption: existing.caption || fallback.caption || "",
+      fallback: fallback.fallback || "pdf-page",
+      page: fallback.page || "",
+    };
+  }
+  return result;
 }
 
 function segmentIsTable(segment = {}) {
@@ -4533,6 +5329,9 @@ function figureEntryFromIndexedFigure(figure) {
     title: `Figure ${figure.number}`,
     caption: figure.caption || "",
     src: figure.src || "",
+    image_segment_ids: figure.image_segment_ids || [],
+    caption_segment_ids: figure.caption_segment_ids || [],
+    part_count: figure.images?.length || 0,
   };
 }
 
@@ -4551,6 +5350,8 @@ function paperMapMediaEntries() {
     entries.push(figure);
     if (figure.image_segment_id) seenSegments.add(figure.image_segment_id);
     if (figure.caption_segment_id) seenSegments.add(figure.caption_segment_id);
+    for (const id of figure.image_segment_ids) seenSegments.add(id);
+    for (const id of figure.caption_segment_ids) seenSegments.add(id);
   }
   let tableIndex = 1;
   for (const segment of state.payload?.segments || []) {
@@ -5484,6 +6285,7 @@ function takeawayArrangePreviewHtml(preview) {
 }
 
 function setTakeawaySaveState(message, kind = "") {
+  renderReaderSaveStatus();
   const node = qs("#takeawaySaveState");
   if (!node) return;
   node.textContent = message;
@@ -5552,6 +6354,7 @@ function touchTakeawayDoc() {
 
 function scheduleTakeawaySave(delay = 650) {
   if (!state.currentPaperId || !state.takeawayDoc) return;
+  state.takeawayDirty = true;
   if (state.takeawaySaveTimer) clearTimeout(state.takeawaySaveTimer);
   setTakeawaySaveState("Editing...", "pending");
   state.takeawaySaveTimer = setTimeout(() => {
@@ -5565,40 +6368,22 @@ function scheduleTakeawaySave(delay = 650) {
 
 async function saveTakeawayDoc(options = {}) {
   if (!state.currentPaperId || !state.takeawayDoc) return;
-  if (state.takeawaySaveInFlight) {
-    state.takeawaySaveQueued = true;
-    setTakeawaySaveState("Saving...", "saving");
-    return;
-  }
   state.takeawayDoc = normalizeTakeawayDoc(state.takeawayDoc);
   const savingPaperId = state.currentPaperId;
   const savingVersion = Number(state.takeawayDocVersion || 0);
-  const requestBody = JSON.stringify(state.takeawayDoc);
-  state.takeawaySaveInFlight = true;
+  state.takeawayDirty = true;
   setTakeawaySaveState("Saving...", "saving");
-  try {
-    const response = await api(`/api/papers/${encodeURIComponent(savingPaperId)}/takeaway-doc`, {
-      method: "POST",
-      body: requestBody,
-    });
-    if (state.currentPaperId !== savingPaperId) return;
-    const savedDoc = normalizeTakeawayDoc(response.takeaway_doc || state.takeawayDoc);
-    if (Number(state.takeawayDocVersion || 0) === savingVersion) {
-      state.takeawayDoc = savedDoc;
-      if (state.payload) state.payload.takeaway_doc = state.takeawayDoc;
-      setTakeawaySaveState("Saved", "saved");
-      if (!options.silent) toast("Takeaway saved");
-    } else {
-      if (state.payload) state.payload.takeaway_doc = state.takeawayDoc;
-      state.takeawaySaveQueued = true;
-      setTakeawaySaveState("Editing...", "pending");
-    }
-  } finally {
-    state.takeawaySaveInFlight = false;
-    if (state.currentPaperId === savingPaperId && (state.takeawaySaveQueued || Number(state.takeawayDocVersion || 0) !== savingVersion)) {
-      state.takeawaySaveQueued = false;
-      scheduleTakeawaySave(120);
-    }
+  const response = await queuePaperWrite(savingPaperId, "takeaway-doc", state.takeawayDoc);
+  if (state.currentPaperId !== savingPaperId) return;
+  if (Number(state.takeawayDocVersion || 0) === savingVersion) {
+    state.takeawayDoc = normalizeTakeawayDoc(response.takeaway_doc || state.takeawayDoc);
+    state.takeawayDirty = false;
+    if (state.payload) state.payload.takeaway_doc = state.takeawayDoc;
+    setTakeawaySaveState("Saved", "saved");
+    if (!options.silent) toast("Takeaway saved");
+    capturePaperSession();
+  } else {
+    setTakeawaySaveState("Editing...", "pending");
   }
 }
 
@@ -6002,8 +6787,7 @@ function bindTakeawayEditorEvents() {
 function renderPresentationPanel(outline = state.payload?.outline || {}) {
   const root = qs("#presentationReportRoot");
   if (!root) return;
-  const report = buildPresentationReport(outline);
-  const doc = ensureTakeawayDoc(report);
+  const doc = normalizeTakeawayDoc(state.takeawayDoc || {});
   if (!doc.blocks.length && !state.payload) {
     root.className = "presentation-root muted";
     root.textContent = "Waiting for agent analysis or notes.";
@@ -6018,13 +6802,12 @@ function renderPresentationPanel(outline = state.payload?.outline || {}) {
         <button class="primary-button mini-button" data-takeaway-add="bullet" data-after-block="${escapeHtml(doc.blocks[doc.blocks.length - 1]?.id || "")}" type="button">Write</button>
         <button class="secondary-button mini-button" data-takeaway-add="heading" data-after-block="${escapeHtml(doc.blocks[doc.blocks.length - 1]?.id || "")}" type="button">Heading</button>
         <button class="secondary-button mini-button" id="arrangeTakeawayTree" type="button">Source order</button>
-        <button class="secondary-button mini-button" id="addTakeawayToMindmap" type="button">Mindmap</button>
       </div>
       ${selectedCount ? `<span class="takeaway-selection-count">${selectedCount} selected</span><button class="secondary-button mini-button" id="clearTakeawaySelection" type="button">Clear</button>` : ""}
       <button class="secondary-button mini-button" id="saveTakeawayNow" type="button">Save</button>
       <span id="takeawaySaveState" class="thinking-save-state">${doc.updated_at ? "Saved" : "Draft"}</span>
     </div>
-    <div class="takeaway-doc-guidance">Write directly in the report. Drag the grip to reorder, Tab / Shift+Tab changes hierarchy, and Source order can regroup evidence by the paper flow.</div>
+    <div class="takeaway-doc-guidance">Edit your saved notes directly. Drag to reorder; Tab / Shift+Tab changes depth. Source order groups evidence by its place in the paper.</div>
     ${state.takeawayArrangePreview ? takeawayArrangePreviewHtml(state.takeawayArrangePreview) : ""}
     <div class="takeaway-doc-editor${state.takeawaySelectionMode ? " takeaway-selection-mode" : ""}" aria-label="Editable takeaway report">
       ${visibleBlocks.map(item => takeawayBlockHtml(item.block, item.index, doc.blocks)).join("")}
@@ -6054,8 +6837,8 @@ function renderPresentationPanel(outline = state.payload?.outline || {}) {
 async function addReportThought(groupKey) {
   if (!state.thinking) return;
   const text = window.prompt("Add your thought to this report group:");
-  const note = String(text || "").trim();
-  if (!note) return;
+  const note = String(text || "");
+  if (!note.trim()) return;
   const now = new Date().toISOString();
   state.thinking.report_thoughts = [...(state.thinking.report_thoughts || []), {
     id: `rt-${Date.now().toString(36)}`,
@@ -6164,7 +6947,9 @@ function renderSidebar() {
     button.dataset.readingState = progress.state;
     button.style.setProperty("--outline-indent", `${16 + Math.max(0, level - 1) * 14}px`);
     button.style.setProperty("--reading-depth", String(progress.depth || 0));
-    button.innerHTML = `<span class="outline-collapse-toggle" aria-hidden="true">${collapsible ? (collapsed ? "⌃" : "⌄") : ""}</span><span class="outline-item-title">${escapeHtml(item.title || item.id)}</span>`;
+    const title = index === 0 && Number(item.level) === 1 && state.payload?.metadata?.title_source === "feishu"
+      ? paperTitle(state.payload.metadata) : cleanPaperTitle(item.title || item.id);
+    button.innerHTML = `<span class="outline-collapse-toggle" aria-hidden="true">${collapsible ? (collapsed ? "⌃" : "⌄") : ""}</span><span class="outline-item-title">${escapeHtml(title)}</span>`;
     button.addEventListener("click", event => {
       if (event.target.closest(".outline-collapse-toggle") && collapsible) {
         event.preventDefault();
@@ -6179,7 +6964,7 @@ function renderSidebar() {
   if (!list.children.length) list.textContent = "No outline yet.";
   if (activeTab === "media" && mediaList) renderPaperMapMediaList(mediaList);
   updateCurrentOutlineHint(outlineItems);
-  renderPresentationPanel(outline);
+  if (state.presentationReportOpen) renderPresentationPanel(outline);
 }
 
 function paperMapMediaCaption(text) {
@@ -6226,7 +7011,7 @@ function paperMapFigurePreviewHtml(entry) {
 
 function paperMapMediaEntryHtml(entry) {
   const preview = entry.kind === "table" ? paperMapTablePreviewHtml(entry) : paperMapFigurePreviewHtml(entry);
-  const badge = entry.kind === "table" ? "Table" : "Figure";
+  const badge = entry.kind === "table" ? "Table" : entry.part_count > 1 ? `${entry.part_count} parts` : "Figure";
   const caption = paperMapMediaCaption(entry.caption || entry.title);
   return `<button class="paper-map-media-card" data-paper-map-jump="${escapeHtml(entry.segment_id)}" type="button">
     <span class="paper-map-media-head"><strong>${escapeHtml(entry.title)}</strong><small>${escapeHtml(badge)}</small></span>
@@ -6254,14 +7039,25 @@ function setPaperMapTab(tab) {
 
 function setWorkspaceMode(mode) {
   tickReadingProgress({ skipSchedule: true });
+  const previousMode = state.workspaceMode;
   const nextMode = ["read", "split", "think"].includes(mode) ? mode : "split";
   state.workspaceMode = nextMode;
   state.readingLastTick = performance.now();
   const workspace = qs(".reader-workspace");
   if (workspace) workspace.dataset.workspaceMode = nextMode;
-  qsa("[data-workspace-mode]").forEach(button => button.classList.toggle("active", button.dataset.workspaceMode === nextMode));
+  qsa(".workspace-mode").forEach(button => {
+    button.classList.toggle("active", button.dataset.workspaceMode === nextMode);
+    button.setAttribute("aria-pressed", String(button.dataset.workspaceMode === nextMode));
+  });
+  qs("#readerWidth")?.toggleAttribute("disabled", nextMode === "think");
+  qs("#toggleReadingTeacher")?.toggleAttribute("disabled", nextMode === "think");
+  renderReadingTeacherStatus();
+  if (qs("#readerView")) qs("#readerView").dataset.workspaceMode = nextMode;
   if (nextMode === "read" && state.presentationReportOpen) setReaderSidePane("sensemaking");
+  if (previousMode === "read" && nextMode !== "read") renderSensemakingPanel();
+  if (nextMode !== "read") restoreThinkingChatScroll();
   updateAnnotationToolbarVisibility();
+  if (state.currentPaperId) persistPaperTabs();
 }
 
 function setPaperMapCollapsed(collapsed) {
@@ -6269,12 +7065,15 @@ function setPaperMapCollapsed(collapsed) {
   document.body.classList.toggle("paper-map-collapsed", state.paperMapCollapsed);
   localStorage.setItem(paperMapCollapsedStorageKey, state.paperMapCollapsed ? "1" : "0");
   const mainButton = qs("#togglePaperMapMain");
-  if (mainButton) mainButton.textContent = state.paperMapCollapsed ? "Show Paper Map" : "Hide Paper Map";
+  if (mainButton) {
+    mainButton.textContent = "Outline";
+    mainButton.setAttribute("aria-expanded", String(!state.paperMapCollapsed));
+  }
   const sideButton = qs("#togglePaperMap");
   if (sideButton) {
     sideButton.textContent = "×";
-    sideButton.title = "Collapse Paper Map";
-    sideButton.setAttribute("aria-label", "Collapse Paper Map");
+    sideButton.title = "Collapse outline";
+    sideButton.setAttribute("aria-label", "Collapse outline");
   }
   const railButton = qs("#paperMapRail");
   if (railButton) railButton.setAttribute("aria-hidden", state.paperMapCollapsed ? "false" : "true");
@@ -6338,34 +7137,20 @@ function setReaderSidePane(pane) {
     button.setAttribute("aria-pressed", button.dataset.readerSidePane === nextPane ? "true" : "false");
   });
   const title = qs("#readerSidePanelTitle");
-  if (title) title.textContent = reportOpen ? "Takeaway Report" : "Sensemaking";
-  const description = qs("#readerSidePanelDescription");
-  if (description) description.textContent = reportOpen ? "Editable synthesis, selected notes, and report outline." : "Chronological AI outputs and your reading thoughts.";
+  if (title) title.textContent = reportOpen ? "Saved Takeaway" : "AI chat";
   const openButton = qs("#openPresentationReport");
-  if (openButton) openButton.textContent = reportOpen ? "Show Sensemaking" : "Takeaway Report";
+  if (openButton) openButton.textContent = reportOpen ? "Show chat" : "Saved Takeaway";
+  if (!reportOpen) restoreThinkingChatScroll();
 }
 
 function openPresentationReport() {
-  if (!state.presentationReportOpen) {
-    state.takeawayPreviousWorkspaceMode = state.workspaceMode || "split";
-    state.takeawayPreviousPaperMapCollapsed = state.paperMapCollapsed;
-  }
-  if (!state.paperMapCollapsed) setPaperMapCollapsed(true);
-  if (state.workspaceMode !== "think") setWorkspaceMode("think");
+  if (state.workspaceMode === "read") setWorkspaceMode("split");
   renderPresentationPanel(state.payload?.outline || {});
   setReaderSidePane("takeaway");
 }
 
 function closePresentationReport() {
   setReaderSidePane("sensemaking");
-  const previousMode = state.takeawayPreviousWorkspaceMode || "split";
-  const previousPaperMapCollapsed = state.takeawayPreviousPaperMapCollapsed;
-  state.takeawayPreviousWorkspaceMode = "";
-  state.takeawayPreviousPaperMapCollapsed = null;
-  if (state.workspaceMode === "think") setWorkspaceMode(previousMode === "think" ? "split" : previousMode);
-  if (typeof previousPaperMapCollapsed === "boolean" && state.paperMapCollapsed !== previousPaperMapCollapsed) {
-    setPaperMapCollapsed(previousPaperMapCollapsed);
-  }
 }
 
 function togglePresentationReport() {
@@ -6377,19 +7162,28 @@ function renderPaperMeta() {
   const metadata = state.payload?.metadata || {};
   const root = qs("#paperMeta");
   const bits = [];
-  for (const key of ["venue", "year", "read_status"]) {
-    if (metadata[key]) bits.push(`<span class="pill">${escapeHtml(metadata[key])}</span>`);
+  for (const key of ["authors", "venue", "year", "read_status"]) {
+    if (metadata[key]) bits.push(`<span>${escapeHtml(Array.isArray(metadata[key]) ? metadata[key].join(", ") : metadata[key])}</span>`);
   }
-  bits.push(`<span class="pill">${escapeHtml(processingLabel(metadata))}</span>`);
-  bits.push(`<span class="pill">${escapeHtml(processingStatus(metadata))}</span>`);
-  if (metadata.translation_status) bits.push(`<span class="pill">Translation: ${escapeHtml(metadata.translation_status)}</span>`);
-  if (metadata.translation_error) bits.push(`<span class="pill error-text">Translation failed</span>`);
-  if (metadata.citation_count !== undefined && metadata.citation_count !== "") bits.push(`<span class="pill">Cited ${escapeHtml(metadata.citation_count)}</span>`);
-  if (metadata.source_pdf) bits.push(`<a class="pill" href="/api/papers/${state.currentPaperId}/pdf" target="_blank">Open PDF</a>`);
-  bits.push(`<a class="pill" href="/api/papers/${state.currentPaperId}/reader-md" target="_blank">Reader MD</a>`);
-  root.innerHTML = `<div class="meta-title-row"><div class="meta-title">${escapeHtml(metadata.title || "Untitled Paper")}</div>${importanceStarEditorHtml(metadata, { variant: "workspace" })}</div>${bits.join("")}`;
-  bindImportanceStarEditors(root);
+  root.innerHTML = `<div class="meta-title-row"><h1 class="meta-title">${escapeHtml(paperTitle(metadata))}</h1></div>
+    <div class="paper-bibliography">${bits.join('<span class="bibliography-separator" aria-hidden="true">·</span>')}</div>`;
+  const links = qs("#readerFileLinks");
+  if (links) {
+    const path = `/api/papers/${encodeURIComponent(state.currentPaperId)}`;
+    links.innerHTML = `${metadata.source_pdf ? `<a href="${path}/pdf" target="_blank" rel="noreferrer">Open original PDF</a>` : ""}
+      <a href="${path}/reader-md" target="_blank" rel="noreferrer">Reader Markdown</a>
+      <a href="${path}/paper-md" target="_blank" rel="noreferrer">Paper Markdown</a>
+      <a href="${path}/translation-notes" target="_blank" rel="noreferrer">Extraction notes</a>
+      <span class="muted small-text">${escapeHtml(processingLabel(metadata))} · ${escapeHtml(processingStatus(metadata))}${metadata.citation_count !== undefined && metadata.citation_count !== "" ? ` · Cited ${escapeHtml(metadata.citation_count)}` : ""}</span>`;
+  }
+  const importance = qs("#readerImportance");
+  if (importance) {
+    importance.innerHTML = importanceStarEditorHtml(metadata, { variant: "workspace" });
+    bindImportanceStarEditors(importance);
+  }
+  renderReaderSaveStatus();
   renderWorkspaceMetadataPanel();
+  renderFeishuMetadata();
 }
 
 function firstMetadataValue(paper, keys = []) {
@@ -6439,6 +7233,7 @@ function workspaceMetadataInfoHtml(paper) {
     rows.push(`<div class="metadata-info-row"><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(text)}</dd></div>`);
   };
   addRow("Authors", firstMetadataValue(paper, ["authors", "author"]));
+  addRow("Institutions", firstMetadataValue(paper, ["institutions", "institution"]));
   addRow("Venue", firstMetadataValue(paper, ["venue", "journal"]));
   addRow("Year", firstMetadataValue(paper, ["year", "publication_year"]));
   addRow("DOI", firstMetadataValue(paper, ["doi"]));
@@ -6457,7 +7252,7 @@ function workspaceMetadataInfoHtml(paper) {
     <section class="metadata-info-section" aria-label="Reading metadata">
       <div class="metadata-info-heading">
         <span>Reading references</span>
-        <small>Links and citation details used while reading</small>
+        <small>${paper.feishu?.record_id ? "Bibliographic fields copied from the linked Feishu record" : "Links and citation details used while reading"}</small>
       </div>
       ${links ? `<div class="metadata-info-cards">${links}</div>` : ""}
       ${rows.length ? `<dl class="metadata-info-list">${rows.join("")}</dl>` : ""}
@@ -6468,6 +7263,570 @@ function workspaceMetadataInfoHtml(paper) {
 function workspaceMetadataPaper() {
   const libraryPaper = state.library?.papers?.find(item => item.id === state.currentPaperId) || {};
   return { ...libraryPaper, ...(state.payload?.metadata || {}) };
+}
+
+function feishuPaperState(paperId) {
+  if (!state.feishuSyncByPaper.has(paperId)) state.feishuSyncByPaper.set(paperId, { status: "", error: "", candidates: [], lastAttempt: 0 });
+  return state.feishuSyncByPaper.get(paperId);
+}
+
+function applyFeishuMetadataResult(paperId, response) {
+  if (!response.metadata) return;
+  const session = state.paperSessions.get(paperId);
+  const payload = paperId === state.currentPaperId ? state.payload : session?.payload;
+  const keys = [...Object.keys(state.feishuConfig.fields || {}), "title_source", "title_key", "feishu", "feishu_local_overrides"];
+  const fields = Object.fromEntries(keys.filter(key => key in response.metadata).map(key => [key, response.metadata[key]]));
+  if (payload) {
+    Object.assign(payload.metadata, fields);
+    if (response.feishu_metadata) payload.feishu_metadata = response.feishu_metadata;
+  }
+  const paper = state.library?.papers?.find(item => item.id === paperId);
+  if (paper) Object.assign(paper, fields);
+  state.libraryDirty = true;
+  if (paperId === state.currentPaperId) {
+    renderPaperMeta();
+    renderPaperTabs();
+    renderPaperSelect();
+    renderSidebar();
+  }
+}
+
+function feishuIntakePhase() {
+  const paper = state.feishuIntake.localPaper;
+  if (!paper) return "unparsed";
+  if (processingStatus(paper) === "ready" && processingMode(paper) === "deep") return "ready";
+  if (paperParsingPending(paper)) return processingStatus(paper) === "processing_queued" ? "queued" : "processing";
+  return processingStatus(paper) === "failed" ? "failed" : "unparsed";
+}
+
+function feishuIntakeNeedsPolling() {
+  return Boolean(qs("#feishuIntakeDialog")?.open && !state.feishuIntake.loading && !state.feishuIntake.busy
+    && ["queued", "processing"].includes(feishuIntakePhase()));
+}
+
+function watchFeishuIntakeProcessing() {
+  if (feishuIntakeNeedsPolling()) refreshProcessingQueue();
+  else if (!state.processingQueue.open) clearTimeout(state.processingQueue.timer);
+}
+
+function renderFeishuIntakeStatus() {
+  const intake = state.feishuIntake;
+  const phase = feishuIntakePhase();
+  const messages = {
+    ready: "Full text is ready. No need to queue this paper again.",
+    queued: "Queued for parsing. The full-text button will appear here when it is ready.",
+    processing: "Parsing in the background. The full-text button will appear here when it is ready.",
+    failed: `Parsing failed${intake.localPaper?.processing_error ? `: ${intake.localPaper.processing_error}` : "."}`,
+  };
+  const status = qs("#feishuIntakeStatus");
+  status.textContent = intake.error || intake.statusError || (intake.busy ? "Preparing the requested paper…"
+    : intake.loading ? "Reading Feishu…" : messages[phase] || intake.message);
+  status.classList.toggle("error-text", Boolean(intake.error || intake.statusError || phase === "failed"));
+  qs("#searchFeishuIntake").disabled = intake.busy || intake.loading;
+  qs("#feishuIntakeQuery").disabled = intake.busy;
+  qsa("[data-preview-feishu-record]").forEach(button => { button.disabled = intake.busy; });
+}
+
+function renderFeishuIntakeActions() {
+  renderFeishuIntakeStatus();
+  const intake = state.feishuIntake;
+  const root = qs("#feishuIntakeActions");
+  if (!root) return;
+  const phase = feishuIntakePhase();
+  const hadFocus = root.contains(document.activeElement);
+  const focusedId = document.activeElement?.id;
+  const queueLink = '<button id="viewFeishuParsingQueue" class="secondary-button" data-view-feishu-queue type="button">View parsing queue</button>';
+  if (intake.busy) root.innerHTML = '<button class="secondary-button" type="button" disabled>Preparing…</button>';
+  else if (phase === "ready") {
+    root.innerHTML = `<button id="readFeishuFullText" class="primary-button" data-open-feishu-paper="${escapeHtml(intake.localPaper.id)}" type="button">Read full text</button>`;
+  } else if (phase === "queued" || phase === "processing") {
+    root.innerHTML = `<button class="secondary-button" type="button" disabled>${phase === "queued" ? "Queued for parsing" : "Parsing…"}</button>${queueLink}`;
+  } else if (phase === "failed") {
+    root.innerHTML = `<button id="retryFeishuParsing" class="primary-button" data-retry-feishu-parse type="button">Retry parsing</button>${queueLink}`;
+  } else {
+    root.innerHTML = `<button id="queueFeishuPaper" class="primary-button" type="button" ${intake.loading || !intake.fileToken ? "disabled" : ""}>Queue for reading</button>`;
+  }
+  qs("#feishuPdfInputs").hidden = intake.busy || phase !== "unparsed";
+  qs("#feishuIntakeActionHelp").textContent = ({
+    ready: "Read the original Markdown now; translation can continue in the background. Metadata refresh is separate, under More → Feishu metadata.",
+    queued: "Already queued. You can preview another paper while waiting; there is no need to submit this one again.",
+    processing: "Already parsing. You can preview another paper while this one finishes.",
+    failed: "Retry uses the existing local PDF. Your saved notes and highlights are kept.",
+    unparsed: "Queue for reading imports the selected PDF and requests parsing. Preview alone does neither. No cloud fields are written.",
+  })[phase];
+  if (hadFocus) {
+    const previous = focusedId ? document.getElementById(focusedId) : null;
+    (previous && root.contains(previous) ? previous : root.querySelector("button:not(:disabled)"))?.focus({ preventScroll: true });
+  }
+}
+
+function renderFeishuIntake() {
+  const intake = state.feishuIntake;
+  renderFeishuIntakeStatus();
+  qs("#feishuIntakeResults").innerHTML = intake.records.map(record => `
+    <button class="secondary-button" data-preview-feishu-record="${escapeHtml(record.record_id)}"
+      aria-pressed="${intake.record?.record_id === record.record_id}" type="button" ${intake.busy ? "disabled" : ""}>
+      ${escapeHtml(record.title || record.record_id)}
+    </button>`).join("") + (intake.hasMore ? '<p class="muted small-text">More matches exist. Refine the title to narrow the search.</p>' : "");
+  const preview = qs("#feishuIntakePreview");
+  if (!intake.record) {
+    preview.innerHTML = '<p class="muted">Search your Feishu collection, then select a paper to preview its existing briefing.</p>';
+    return;
+  }
+  const record = intake.record;
+  const metadata = record.metadata || {};
+  const attachments = record.attachments || [];
+  const briefings = record.briefings || {};
+  const brief = briefings[intake.brief] || "";
+  preview.innerHTML = `
+    <h3 id="feishuPreviewTitle" tabindex="-1">${escapeHtml(metadata.title || attachments[0]?.name || record.record_id)}</h3>
+    <p class="muted small-text">${escapeHtml([metadata.authors, metadata.venue, metadata.year].filter(Boolean).join(" · "))}</p>
+    <div class="reader-data-actions" role="group" aria-label="Feishu briefing language">
+      ${["raw text_中文", "raw text"].map(field => `<button class="reader-side-tab ${intake.brief === field ? "active" : ""}" data-feishu-brief="${escapeHtml(field)}" type="button" aria-pressed="${intake.brief === field}">${escapeHtml(field)}</button>`).join("")}
+    </div>
+    ${brief ? `<pre class="feishu-intake-brief">${escapeHtml(brief)}</pre>` : '<p class="muted">This briefing is not available yet. It is not required to parse the PDF.</p>'}
+    <div id="feishuPdfInputs">
+    <label class="sense-label" for="feishuAttachmentSelect">PDF attachment</label>
+    <select id="feishuAttachmentSelect" ${intake.busy ? "disabled" : ""}>
+      ${attachments.length !== 1 ? `<option value="">${attachments.length ? "Select the PDF to read" : "No PDF attachment available"}</option>` : ""}
+      ${attachments.map(file => `<option value="${escapeHtml(file.file_token)}" ${file.file_token === intake.fileToken ? "selected" : ""}>${escapeHtml(file.name)}${file.size ? ` · ${Math.ceil(file.size / 1024)} KB` : ""}</option>`).join("")}
+    </select>
+    <details ${intake.localPath ? "open" : ""}>
+      <summary>Use a local PDF instead of downloading</summary>
+      <label class="sense-label" for="feishuLocalPdfPath">PDF path on this computer (optional)</label>
+      <input id="feishuLocalPdfPath" type="text" value="${escapeHtml(intake.localPath)}" placeholder="Full local path to the PDF" ${intake.busy ? "disabled" : ""} />
+      <p class="muted small-text">Only use a file you know belongs to this record. Its size is checked, but the cloud PDF is not downloaded for byte comparison.</p>
+    </details>
+    </div>
+    <div id="feishuIntakeActions" class="reader-data-actions"></div>
+    <p id="feishuIntakeActionHelp" class="muted small-text"></p>`;
+  renderFeishuIntakeActions();
+}
+
+function openFeishuIntake() {
+  if (!state.feishuConfig.enabled) { toast("Configure the Feishu Base and table before opening a cloud paper."); return; }
+  renderFeishuIntake();
+  qs("#feishuIntakeDialog").showModal();
+  qs("#feishuIntakeQuery").focus();
+  watchFeishuIntakeProcessing();
+}
+
+async function previewFeishuIntake(reference) {
+  const intake = state.feishuIntake;
+  const version = ++intake.version;
+  Object.assign(intake, { loading: true, error: "", statusError: "", message: "", record: null, localPaper: null, localPath: "", fileToken: "" });
+  watchFeishuIntakeProcessing();
+  renderFeishuIntake();
+  try {
+    const data = await api(`/api/feishu/preview?${new URLSearchParams({ reference })}`);
+    if (version !== intake.version) return;
+    Object.assign(intake, {
+      record: data.record, localPaper: data.local_paper || null,
+      fileToken: data.record.attachments?.length === 1 ? data.record.attachments[0].file_token : "",
+      brief: data.record.briefings?.["raw text_中文"] ? "raw text_中文" : "raw text",
+    });
+  } catch (error) {
+    if (version === intake.version) intake.error = `Preview unavailable: ${error.message}`;
+  } finally {
+    if (version === intake.version) {
+      intake.loading = false;
+      renderFeishuIntake();
+      if (qs("#feishuIntakeDialog").open) qs("#feishuPreviewTitle")?.focus({ preventScroll: true });
+      watchFeishuIntakeProcessing();
+    }
+  }
+}
+
+async function searchFeishuIntake(event) {
+  event?.preventDefault();
+  const intake = state.feishuIntake;
+  if (intake.busy) return;
+  const query = qs("#feishuIntakeQuery").value.trim();
+  if (!query) { toast("Enter a paper title or a Feishu record reference."); return; }
+  if (/^https?:\/\//i.test(query) || /^rec[A-Za-z0-9]+$/.test(query)) {
+    await previewFeishuIntake(query);
+    return;
+  }
+  const version = ++intake.version;
+  Object.assign(intake, { loading: true, error: "", statusError: "", message: "", records: [], record: null, localPaper: null, hasMore: false });
+  watchFeishuIntakeProcessing();
+  renderFeishuIntake();
+  try {
+    const data = await api(`/api/feishu/search?${new URLSearchParams({ keyword: query })}`);
+    if (version !== intake.version) return;
+    Object.assign(intake, { records: data.records || [], hasMore: Boolean(data.has_more),
+      message: data.records?.length ? "Select a record to preview; nothing has been imported." : "No title match. Try a shorter title or paste the record link." });
+  } catch (error) {
+    if (version === intake.version) intake.error = `Search unavailable: ${error.message}`;
+  } finally {
+    if (version === intake.version) { intake.loading = false; renderFeishuIntake(); }
+  }
+}
+
+async function queueFeishuIntake() {
+  const intake = state.feishuIntake;
+  if (intake.busy || intake.loading || !intake.record || !intake.fileToken) return;
+  if (feishuIntakePhase() !== "unparsed") {
+    toast(feishuIntakePhase() === "ready" ? "Full text is already ready. Choose Read full text." : "This paper already has a parsing job. Check its status instead of queuing it again.");
+    return;
+  }
+  const data = { record_id: intake.record.record_id, file_token: intake.fileToken, local_pdf_path: intake.localPath };
+  intake.version += 1;
+  Object.assign(intake, { busy: true, error: "", statusError: "", message: "" });
+  renderFeishuIntakeActions();
+  try {
+    if (intake.localPaper?.id === state.currentPaperId) await flushCurrentPaperEdits();
+    const result = await api("/api/feishu/intake", { method: "POST", body: JSON.stringify(data) });
+    const paper = result.paper || { ...result.metadata, id: result.paper_id };
+    const existing = state.library?.papers?.find(item => item.id === paper.id);
+    if (existing) Object.assign(existing, paper);
+    else state.library?.papers?.unshift(paper);
+    applyFeishuMetadataResult(paper.id, result);
+    const cached = state.paperSessions.get(paper.id);
+    if (cached) cached.loadedAt = 0;
+    intake.localPaper = paper;
+    intake.message = result.metadata.processing_status === "ready" ? "Markdown is already ready. The local source was reused."
+      : "Added to the parsing queue. You can select another paper while this one is prepared.";
+    state.libraryDirty = true;
+    renderPaperTabs();
+    renderPaperSelect();
+    if (document.body.dataset.activeView === "library") renderLibrary();
+    toast(intake.message);
+    if (state.processingQueue.open) refreshProcessingQueue();
+  } catch (error) {
+    console.error("Feishu intake failed", error);
+    intake.error = `Could not prepare the paper: ${error.message}. Existing reading data is kept.`;
+  } finally {
+    intake.busy = false;
+    renderFeishuIntakeActions();
+    watchFeishuIntakeProcessing();
+  }
+}
+
+async function retryFeishuIntakeParsing() {
+  const intake = state.feishuIntake;
+  if (intake.busy || intake.loading || feishuIntakePhase() !== "failed") return;
+  intake.version += 1;
+  Object.assign(intake, { busy: true, error: "", statusError: "" });
+  renderFeishuIntakeActions();
+  try {
+    const result = await api("/api/processing-queue/retry", {
+      method: "POST", body: JSON.stringify({ paper_id: intake.localPaper.id }),
+    });
+    Object.assign(intake.localPaper, result.metadata);
+    const cached = state.paperSessions.get(intake.localPaper.id);
+    if (cached) cached.loadedAt = 0;
+  } catch (error) {
+    console.error("Feishu parsing retry failed", error);
+    intake.error = `Could not retry parsing: ${error.message}`;
+  } finally {
+    intake.busy = false;
+    renderFeishuIntakeActions();
+    watchFeishuIntakeProcessing();
+  }
+}
+
+async function updateFeishuIntakeProcessing(snapshot, watched) {
+  const intake = state.feishuIntake;
+  const current = () => watched && watched.version === intake.version && watched.paperId === intake.localPaper?.id
+    && feishuIntakeNeedsPolling();
+  if (!current()) return;
+  const job = snapshot.jobs?.find(item => item.paper_id === watched.paperId);
+  let metadata;
+  if (job) {
+    const status = { queued: "processing_queued", processing: "processing", ready: "ready", failed: "failed" }[job.status];
+    if (!status) throw new Error("The parsing queue returned an unknown status.");
+    metadata = { processing_status: status, processing_mode: job.mode, processing_error: job.error || "" };
+  } else {
+    // Older or externally started jobs may be absent from this server's queue.
+    const index = await api("/api/papers");
+    metadata = index.papers?.find(paper => paper.id === watched.paperId);
+    if (!metadata) throw new Error("The local paper is no longer indexed. Refresh its preview to check the association.");
+  }
+  if (!current()) return;
+  const fields = Object.fromEntries(["processing_status", "processing_mode", "processing_error"]
+    .filter(key => metadata[key] !== undefined).map(key => [key, metadata[key]]));
+  const changed = Object.entries(fields).some(([key, value]) => intake.localPaper[key] !== value);
+  Object.assign(intake.localPaper, fields);
+  const paper = state.library?.papers?.find(item => item.id === watched.paperId);
+  if (paper) Object.assign(paper, fields);
+  if (changed) {
+    state.libraryDirty = true;
+    const cached = state.paperSessions.get(watched.paperId);
+    if (cached) cached.loadedAt = 0;
+  }
+  if (changed || intake.statusError) {
+    intake.statusError = "";
+    renderFeishuIntakeActions();
+  }
+}
+
+function renderFeishuMetadata() {
+  const button = qs("#toggleFeishuMetadata");
+  const root = qs("#feishuMetadataPanel");
+  const indicator = qs("#feishuSyncStatus");
+  const publishButton = qs("#publishReadingToFeishu");
+  if (publishButton) publishButton.hidden = !state.feishuConfig.publication_enabled || !state.currentPaperId;
+  if (!button || !root || !indicator) return;
+  button.hidden = !state.feishuConfig.enabled || !state.currentPaperId;
+  root.hidden = button.hidden || !state.feishuPanelOpen;
+  if (button.hidden) { indicator.textContent = ""; return; }
+  const sync = feishuPaperState(state.currentPaperId);
+  const link = state.payload?.metadata?.feishu;
+  indicator.textContent = sync.error ? `Feishu: ${sync.error}` : ({
+    syncing: "Reading Feishu fields…", synced: "Metadata from Feishu",
+    needs_match: "Feishu association needs confirmation",
+  })[sync.status] || (link?.record_id ? "Using cached Feishu metadata" : "Not yet associated with Feishu");
+  if (root.hidden) return;
+  const cached = state.payload?.feishu_metadata || {};
+  const sources = cached.field_sources || state.feishuConfig.fields || {};
+  const values = cached.metadata || {};
+  const query = sync.query ?? cleanPaperTitle(state.payload?.metadata?.title || "");
+  root.innerHTML = `
+    <div class="queue-heading"><strong>Feishu → local metadata</strong><button class="icon-button" data-close-feishu type="button" aria-label="Close Feishu metadata">×</button></div>
+    <p class="muted small-text">Copy existing column values only. No re-analysis, no cloud writes, and no changes to source text or notes.</p>
+    ${link?.record_id ? `<p><a href="${escapeHtml(link.url)}" target="_blank" rel="noreferrer">Open linked Feishu record</a><span class="muted small-text"> · ${escapeHtml(link.synced_at || "")}</span></p>` : ""}
+    <div class="reader-data-actions">
+      <button class="secondary-button mini-button" data-refresh-feishu type="button" ${sync.status === "syncing" ? "disabled" : ""}>${link?.record_id ? "Refresh mapped fields" : "Match exact title"}</button>
+      ${!link?.record_id ? `<input id="feishuSearchKeyword" type="search" value="${escapeHtml(query)}" aria-label="Search Feishu paper title" placeholder="Feishu paper title" /><button class="secondary-button mini-button" data-search-feishu type="button">Search</button>` : ""}
+    </div>
+    ${sync.error ? `<p class="error-text" role="alert">${escapeHtml(sync.error)}</p>` : ""}
+    ${sync.candidates.length && !link?.record_id ? `<ul class="feishu-candidates">${sync.candidates.map(item => `<li><span>${escapeHtml(item.title)}</span><button class="secondary-button mini-button" data-link-feishu="${escapeHtml(item.record_id)}" type="button">Use this record</button></li>`).join("")}</ul>` : ""}
+    ${sync.status === "needs_match" && !sync.candidates.length ? '<p class="muted">No unique exact title match yet. Search manually or retry after Feishu finishes its fields.</p>' : ""}
+    ${sync.local_overrides?.length ? `<p class="muted small-text">Local edits retained: ${escapeHtml(sync.local_overrides.join(", "))}</p>` : ""}
+    ${link?.record_id ? `<dl class="metadata-info-list">${Object.entries(sources).map(([key, field]) => `<div class="metadata-info-row"><dt>${escapeHtml(field)} → ${escapeHtml(key)}</dt><dd>${escapeHtml(values[key] || "(empty — existing local value retained)")}</dd></div>`).join("")}</dl>` : ""}
+    ${Object.entries(cached.briefings || {}).filter(([, text]) => text).map(([field, text]) => `<details class="feishu-brief"><summary>Feishu ${escapeHtml(field)} (read-only copy)</summary><pre>${escapeHtml(text)}</pre></details>`).join("")}`;
+}
+
+function publicationLink(url, label) {
+  if (!url) return "";
+  const safe = externalHttpUrl(url);
+  return safe ? `<a href="${escapeHtml(safe)}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>` : "";
+}
+
+function renderFeishuPublication() {
+  const view = state.feishuPublication;
+  const result = view.publication;
+  const preview = view.preview;
+  const tableMode = (preview?.mode || result?.mode) === "table";
+  const active = view.sending || result?.status === "publishing";
+  const messages = {
+    idle: "Review the records and destination before publishing.",
+    publishing: `Publishing${result?.phase ? ` · ${result.phase}` : ""}… You can close this window; publishing continues.`,
+    synced: `${tableMode ? "Saved to the Feishu table" : "Published"}${result?.published_at ? ` · ${result.published_at}` : ""}`,
+    pending: "The snapshot is published. Newer local edits still need another update.",
+    failed: "Publication failed. Existing local records are safe.",
+    conflict: "Publication stopped because the local or cloud version changed.",
+    interrupted: "Publication was interrupted. Refresh the preview before resuming.",
+    recovery_required: "The previous write needs verification before another publication.",
+  };
+  qs("#feishuPublishPaper").textContent = view.title;
+  qs("#feishuPublishStatus").textContent = view.loading ? "Preparing a read-only preview…"
+    : messages[result?.status] || (preview ? "Review the records and destination before publishing." : "");
+  const error = view.error || result?.error || "";
+  qs("#feishuPublishError").textContent = error;
+  qs("#feishuPublishError").hidden = !error;
+  const destination = preview?.destination;
+  qs("#feishuPublishDestination").innerHTML = tableMode ? `
+    <p>${publicationLink(result?.record_url || destination?.record_url, "Open paper in Feishu")}</p>
+    ${destination ? `<p class="muted small-text">Columns: ${(destination.text_fields || []).map(field => escapeHtml(field.name)).join(" · ")}</p>
+      <p class="muted small-text">Edit these records in the reader. Cloud copies are checked before each update.</p>` : ""}` : `
+    ${destination ? `<p>${publicationLink(destination.record_url, "Feishu paper record")}</p>
+      <p class="muted small-text">Writes only ${escapeHtml(destination.archive_field?.name || "")} and ${escapeHtml(destination.backup_field?.name || "")}. Your existing analysis and manual fields stay unchanged.</p>` : ""}
+    ${publicationLink(result?.document_url || destination?.document_url, "Open reading archive")}`;
+  const root = qs("#feishuPublishPreview");
+  const previewId = preview?.preview_id || "";
+  if (root.dataset.previewId !== previewId) {
+    root.dataset.previewId = previewId;
+    root.innerHTML = preview ? `
+      <p class="muted small-text">Original notes, recorded discussions and accepted definitions. No new AI summary.</p>
+      ${(preview.warnings || []).map(warning => `<p class="error-text">${escapeHtml(warning)}</p>`).join("")}
+      ${tableMode ? (preview.columns || []).map(column => `<details class="feishu-publish-section" data-publication-column="${escapeHtml(column.id)}">
+        <summary>${escapeHtml(column.name)} <span class="muted">${escapeHtml(column.characters)} / ${escapeHtml(column.limit)} characters</span></summary>
+        ${column.text ? '<pre class="feishu-publish-cell"></pre>' : '<p class="muted small-text">Empty — clears this reader-managed column.</p>'}
+      </details>`).join("") : (preview.sections || []).map(section => `<details class="feishu-publish-section">
+        <summary>${escapeHtml(section.title)} <span class="muted">${section.entries.length}</span></summary>
+        ${section.entries.map(entry => `<article class="feishu-publish-entry">
+          <h3>${escapeHtml(entry.label || entry.id)}</h3>
+          ${entry.source ? `<p class="muted small-text">${escapeHtml(entry.source)}</p>` : ""}
+          ${entry.quote ? `<blockquote>${escapeHtml(entry.quote)}</blockquote>` : ""}
+          ${entry.text ? `<pre>${escapeHtml(entry.text)}</pre>` : ""}
+        </article>`).join("")}
+      </details>`).join("")}
+      <p class="muted small-text">JSON backup${tableMode && destination?.backup_field?.name ? ` · ${escapeHtml(destination.backup_field.name)}` : ""} · ${Math.ceil((preview.snapshot_bytes || 0) / 1024)} KB. Includes stored reading data; excludes PDF/image files, credentials and unrelated project files. Existing backup versions are kept.</p>` : "";
+    if (tableMode && preview) {
+      root.querySelectorAll("[data-publication-column]").forEach((section, index) => {
+        const cell = section.querySelector(".feishu-publish-cell");
+        if (cell) cell.textContent = preview.columns[index].text;
+      });
+    }
+  }
+  const alreadyPublished = ["synced", "pending"].includes(result?.status) && result.preview_id === preview?.preview_id;
+  const confirm = qs("#confirmFeishuPublish");
+  const retry = ["failed", "conflict", "interrupted", "recovery_required"].includes(result?.status);
+  const needsFreshPreview = retry && result.preview_id === preview?.preview_id;
+  confirm.disabled = view.loading || active || needsFreshPreview || !preview || Boolean(view.error) || alreadyPublished || preview.changed === false;
+  confirm.textContent = active ? "Publishing…" : alreadyPublished && result?.status === "pending" ? "Refresh preview for newer edits"
+    : alreadyPublished || preview?.changed === false ? "No changes to publish"
+    : needsFreshPreview ? "Refresh preview before retrying"
+    : retry ? "Retry this publication" : "Confirm & publish";
+  qs("#refreshFeishuPublish").disabled = view.loading || (active && !view.error);
+}
+
+function cancelPublicationPolling() {
+  const view = state.feishuPublication;
+  if (view.timer) clearTimeout(view.timer);
+  view.timer = null;
+}
+
+function publicationViewIsCurrent(version, paperId) {
+  return qs("#feishuPublishDialog")?.open && state.feishuPublication.version === version
+    && state.feishuPublication.paperId === paperId;
+}
+
+async function refreshFeishuPublicationStatus(version, paperId) {
+  if (!publicationViewIsCurrent(version, paperId)) return;
+  cancelPublicationPolling();
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/feishu-publication`);
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    state.feishuPublication.publication = response.publication;
+    state.feishuPublication.error = "";
+    renderFeishuPublication();
+    if (response.publication.status === "publishing") {
+      state.feishuPublication.timer = setTimeout(() => refreshFeishuPublicationStatus(version, paperId), 1200);
+    }
+  } catch (error) {
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    state.feishuPublication.error = `Status unavailable: ${error.message}. Publishing may still be running; close and reopen to check.`;
+    renderFeishuPublication();
+  }
+}
+
+async function openFeishuPublication() {
+  const paperId = state.currentPaperId;
+  if (!paperId || !state.feishuConfig.publication_enabled) {
+    toast("Configure the Feishu paper library before publishing.");
+    return;
+  }
+  cancelPublicationPolling();
+  const view = state.feishuPublication;
+  const version = ++view.version;
+  Object.assign(view, { paperId, title: state.payload?.metadata?.title || paperId, loading: true, sending: false,
+    preview: null, publication: null, error: "" });
+  qs("#readerMoreActions").open = false;
+  if (!qs("#feishuPublishDialog").open) qs("#feishuPublishDialog").showModal();
+  renderFeishuPublication();
+  try {
+    if (state.currentPaperId !== paperId) throw new Error("The active paper changed. Reopen publication for the intended paper.");
+    const status = await api(`/api/papers/${encodeURIComponent(paperId)}/feishu-publication`);
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    view.publication = status.publication;
+    if (status.publication.status === "publishing") {
+      view.timer = setTimeout(() => refreshFeishuPublicationStatus(version, paperId), 1200);
+      return;
+    }
+    if (hasThinkingComposerDraft()) throw new Error("Finish or copy and clear the unsubmitted chat/paste draft first. Drafts are not saved reading records.");
+    await flushCurrentPaperEdits();
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    if (state.currentPaperId !== paperId) throw new Error("The active paper changed. Reopen the preview.");
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/feishu-publication/preview`, {
+      method: "POST", body: "{}",
+    });
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    view.preview = response.preview;
+  } catch (error) {
+    if (publicationViewIsCurrent(version, paperId)) view.error = error.message;
+  } finally {
+    if (publicationViewIsCurrent(version, paperId)) {
+      view.loading = false;
+      renderFeishuPublication();
+    }
+  }
+}
+
+async function confirmFeishuPublication() {
+  const view = state.feishuPublication;
+  if (!view.preview || view.loading || view.sending || view.publication?.status === "publishing") return;
+  const { version, paperId, preview } = view;
+  view.sending = true;
+  view.error = "";
+  renderFeishuPublication();
+  try {
+    if (paperId !== state.currentPaperId) throw new Error("The active paper changed. Reopen the preview.");
+    if (hasThinkingComposerDraft()) throw new Error("Finish or copy and clear the unsubmitted draft before publishing.");
+    await flushCurrentPaperEdits();
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/feishu-publication/publish`, {
+      method: "POST", body: JSON.stringify({ preview_id: preview.preview_id, confirm: true }),
+    });
+    if (!publicationViewIsCurrent(version, paperId)) return;
+    view.publication = response.publication;
+    if (response.publication.status === "publishing") {
+      view.timer = setTimeout(() => refreshFeishuPublicationStatus(version, paperId), 1200);
+    }
+  } catch (error) {
+    if (publicationViewIsCurrent(version, paperId)) view.error = `${error.message} Refresh the preview before retrying.`;
+  } finally {
+    if (publicationViewIsCurrent(version, paperId)) {
+      view.sending = false;
+      renderFeishuPublication();
+    }
+  }
+}
+
+async function syncFeishuPaper(paperId = state.currentPaperId, options = {}) {
+  if (!paperId || !state.feishuConfig.enabled) return;
+  const sync = feishuPaperState(paperId);
+  if (sync.status === "syncing") return;
+  if (options.automatic && (state.metadataDrafts.has(paperId)
+    || state.workspaceMetadataEditor.open && state.workspaceMetadataEditor.paperId === paperId)) return;
+  Object.assign(sync, { status: "syncing", error: "", lastAttempt: Date.now() });
+  renderFeishuMetadata();
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/feishu-sync`, {
+      method: "POST", body: JSON.stringify(options),
+    });
+    Object.assign(sync, { status: response.status, candidates: response.candidates || [], local_overrides: response.local_overrides || [] });
+    applyFeishuMetadataResult(paperId, response);
+  } catch (error) {
+    console.error(`Feishu metadata sync failed for ${paperId}`, error);
+    Object.assign(sync, { status: "failed", error: error.message });
+    if (!options.automatic) toast(`Feishu metadata unchanged: ${error.message}`);
+  } finally {
+    if (paperId === state.currentPaperId) renderFeishuMetadata();
+  }
+}
+
+function watchFeishuMetadata() {
+  clearTimeout(state.feishuPollTimer);
+  renderFeishuMetadata();
+  if (!state.feishuConfig.enabled || !state.feishuConfig.auto_sync
+    || !state.currentPaperId || document.body.dataset.activeView !== "reader") return;
+  const paperId = state.currentPaperId;
+  const poll = async () => {
+    if (state.currentPaperId !== paperId || document.body.dataset.activeView !== "reader") return;
+    const sync = feishuPaperState(paperId);
+    if (Date.now() - sync.lastAttempt >= 60000) await syncFeishuPaper(paperId, { automatic: true });
+    if (state.currentPaperId === paperId && document.body.dataset.activeView === "reader") state.feishuPollTimer = setTimeout(poll, 60000);
+  };
+  state.feishuPollTimer = setTimeout(poll, 0);
+}
+
+async function searchFeishuPapers() {
+  if (!state.currentPaperId) return;
+  const paperId = state.currentPaperId;
+  const sync = feishuPaperState(paperId);
+  const keyword = qs("#feishuSearchKeyword")?.value || "";
+  sync.query = keyword;
+  try {
+    const response = await api(`/api/feishu/search?${new URLSearchParams({ keyword })}`);
+    Object.assign(sync, { candidates: response.records || [], status: "needs_match", error: response.has_more ? "More matches exist. Use a more specific title." : "" });
+  } catch (error) {
+    console.error("Feishu search failed", error);
+    Object.assign(sync, { status: "failed", error: error.message });
+  }
+  if (state.currentPaperId === paperId) renderFeishuMetadata();
 }
 
 function openWorkspaceMetadataEditor() {
@@ -6758,6 +8117,8 @@ function preferredDrawerPoint() {
 function positionNoteDrawer(point = preferredDrawerPoint()) {
   const drawer = qs("#noteDrawer");
   if (!drawer) return;
+  const minTop = Math.min(readerViewportTop() + 8, Math.max(12, window.innerHeight - 180));
+  drawer.style.maxHeight = `calc(100vh - ${minTop + 12}px)`;
   const width = drawer.offsetWidth || 420;
   const height = Math.min(drawer.offsetHeight || 520, window.innerHeight - 24);
   let left = Number(point?.x ?? window.innerWidth - width - 18) + 12;
@@ -6765,7 +8126,7 @@ function positionNoteDrawer(point = preferredDrawerPoint()) {
   if (left + width > window.innerWidth - 12) left = Math.max(12, Number(point?.x ?? 0) - width - 12);
   if (top + height > window.innerHeight - 12) top = Math.max(12, window.innerHeight - height - 12);
   drawer.style.left = `${Math.max(12, left)}px`;
-  drawer.style.top = `${Math.max(12, top)}px`;
+  drawer.style.top = `${Math.max(minTop, top)}px`;
 }
 
 function refreshDrawerMode() {
@@ -6784,6 +8145,7 @@ function refreshDrawerMode() {
 function openNoteDrawerAtPointer() {
   const drawer = qs("#noteDrawer");
   if (!drawer) return;
+  state.drawerInitialValue = noteDrawerSnapshot();
   refreshDrawerMode();
   drawer.classList.add("open");
   drawer.setAttribute("aria-hidden", "false");
@@ -6796,46 +8158,625 @@ function paragraphHtml(paragraph) {
   const type = paragraph.kind || "paragraph";
   const text = paragraph.markdown || "";
   const readingProgress = readingProgressForSegment(pid);
-  const visibleText = displayText(text, { trim: false });
+  const visibleText = displayTextPreservingMath(text, { trim: false });
+  const isTableSegment = isTextTableSegment(paragraph);
   let body = "";
   if (type === "heading") {
     const level = Math.min(Math.max(Number(paragraph.level || 2), 1), 3);
-    const headingText = visibleText.replace(/^#{1,6}\s+/, "");
+    const headingText = cleanPaperTitle(visibleText.replace(/^#{1,6}\s+/, ""));
     body = `<h${level}>${inlineMarkdown(headingText)}</h${level}>`;
   } else if (type === "code") {
     body = `<pre><code>${escapeHtml(text)}</code></pre>`;
   } else if (isHtmlTable(text)) {
     body = mediaAnnotationToolbarHtml(paragraph, "table", renderHtmlTable(text));
-  } else if (type === "table" || text.includes("\n|")) {
+  } else if (isTableSegment) {
     body = mediaAnnotationToolbarHtml(paragraph, "table", renderPipeTable(text));
   } else if (/!\[[^\]]*\]\([^)]+\)/.test(text)) {
     body = `<div class="source-text annotation-text" data-pid="${pid}" data-target="source">${wrapMediaImageButtons(paragraph, applyHighlights(visibleText, pid, "source"))}</div>`;
   } else {
     body = `<div class="source-text annotation-text" data-pid="${pid}" data-target="source">${applyHighlights(visibleText, pid, "source")}</div>`;
   }
-  const isTableSegment = isHtmlTable(text) || type === "table" || text.includes("\n|");
+  const translated = isTableSegment ? null : translationPresentation(paragraph);
   const translation = isTableSegment
     ? renderTableTranslation(paragraph)
-    : paragraph.translation
-      ? `<div class="translation annotation-text" data-pid="${pid}" data-target="translation">${applyHighlights(displayText(paragraph.translation, { trim: false }), pid, "translation")}</div>`
+    : stripTranslationImages(translated.text).trim()
+      ? `<div class="translation annotation-text" data-pid="${pid}" data-target="translation">${applyHighlights(displayTextPreservingMath(paragraph.translation, { trim: false }), pid, "translation", { omissions: translated.omissions })}</div>`
       : "";
-  const notes = annotationCardsHtml(pid);
-  return `<article class="paragraph${notes ? " has-comments" : ""}" id="${pid}" data-pid="${pid}" data-reading-state="${escapeHtml(readingProgress.state)}" style="--reading-depth: ${readingProgress.depth || 0}">${body}${translation}${notes}</article>`;
+  const notes = marginCardsHtml(pid);
+  const repeatsTitle = type === "heading" && state.payload?.segments?.[0]?.id === pid
+    && !getAnnotationsFor(pid).length
+    && cleanPaperTitle(visibleText.replace(/^#{1,6}\s+/, "")).toLocaleLowerCase() === paperTitle(state.payload?.metadata || {}).toLocaleLowerCase();
+  return `<article class="paragraph${notes ? " has-comments" : ""}${repeatsTitle ? " paper-title-repeat" : ""}" id="${pid}" data-pid="${pid}" data-reading-state="${escapeHtml(readingProgress.state)}" style="--reading-depth: ${readingProgress.depth || 0}">${body}${translation}${notes}</article>`;
 }
 
 function annotationCardsHtml(paragraphId) {
   const items = getAnnotationsFor(paragraphId)
     .map(item => ({ item, noteText: annotationNoteCardText(item) }))
-    .filter(entry => entry.noteText);
+    .filter(entry => entry.noteText || isTeacherDefinition(entry.item));
   if (!items.length) return "";
-  return `<div class="comment-stack">${items.map(({ item, noteText }) => `
-    <div class="comment-card" data-jump-annotation="${escapeHtml(item.id || "")}" role="button" tabindex="0" title="Jump to highlighted text">
-      <span class="comment-color hl-${escapeHtml(item.color || "yellow")}"></span>
-      <span class="comment-text">${escapeHtml(noteText)}</span>
-      <button class="comment-edit" data-edit-annotation="${escapeHtml(item.id || "")}" title="Edit note">Edit</button>
-      <button class="comment-delete" data-delete-annotation="${escapeHtml(item.id || "")}" data-paper-id="${escapeHtml(state.currentPaperId || "")}" title="Delete note">x</button>
-      ${annotationTags(item).length ? `<span class="comment-tags">${annotationTags(item).map(tag => `<span>${escapeHtml(tag)}</span>`).join("")}</span>` : ""}
-    </div>`).join("")}</div>`;
+  return items.map(({ item, noteText }) => {
+    if (isTeacherDefinition(item)) return savedDefinitionCardHtml(item);
+    const long = noteText.length > 320 || noteText.split("\n").length > 6;
+    const expanded = state.expandedMarginNotes.has(item.id);
+    const aiDefinition = isTeacherDefinition(item);
+    return `<section class="comment-card${long && !expanded ? " is-collapsed" : ""}" data-note-origin="${aiDefinition ? "reading-teacher" : "user"}" aria-label="${aiDefinition ? "Saved AI definition" : "My note"}">
+      <header class="margin-card-header">
+        <button class="comment-jump" type="button" data-jump-annotation="${escapeHtml(item.id || "")}" title="${aiDefinition ? "Saved AI definition" : "My note"} · ${escapeHtml(annotationKindLabel(item))}" aria-label="Jump to highlighted text">
+          <span class="comment-color swatch-${escapeHtml(item.color || "yellow")}" aria-hidden="true"></span>
+        </button>
+        <button class="comment-edit" type="button" data-edit-annotation="${escapeHtml(item.id || "")}" title="Edit note">Edit</button>
+        <button class="comment-delete" type="button" data-delete-annotation="${escapeHtml(item.id || "")}" data-paper-id="${escapeHtml(state.currentPaperId || "")}" title="Delete note" aria-label="Delete note">×</button>
+      </header>
+      <div class="comment-text" id="margin-note-${escapeHtml(item.id)}">${escapeHtml(noteText)}</div>
+      ${long ? `<button class="margin-note-expand" type="button" data-expand-annotation="${escapeHtml(item.id)}" aria-expanded="${expanded}" aria-controls="margin-note-${escapeHtml(item.id)}">${expanded ? "Show less" : "Read full note"}</button>` : ""}
+      ${annotationTags(item).length ? `<div class="comment-tags">${annotationTags(item).map(tag => `<span>${escapeHtml(tag)}</span>`).join("")}</div>` : ""}
+    </section>`;
+  }).join("");
+}
+
+function savedDefinitionView(annotation) {
+  const origin = annotation.origin;
+  const sources = Array.isArray(origin.sources) ? origin.sources : [];
+  const title = (typeof origin.title === "string" && origin.title) || String(annotation.note || "").split(/\r?\n/)[0] || "Definition";
+  const card = { id: origin.card_id, title, definition: origin.definition,
+    anchor: origin.anchor || { segment_id: annotation.segment_id, quote: annotation.quote } };
+  const complete = typeof card.definition?.paper === "string" && Array.isArray(card.definition.external)
+    && card.definition.external.length > 0 && card.definition.external.every(item =>
+      typeof item?.summary === "string" && (item.kind === "ai-summary"
+        || sources.some(source => source?.id === item.source_id && typeof source.title === "string"
+          && typeof source.url === "string" && typeof source.accessed_at === "string")));
+  if (!complete) console.warn("Saved definition has incomplete provenance; showing its saved text.", annotation.id);
+  const initial = complete ? (origin.initial_note ?? teacherDefinitionNote(card, { sources })) : null;
+  return { card, sources, pristine: complete && annotation.note === initial };
+}
+
+function savedDefinitionSaveState(annotation) {
+  const write = state.paperSessions.get(state.currentPaperId)?.writes.get("annotations");
+  if (state.readingTeacher.saving.has(annotation.origin.card_id) || write?.pending) return "saving";
+  return write?.dirty ? "retry" : "saved";
+}
+
+function savedDefinitionActionsHtml(annotation) {
+  const status = savedDefinitionSaveState(annotation);
+  const saving = status === "saving";
+  return `<span class="definition-save-state" role="status">${saving ? "Saving…" : status === "retry" ? "Not saved" : "✓ Saved"}</span>
+    ${status === "retry"
+      ? `<button class="secondary-button mini-button" type="button" data-retry-definition-save="${escapeHtml(annotation.id)}">Retry save</button>`
+      : `<button class="secondary-button mini-button" type="button" data-edit-annotation="${escapeHtml(annotation.id)}"${saving ? " disabled" : ""}>Edit</button>`}`;
+}
+
+function refreshSavedDefinitionStatuses() {
+  qsa("#documentRoot [data-definition-actions]").forEach(footer => {
+    const annotation = state.annotations.find(item => item.id === footer.dataset.definitionActions);
+    if (!annotation) return;
+    const status = savedDefinitionSaveState(annotation);
+    if (footer.dataset.saveState === status) return;
+    footer.dataset.saveState = status;
+    footer.innerHTML = savedDefinitionActionsHtml(annotation);
+    bindReaderDynamicEvents(footer);
+  });
+  qsa("#documentRoot [data-definition-status]").forEach(mark => {
+    const annotation = state.annotations.find(item => item.id === mark.dataset.definitionStatus);
+    if (!annotation) return;
+    const status = savedDefinitionSaveState(annotation);
+    mark.textContent = status === "saving" ? "…" : status === "retry" ? "!" : "✓";
+    mark.title = status === "saving" ? "Saving" : status === "retry" ? "Not saved" : "Saved";
+  });
+}
+
+function savedDefinitionCardHtml(annotation) {
+  const { card, sources, pristine } = savedDefinitionView(annotation);
+  const id = escapeHtml(annotation.id);
+  const status = savedDefinitionSaveState(annotation);
+  if (state.collapsedDefinitionNotes.has(annotation.id)) {
+    return `<button class="teacher-marker saved-definition-marker" type="button" data-open-definition-note="${id}" aria-expanded="false" aria-label="Open saved definition: ${escapeHtml(card.title)}">
+      <span data-definition-status="${id}" aria-hidden="true">${status === "saving" ? "…" : status === "retry" ? "!" : "✓"}</span> ${escapeHtml(card.title)}</button>`;
+  }
+  const note = String(annotation.note || "");
+  const long = !pristine && (note.length > 320 || note.split("\n").length > 6);
+  const expanded = state.expandedMarginNotes.has(annotation.id);
+  return `<section class="comment-card saved-definition-card${long && !expanded ? " is-collapsed" : ""}" id="saved-definition-${id}" data-saved-definition="${id}" data-note-origin="reading-teacher" tabindex="-1" aria-label="Saved AI definition: ${escapeHtml(card.title)}">
+    <header class="margin-card-header">${pristine ? `<h3>${escapeHtml(card.title)}</h3>` : '<span class="comment-color swatch-blue" aria-hidden="true"></span>'}
+      <button class="teacher-close" type="button" data-close-definition-note="${id}" title="Collapse definition" aria-label="Collapse saved definition">×</button></header>
+    ${pristine ? teacherDefinitionHtml(card, { sources, annotationId: annotation.id })
+      : `<div class="comment-text" id="margin-note-${id}">${escapeHtml(note)}</div>`}
+    ${long ? `<button class="margin-note-expand" type="button" data-expand-annotation="${id}" aria-expanded="${expanded}" aria-controls="margin-note-${id}">${expanded ? "Show less" : "Read full note"}</button>` : ""}
+    <footer class="teacher-actions" data-definition-actions="${id}" data-save-state="${status}">${savedDefinitionActionsHtml(annotation)}</footer>
+  </section>`;
+}
+
+function toggleSavedDefinitionNote(annotationId, open) {
+  const annotation = state.annotations.find(item => item.id === annotationId && isTeacherDefinition(item));
+  if (!annotation) { toast("This saved definition is no longer available."); return; }
+  if (open) state.collapsedDefinitionNotes.delete(annotationId);
+  else state.collapsedDefinitionNotes.add(annotationId);
+  refreshTeacherMargins([annotation.segment_id]);
+  const target = open ? document.getElementById(`saved-definition-${annotationId}`)
+    : document.querySelector(`[data-open-definition-note="${cssEscape(annotationId)}"]`);
+  target?.focus({ preventScroll: true });
+}
+
+async function retrySavedDefinitionNote(annotationId) {
+  const annotation = state.annotations.find(item => item.id === annotationId && isTeacherDefinition(item));
+  if (!annotation) { toast("This saved definition is no longer available."); return; }
+  const paperId = state.currentPaperId;
+  const teacher = state.readingTeacher;
+  const cardId = annotation.origin.card_id;
+  if (teacher.saving.has(cardId)) return;
+  teacher.saving.add(cardId);
+  try {
+    await persistCurrentPaperAnnotations("", { segmentIds: [annotation.segment_id] });
+  } catch (error) {
+    console.error("Could not save the accepted definition", error);
+    if (state.currentPaperId === paperId) toast(`Definition not saved: ${error.message}. Use Retry save.`);
+  } finally {
+    teacher.saving.delete(cardId);
+    if (state.currentPaperId === paperId) refreshTeacherMargins([annotation.segment_id]);
+  }
+}
+
+function emptyReadingTeacher(enabled = true) {
+  return { enabled, data: null, loading: false, error: "", cardsBySegment: new Map(),
+    issues: [], openDetails: new Set(), saving: new Set(), ranges: new Map(), activeCardId: "",
+    openCardId: "", showDeep: false, needsRefresh: false, scheduled: false };
+}
+
+function isDeepTeacherCard(card) {
+  return ["focus", "question", "transfer"].includes(card.kind);
+}
+
+function marginCardsHtml(paragraphId) {
+  const cards = state.readingTeacher.enabled ? state.readingTeacher.cardsBySegment.get(paragraphId) || [] : [];
+  const content = annotationCardsHtml(paragraphId) + cards.filter(card =>
+    card.kind !== "definition" || adoptedTeacherDefinition(card.id)?.segment_id !== paragraphId).map(card =>
+    state.readingTeacher.openCardId === card.id ? readingTeacherCardHtml(card)
+      : `<button class="teacher-marker" type="button" data-teacher-open="${escapeHtml(card.id)}" aria-expanded="false" aria-label="Open AI annotation: ${escapeHtml(card.title)}" title="AI teacher · ${escapeHtml(card.title)}">${escapeHtml(card.title)}</button>`
+  ).join("");
+  return content ? `<aside class="comment-stack" aria-label="Margin annotations">${content}</aside>` : "";
+}
+
+function updateMarginLayout() {
+  qs("#documentRoot")?.classList.toggle("has-margin-notes",
+    Boolean(state.payload?.teacher_available && state.readingTeacher.enabled)
+    || state.annotations.some(annotation => isTeacherDefinition(annotation) || annotationNoteCardText(annotation)));
+}
+
+function externalHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) throw new Error("Unsupported external URL.");
+    return url.href;
+  } catch (error) {
+    console.warn("Invalid external link", error);
+    return "";
+  }
+}
+
+function readingTeacherSourceUrl(value) {
+  return externalHttpUrl(value);
+}
+
+function teacherDisclosure(card, key, label, content) {
+  const id = `${card.id}:${key}`;
+  return `<details data-teacher-disclosure="${escapeHtml(id)}"${state.readingTeacher.openDetails.has(id) ? " open" : ""}><summary>${label}</summary>${content}</details>`;
+}
+
+function teacherPaperMeaning(card) {
+  return {
+    quoted: card.definition.paper_kind === "quote" || (!card.definition.paper_kind && card.definition.paper === card.anchor.quote),
+    label: card.definition.paper_kind === "usage" ? "本文用法" : "本文定义",
+  };
+}
+
+function teacherDefinitionHtml(card, { sources = state.readingTeacher.data?.sources || [], annotationId = "" } = {}) {
+  if (!card.definition) return "";
+  const { quoted, label } = teacherPaperMeaning(card);
+  const aiOnly = card.definition.external.every(item => item.kind === "ai-summary");
+  const external = card.definition.external.map((item, index) => {
+    if (item.kind === "ai-summary") return `<p>${escapeHtml(item.summary)}${aiOnly ? "" : ' <span class="teacher-context-label">AI 概括</span>'}</p>`;
+    const source = sources.find(entry => entry.id === item.source_id);
+    const url = readingTeacherSourceUrl(source?.url);
+    const provenance = source ? `${source.title} · ${source.accessed_at}${source.reading_scope ? ` · ${source.reading_scope}` : ""}` : item.source_id;
+    return `<p>${escapeHtml(item.summary)} ${url ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(provenance)}" aria-label="${escapeHtml(provenance)}">[${index + 1}]</a>` : "<span class=\"error-text\">来源地址无效。</span>"}</p>`;
+  }).join("");
+  const sourceAction = annotationId ? `data-jump-annotation="${escapeHtml(annotationId)}"`
+    : `data-teacher-source="${escapeHtml(card.id)}" data-evidence-index="-1"`;
+  return `<div class="teacher-definition">
+    <div><button class="teacher-source-link" type="button" ${sourceAction} title="${quoted ? "Quoted from the paper" : "AI paraphrase of the paper"}">${label}</button>
+      <p${quoted ? ' class="teacher-definition-quote"' : ""}>${quoted ? "“" : ""}${escapeHtml(card.definition.paper)}${quoted ? "”" : ""}</p></div>
+    <div><strong>${aiOnly ? "一般含义 · AI 概括" : "外部定义"}</strong>${external}</div>
+  </div>`;
+}
+
+function readingTeacherCardHtml(card) {
+  const teacher = state.readingTeacher;
+  const definitionOnly = card.kind === "definition";
+  const cue = card.kind === "cue";
+  const compact = definitionOnly || cue;
+  const context = teacher.data.project_context;
+  const refs = (card.context_ids || []).map(id => context?.cards.find(item => item.id === id)).filter(Boolean);
+  const evidence = [{ ...card.anchor, label: "批注所在原文" }, ...(card.evidence || [])];
+  const sourcesHtml = evidence.map((item, index) => `<div>
+    <button class="teacher-source-link" type="button" data-teacher-source="${escapeHtml(card.id)}" data-evidence-index="${index - 1}">${escapeHtml(item.label)} · ${escapeHtml(item.segment_id)}</button>
+    <blockquote>${escapeHtml(item.quote)}</blockquote></div>`).join("");
+  const contextHtml = refs.length ? `<p class="teacher-context-label">${escapeHtml(context.project)} · 项目假设 · 快照 ${escapeHtml(context.snapshot_at)}</p>
+    ${refs.map(item => `<p><strong>${escapeHtml(item.title)}</strong><br>${escapeHtml(item.summary)}</p>`).join("")}
+    <p class="teacher-context-label">来源：${escapeHtml(context.source_path)}${context.source_status === "missing" ? "（路径不可用，仅保留历史快照）" : ""}</p>` : "";
+  const adopted = adoptedTeacherDefinition(card.id);
+  const write = state.paperSessions.get(state.currentPaperId)?.writes.get("annotations");
+  const saving = teacher.saving.has(card.id);
+  const retry = adopted && write?.dirty;
+  return `<section class="teacher-card" id="teacher-card-${escapeHtml(card.id)}" data-teacher-card="${escapeHtml(card.id)}" tabindex="-1" aria-label="AI teacher: ${escapeHtml(card.title)}">
+    <header class="margin-card-header"><h3 title="AI teacher">${escapeHtml(card.title)}</h3>
+      <button class="teacher-close" type="button" data-teacher-close="${escapeHtml(card.id)}" aria-label="Close AI annotation" title="Close">×</button></header>
+    ${cue ? `<p class="teacher-cue">${escapeHtml(card.text)}</p>` : definitionOnly ? "" : `<p class="teacher-question">${escapeHtml(card.question)}</p>`}
+    ${teacherDefinitionHtml(card)}
+    ${compact ? "" : teacherDisclosure(card, "hint", "线索", `<p>${escapeHtml(card.hint)}</p>`)}
+    ${compact ? "" : teacherDisclosure(card, "explanation", "解读与依据", `<p>${escapeHtml(card.why)}</p><p>${escapeHtml(card.explanation)}</p>${sourcesHtml}`)}
+    ${!compact && contextHtml ? teacherDisclosure(card, "context", `项目依据 · ${escapeHtml(context.project)}`, contextHtml) : ""}
+    ${cue ? "" : `<div class="teacher-actions">
+      ${definitionOnly ? "" : `<button class="secondary-button mini-button" type="button" data-teacher-reflect="${escapeHtml(card.id)}">记下想法</button>`}
+      ${card.definition ? `<button class="secondary-button mini-button" type="button" data-teacher-adopt="${escapeHtml(card.id)}"${saving ? " disabled" : ""} title="Save this AI definition with its sources">${saving ? "Saving…" : retry ? "Retry save" : adopted ? "Saved · edit" : "Save to Notes"}</button>` : ""}
+    </div>`}
+  </section>`;
+}
+
+function exactTeacherRange(anchor) {
+  const segment = state.payload?.segments?.find(item => item.id === anchor.segment_id);
+  if (!segment || segment.markdown !== anchor.source_markdown) return null;
+  const article = document.getElementById(anchor.segment_id);
+  const root = article?.querySelector('.source-text[data-target="source"]');
+  if (!root || !qs("#documentRoot")?.contains(root)) return null;
+  const quote = displayTextPreservingMath(anchor.quote, { trim: false });
+  const text = root.textContent;
+  const start = text.indexOf(quote);
+  if (!quote || start < 0 || text.indexOf(quote, start + 1) >= 0) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  const range = document.createRange();
+  let offset = 0;
+  let started = false;
+  while (walker.nextNode()) {
+    const node = walker.currentNode;
+    const end = offset + node.textContent.length;
+    if (!started && start < end) {
+      range.setStart(node, start - offset);
+      started = true;
+    }
+    if (started && start + quote.length <= end) {
+      range.setEnd(node, start + quote.length - offset);
+      return range;
+    }
+    offset = end;
+  }
+  return null;
+}
+
+function refreshReadingTeacher() {
+  const teacher = state.readingTeacher;
+  const affected = new Set(teacher.cardsBySegment.keys());
+  teacher.cardsBySegment = new Map();
+  teacher.ranges = new Map();
+  teacher.issues = [...(teacher.data?.issues || [])];
+  const segmentOrder = new Map((state.payload?.segments || []).map((segment, index) => [segment.id, index]));
+  const cards = teacher.enabled ? (teacher.data?.cards || []).filter(card => isDeepTeacherCard(card) === teacher.showDeep).sort((a, b) =>
+    (segmentOrder.get(a.anchor.segment_id) ?? Infinity) - (segmentOrder.get(b.anchor.segment_id) ?? Infinity)) : [];
+  for (const card of cards) {
+    const anchors = [card.anchor, ...(card.evidence || [])];
+    const sourceMatches = anchors.every(anchor => state.payload?.segments?.some(segment =>
+      segment.id === anchor.segment_id && segment.markdown === anchor.source_markdown));
+    const range = sourceMatches ? exactTeacherRange(card.anchor) : null;
+    if (!range) {
+      teacher.issues.push({ id: card.id, reason: "原文已变化，或引文无法唯一定位；未划线，请重新核对。" });
+      continue;
+    }
+    const segmentId = card.anchor.segment_id;
+    if (!teacher.cardsBySegment.has(segmentId)) teacher.cardsBySegment.set(segmentId, []);
+    teacher.cardsBySegment.get(segmentId).push(card);
+    teacher.ranges.set(card.id, range);
+    affected.add(segmentId);
+  }
+  if (window.CSS?.highlights && window.Highlight) {
+    window.CSS.highlights.delete("reading-teacher");
+    window.CSS.highlights.delete("reading-teacher-cues");
+    window.CSS.highlights.delete("reading-teacher-focus");
+    if (teacher.ranges.size) window.CSS.highlights.set("reading-teacher", new window.Highlight(...teacher.ranges.values()));
+    const cueRanges = cards.filter(card => card.kind !== "definition" && teacher.ranges.has(card.id)).map(card => teacher.ranges.get(card.id));
+    if (cueRanges.length) window.CSS.highlights.set("reading-teacher-cues", new window.Highlight(...cueRanges));
+  }
+  if (teacher.enabled && !teacher.ranges.has(teacher.openCardId)) teacher.openCardId = "";
+  updateMarginLayout();
+  refreshTeacherMargins(affected);
+  renderReadingTeacherStatus();
+  teacher.needsRefresh = false;
+}
+
+function refreshTeacherMargins(segmentIds) {
+  for (const segmentId of new Set(segmentIds)) {
+    const article = document.getElementById(segmentId);
+    if (!article || !qs("#documentRoot")?.contains(article)) continue;
+    const previous = article.querySelector(":scope > .comment-stack");
+    const html = marginCardsHtml(segmentId);
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = html;
+    const next = wrapper.firstElementChild;
+    if (next) {
+      if (previous) previous.replaceWith(next);
+      else article.appendChild(next);
+      bindReaderDynamicEvents(next);
+    } else previous?.remove();
+    article.classList.toggle("has-comments", Boolean(next));
+  }
+}
+
+function renderReadingTeacherStatus() {
+  const teacher = state.readingTeacher;
+  const toggle = qs("#toggleReadingTeacher");
+  const status = qs("#readingTeacherStatus");
+  if (!toggle || !status) return;
+  toggle.hidden = !state.payload?.teacher_available;
+  toggle.disabled = state.workspaceMode === "think";
+  toggle.setAttribute("aria-pressed", String(teacher.enabled));
+  toggle.textContent = "AI teacher";
+  toggle.title = teacher.enabled ? "Hide AI annotations" : "Show AI annotations";
+  const depth = qs("#toggleTeacherDepth");
+  if (depth) {
+    depth.hidden = toggle.hidden || !teacher.enabled || state.workspaceMode === "think"
+      || (!teacher.showDeep && !teacher.data?.cards.some(isDeepTeacherCard));
+    depth.setAttribute("aria-pressed", String(teacher.showDeep));
+    depth.textContent = teacher.showDeep ? "返回导读" : "深入思考";
+    depth.title = teacher.showDeep ? "Return to reading cues and definitions" : "Open saved deeper questions; no generation";
+  }
+  renderReadingTeacherNavigation();
+  status.hidden = toggle.hidden || !teacher.enabled || state.workspaceMode === "think";
+  if (status.hidden) return;
+  if (teacher.error) {
+    status.textContent = `AI teacher 未加载：${teacher.error}。原文和笔记仍可正常使用。`;
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.className = "secondary-button mini-button";
+    retry.textContent = "Retry teacher";
+    retry.addEventListener("click", () => loadReadingTeacher(state.currentPaperId, { force: true }));
+    status.appendChild(retry);
+    return;
+  }
+  if (!teacher.data) {
+    status.textContent = "AI 批注加载中…";
+    return;
+  }
+  const count = teacher.ranges.size;
+  const unsupported = !(window.CSS?.highlights && window.Highlight);
+  status.hidden = Boolean(count && !teacher.issues.length && !unsupported);
+  status.textContent = `${count ? "" : "暂无 AI 批注。"}${teacher.issues.length ? `${teacher.issues.length} 处引用失效，已隐藏。` : ""}${unsupported ? "当前浏览器不支持原文标记；可用右侧标签或顶部位置菜单。" : ""}`;
+  if (teacher.issues.length) {
+    const details = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = "查看未显示的批注";
+    const body = document.createElement("div");
+    body.textContent = teacher.issues.map(item => `${item.id}: ${item.reason}`).join("\n");
+    details.append(summary, body);
+    status.appendChild(details);
+  }
+}
+
+function renderReadingTeacherNavigation() {
+  const nav = qs("#readingTeacherNav");
+  const select = qs("#readingTeacherLocation");
+  if (!nav || !select) return;
+  const teacher = state.readingTeacher;
+  const cards = [...teacher.cardsBySegment.values()].flat();
+  nav.hidden = !state.payload?.teacher_available || !teacher.enabled || !cards.length || state.workspaceMode === "think";
+  if (nav.hidden) return;
+  const options = JSON.stringify(cards.map(card => [card.id, card.title]));
+  if (select.dataset.cards !== options) {
+    select.innerHTML = `<option value="" disabled>${cards.length} 处批注</option>` + cards.map((card, index) =>
+      `<option value="${escapeHtml(card.id)}">${index + 1}/${cards.length} · ${escapeHtml(card.title)}</option>`).join("");
+    select.dataset.cards = options;
+  }
+  const index = cards.findIndex(card => card.id === teacher.activeCardId);
+  select.value = index < 0 ? "" : teacher.activeCardId;
+  select.title = index < 0 ? "Go to AI annotation" : cards[index].title;
+  select.onchange = () => { if (select.value) focusTeacherSource(select.value); };
+  const previous = qs("#previousTeacherCard");
+  const next = qs("#nextTeacherCard");
+  previous.disabled = index <= 0;
+  next.disabled = index === cards.length - 1;
+  previous.onclick = () => { if (index > 0) focusTeacherSource(cards[index - 1].id); };
+  next.onclick = () => { if (index < cards.length - 1) focusTeacherSource(cards[index + 1].id); };
+}
+
+function scheduleReadingTeacher(paperId) {
+  const session = state.paperSessions.get(paperId);
+  const teacher = session?.readingTeacher;
+  if (!session?.payload?.teacher_available || !teacher || teacher.data || teacher.loading || teacher.scheduled || teacher.error) return;
+  teacher.scheduled = true;
+  const load = () => {
+    teacher.scheduled = false;
+    if (state.currentPaperId === paperId && !state.paperLoadingId
+      && state.paperSessions.get(paperId) === session && session.readingTeacher === teacher) loadReadingTeacher(paperId);
+  };
+  // Leave a source-only paint before optional file loading and margin layout.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (typeof window.requestIdleCallback === "function") window.requestIdleCallback(load, { timeout: 1000 });
+    else setTimeout(load, 0);
+  }));
+}
+
+async function loadReadingTeacher(paperId, { force = false } = {}) {
+  const session = state.paperSessions.get(paperId);
+  const teacher = session?.readingTeacher;
+  if (!session?.payload?.teacher_available || !teacher || teacher.loading || (teacher.data && !force)) return;
+  teacher.loading = true;
+  teacher.error = "";
+  if (paperId === state.currentPaperId) renderReadingTeacherStatus();
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/reading-teacher`);
+    if (response.paper_id !== paperId || !response.teacher || !Array.isArray(response.teacher.cards)) {
+      throw new Error("Invalid or mismatched teacher response.");
+    }
+    if (session.readingTeacher !== teacher || state.paperSessions.get(paperId) !== session) return;
+    teacher.data = response.teacher;
+    teacher.needsRefresh = true;
+    if (response.teacher.available === false) session.payload.teacher_available = false;
+  } catch (error) {
+    teacher.error = error.message;
+    teacher.needsRefresh = true;
+    console.error(`Reading teacher failed for ${paperId}`, error);
+  } finally {
+    teacher.loading = false;
+    if (paperId === state.currentPaperId && state.readingTeacher === teacher && !state.paperLoadingId) {
+      const top = readerViewportTop();
+      const anchor = qsa("#documentRoot .paragraph").find(node => node.getBoundingClientRect().bottom > top);
+      const before = anchor?.getBoundingClientRect().top;
+      refreshReadingTeacher();
+      if (anchor && before !== undefined) {
+        const shift = anchor.getBoundingClientRect().top - before;
+        if (Math.abs(shift) > 0.5) window.scrollTo({ top: window.scrollY + shift, behavior: "instant" });
+      }
+    }
+  }
+}
+
+function readingTeacherCard(cardId) {
+  return [...state.readingTeacher.cardsBySegment.values()].flat().find(card => card.id === cardId);
+}
+
+function focusTeacherSource(cardId, evidenceIndex = -1, { scroll = true, moveFocus = false } = {}) {
+  const card = readingTeacherCard(cardId);
+  const anchor = evidenceIndex < 0 ? card?.anchor : card?.evidence?.[evidenceIndex];
+  const range = anchor ? exactTeacherRange(anchor) : null;
+  if (!range) { toast("无法唯一定位原文；请重新核对该批注。"); return; }
+  const teacher = state.readingTeacher;
+  const article = document.getElementById(anchor.segment_id);
+  const before = article.getBoundingClientRect().top;
+  const previous = readingTeacherCard(teacher.openCardId);
+  const saved = card.kind === "definition" ? adoptedTeacherDefinition(cardId) : null;
+  const savedHere = saved?.segment_id === card.anchor.segment_id ? saved : null;
+  const wasCollapsed = savedHere && state.collapsedDefinitionNotes.delete(savedHere.id);
+  teacher.activeCardId = cardId;
+  if (teacher.openCardId !== cardId || wasCollapsed) {
+    teacher.openCardId = cardId;
+    refreshTeacherMargins([previous?.anchor.segment_id, card.anchor.segment_id].filter(Boolean));
+  }
+  renderReadingTeacherNavigation();
+  if (scroll) article.scrollIntoView({ behavior: "smooth", block: "center" });
+  else {
+    const shift = article.getBoundingClientRect().top - before;
+    if (Math.abs(shift) > 0.5) window.scrollTo({ top: window.scrollY + shift, behavior: "instant" });
+  }
+  if (moveFocus) document.getElementById(savedHere ? `saved-definition-${savedHere.id}` : `teacher-card-${cardId}`)?.focus({ preventScroll: true });
+  if (window.CSS?.highlights && window.Highlight) {
+    const highlight = new window.Highlight(range);
+    window.CSS.highlights.set("reading-teacher-focus", highlight);
+    setTimeout(() => {
+      if (window.CSS.highlights.get("reading-teacher-focus") === highlight) window.CSS.highlights.delete("reading-teacher-focus");
+    }, 2200);
+  }
+}
+
+function closeReadingTeacherCard() {
+  const teacher = state.readingTeacher;
+  const card = readingTeacherCard(teacher.openCardId);
+  teacher.openCardId = "";
+  if (!card) return;
+  refreshTeacherMargins([card.anchor.segment_id]);
+  document.querySelector(`[data-teacher-open="${card.id}"]`)?.focus({ preventScroll: true });
+}
+
+function handleReadingTeacherSourceClick(event) {
+  if (!state.readingTeacher.enabled || state.workspaceMode === "think" || event.defaultPrevented
+    || event.button !== 0 || event.detail > 1 || event.ctrlKey || event.metaKey || event.altKey || event.shiftKey
+    || window.getSelection()?.toString() || event.target.closest("button, a, mark[data-annotation-id], img, svg")) return;
+  const source = event.target.closest('.source-text[data-target="source"]');
+  if (!source) return;
+  const cards = [...(state.readingTeacher.cardsBySegment.get(source.dataset.pid) || [])]
+    .sort((a, b) => Number(b.kind === "definition") - Number(a.kind === "definition"));
+  for (const card of cards) {
+    const range = state.readingTeacher.ranges.get(card.id);
+    if (range && [...range.getClientRects()].some(rect => event.clientX >= rect.left && event.clientX <= rect.right
+      && event.clientY >= rect.top && event.clientY <= rect.bottom)) {
+      focusTeacherSource(card.id, -1, { scroll: false });
+      return;
+    }
+  }
+}
+
+function teacherNoteSelection(card) {
+  const segment = state.payload?.segments?.find(item => item.id === card.anchor.segment_id);
+  if (!segment || segment.markdown !== card.anchor.source_markdown) throw new Error("Source changed; reload and verify the teaching card.");
+  const text = displayTextPreservingMath(segment.markdown, { trim: false });
+  const quote = displayTextPreservingMath(card.anchor.quote, { trim: false });
+  const range = rangeForQuote(text, quote);
+  if (!range || text.indexOf(quote, range.start + 1) >= 0) throw new Error("Teaching quote is not a unique source match.");
+  return { segment_id: segment.id, target: "source", quote, range };
+}
+
+function adoptedTeacherDefinition(cardId) {
+  return state.annotations.find(item => item.origin?.kind === "reading-teacher"
+    && item.origin.document_id === state.readingTeacher.data?.id && item.origin.card_id === cardId
+    && item.origin.content_type === "definition");
+}
+
+function teacherDefinitionNote(card, data = state.readingTeacher.data) {
+  const definition = card.definition;
+  const external = definition.external.map(item => {
+    if (item.kind === "ai-summary") return `AI 概括（未外部检索）\n${item.summary}`;
+    const source = data.sources.find(entry => entry.id === item.source_id);
+    if (!source) throw new Error("The definition's external source is no longer available.");
+    return `${source.title}\n${item.summary}\n${source.url}\nRetrieved: ${source.accessed_at}`;
+  });
+  const { quoted, label } = teacherPaperMeaning(card);
+  const externalLabel = definition.external.every(item => item.kind === "ai-summary") ? "一般含义" : "外部定义";
+  return `${card.title}\n\n来源：AI teacher 定义，用户主动采纳；不是用户原创。\n\n${label}（${quoted ? "原文" : "AI 概括"}）\n${definition.paper}\n原文位置：reader.md#${card.anchor.segment_id}\n\n${externalLabel}\n${external.join("\n\n")}${definition.comparison ? `\n\nAI 对照（不是作者原话）\n${definition.comparison}` : ""}`;
+}
+
+async function adoptTeacherDefinition(cardId) {
+  const teacher = state.readingTeacher;
+  const card = readingTeacherCard(cardId);
+  if (teacher.saving.has(cardId)) return;
+  if (!card?.definition) { toast("This definition is no longer available; reload and verify the teaching card."); return; }
+  const paperId = state.currentPaperId;
+  const existing = adoptedTeacherDefinition(cardId);
+  const write = state.paperSessions.get(paperId)?.writes.get("annotations");
+  if (existing && !write?.dirty) { openExistingAnnotationDrawer(existing.id); return; }
+  teacher.saving.add(cardId);
+  try {
+    if (!existing) {
+      const selection = teacherNoteSelection(card);
+      const now = new Date().toISOString();
+      const note = teacherDefinitionNote(card);
+      state.collapsedDefinitionNotes.delete(`ai-def-${teacher.data.id}-${card.id}`);
+      state.annotations.push({
+        id: `ai-def-${teacher.data.id}-${card.id}`, type: "range", ...selection, color: "blue",
+        note, tags: ["definition"], created_at: now, updated_at: now,
+        origin: JSON.parse(JSON.stringify({ kind: "reading-teacher", content_type: "definition", document_id: teacher.data.id,
+          card_id: card.id, title: card.title, initial_note: note, created_by: teacher.data.created_by, anchor: card.anchor,
+          definition: card.definition, sources: teacher.data.sources.filter(source =>
+            card.definition.external.some(item => item.source_id === source.id)) })),
+      });
+    }
+    await persistCurrentPaperAnnotations("", { segmentIds: [card.anchor.segment_id] });
+    if (state.currentPaperId === paperId) toast("Definition saved to Notes.");
+  } catch (error) {
+    console.error("Could not adopt teacher definition", error);
+    if (state.currentPaperId === paperId) toast(`Definition not saved: ${error.message}. Use Retry save.`);
+  } finally {
+    teacher.saving.delete(cardId);
+    if (state.currentPaperId === paperId && state.readingTeacher === teacher) refreshReadingTeacher();
+  }
+}
+
+function reflectOnTeacherCard(cardId) {
+  const card = readingTeacherCard(cardId);
+  if (!card) { toast("This teaching card is no longer available."); return; }
+  if (!isDeepTeacherCard(card)) { toast("Use the normal highlight or note controls for your own response."); return; }
+  try {
+    openAnnotationDrawer(card.anchor.segment_id, "yellow", {
+      ...teacherNoteSelection(card),
+      teacher_prompt: { document_id: state.readingTeacher.data.id, card_id: card.id, question: card.question },
+    });
+  } catch (error) {
+    toast(`Could not attach a reflection: ${error.message}`);
+  }
 }
 
 function skimSummaryHtml(markdown) {
@@ -6924,8 +8865,8 @@ function renderThinkingSpan(text, startOffset, annotations, target = "thinking",
   const localAnnotations = annotations.map(annotation => {
     let range = normalizedAnnotationRange(annotation, sourceText, target);
     if (annotation.quote) {
-      const quoted = displayText(annotation.quote);
-      const currentSlice = range ? displayText(sourceText.slice(range.start, range.end)) : "";
+      const quoted = displayTextPreservingMath(annotation.quote);
+      const currentSlice = range ? displayTextPreservingMath(sourceText.slice(range.start, range.end)) : "";
       if (!range || (quoted && currentSlice !== quoted && !currentSlice.includes(quoted))) {
         range = rangeForQuote(sourceText, quoted) || range;
       }
@@ -7042,7 +8983,11 @@ function applyThinkingHighlights(text, blockId) {
 function renderExplainPane() {
   const root = qs("#explainPane");
   if (!root || !state.thinking) return;
-  const content = state.thinking.explain.content || buildExplainSeedMarkdown();
+  const content = state.thinking.explain.content || "";
+  if (!content) {
+    root.innerHTML = '<p class="muted">No saved explanation. Original notes are kept without generating a summary.</p>';
+    return;
+  }
   root.innerHTML = `
     <div class="sense-section sense-explain">
       <div class="sense-section-heading">
@@ -7068,13 +9013,15 @@ function renderExplainPane() {
 }
 
 function paperBriefCardHtml() {
-  const content = state.thinking?.explain?.content || buildExplainSeedMarkdown();
+  const content = state.thinking?.explain?.content || "";
+  if (!content.trim()) return "";
   return `
-    <article class="paper-brief-card" id="paper-brief">
+    <details class="paper-brief-card" id="paper-brief">
+      <summary class="paper-brief-summary">Saved Paper Brief</summary>
       <div class="paper-brief-header">
         <div>
           <span class="sense-kicker">Paper Brief</span>
-          <h2>读前理解入口</h2>
+          <h2>已保存的解读</h2>
         </div>
         <button class="secondary-button" id="regeneratePaperBrief" type="button">Regenerate from PDF</button>
       </div>
@@ -7083,7 +9030,7 @@ function paperBriefCardHtml() {
         <summary>Edit paper brief</summary>
         <textarea id="paperBriefEditor" class="sense-textarea" rows="10" spellcheck="false">${escapeHtml(content)}</textarea>
       </details>
-    </article>`;
+    </details>`;
 }
 
 function bindPaperBriefCard() {
@@ -7107,6 +9054,7 @@ function refreshPaperBriefCard() {
   wrapper.innerHTML = paperBriefCardHtml().trim();
   const next = wrapper.firstElementChild;
   if (!next) return false;
+  next.open = card.open;
   card.replaceWith(next);
   bindPaperBriefCard();
   updateToolbarStatus();
@@ -7139,7 +9087,8 @@ async function regenerateExplanationFromPdf() {
     });
     state.thinking = normalizeThinkingData(response.thinking || state.thinking, { seed: false });
     if (state.payload) state.payload.thinking = state.thinking;
-    if (state.currentPaperId === paperId) await loadPaper(paperId);
+    invalidatePaperCache(paperId);
+    if (state.currentPaperId === paperId) await loadPaper(paperId, { force: true });
     setThinkingSaveState("Paper Brief regenerated", "saved");
     toast("Paper Brief regenerated");
   } catch (error) {
@@ -7213,7 +9162,7 @@ function selectionRefsHtml(refs = []) {
 }
 
 function modeLabel(mode) {
-  return mode === "source" ? "Source-grounded" : mode === "free" ? "Free reflection" : "Manual output";
+  return mode === "source" ? "Source-grounded" : mode === "free" ? "Free reflection" : mode === "reading_narrative" ? "Reading Narrative" : "Manual output";
 }
 
 function chatModeHint(mode = state.chatMode) {
@@ -7223,16 +9172,14 @@ function chatModeHint(mode = state.chatMode) {
 }
 
 function isAgentThinkingBlock(block) {
-  return ["source", "free"].includes(String(block?.mode || "")) || Boolean(block?.model);
+  return ["source", "free", "reading_narrative"].includes(String(block?.mode || "")) || Boolean(block?.model);
 }
 
 function thinkingBlockHeaderHtml(block) {
-  if (isAgentThinkingBlock(block)) {
-    return `<div class="thinking-block-delete-row"><button class="icon-button" data-delete-thinking-block="${escapeHtml(block.id)}" title="Delete block">x</button></div>`;
-  }
-  return `<div class="thinking-block-header">
-    <input class="thinking-title-input" data-thinking-prompt="${escapeHtml(block.id)}" value="${escapeHtml(block.prompt || block.title || "")}" aria-label="Prompt for AI output" placeholder="Prompt / question for this AI output" />
-    <button class="icon-button" data-delete-thinking-block="${escapeHtml(block.id)}" title="Delete block">x</button>
+  const label = block.mode === "reading_narrative" ? "Generated narrative" : isAgentThinkingBlock(block) ? "" : "Pasted response";
+  return `<div class="thinking-message-heading">
+    <span class="thinking-message-role">AI</span>
+    ${label ? `<span class="thinking-message-origin">${label}</span>` : ""}
   </div>`;
 }
 
@@ -7254,38 +9201,40 @@ function chatComposerHtml() {
   const project = currentPaperProject();
   const projectCardCount = projectContextCards(project).length;
   return `
-    <section class="sense-section thinking-agent-compose">
-      <div class="sense-section-heading">
-        <span class="sense-kicker">Think Agent</span>
-        <h3>Ask about this paper or riff on design ideas</h3>
-      </div>
-      <div class="thinking-chat-mode-shell">
-        <span class="thinking-chat-mode-label">Mode inside Sensemaking</span>
+    <section id="thinkingChatComposer" class="sense-section thinking-agent-compose" aria-label="Chat with AI">
+      <div class="thinking-chat-controls">
         <div class="thinking-chat-mode" role="group" aria-label="Agent mode">
-          <button class="thinking-chat-mode-button ${state.chatMode === "source" ? "active" : ""}" data-chat-mode="source" aria-pressed="${state.chatMode === "source" ? "true" : "false"}" type="button">Source-grounded</button>
-          <button class="thinking-chat-mode-button ${state.chatMode === "free" ? "active" : ""}" data-chat-mode="free" aria-pressed="${state.chatMode === "free" ? "true" : "false"}" type="button">Free reflection</button>
+          <button class="thinking-chat-mode-button ${state.chatMode === "source" ? "active" : ""}" data-chat-mode="source" aria-pressed="${state.chatMode === "source" ? "true" : "false"}" title="${escapeHtml(chatModeHint("source"))}" type="button" ${state.chatSending ? "disabled" : ""}>Source-grounded</button>
+          <button class="thinking-chat-mode-button ${state.chatMode === "free" ? "active" : ""}" data-chat-mode="free" aria-pressed="${state.chatMode === "free" ? "true" : "false"}" title="${escapeHtml(chatModeHint("free"))}" type="button" ${state.chatSending ? "disabled" : ""}>Free reflection</button>
         </div>
-        <p class="thinking-chat-mode-help">${escapeHtml(chatModeHint())}</p>
+        <label class="thinking-project-context-toggle ${projectCardCount ? "" : "disabled"}" title="${escapeHtml(project)} · ${escapeHtml(projectCardCount)} context cards">
+          <input id="useProjectContext" type="checkbox" ${state.chatUseProjectContext && projectCardCount ? "checked" : ""} ${projectCardCount && !state.chatSending ? "" : "disabled"} />
+          <span>Project context</span>
+        </label>
       </div>
       ${selectionRefs.length ? `<div class="thinking-chat-selection"><span>Quoted from paper</span>${selectionRefsHtml(selectionRefs)}<button class="icon-button" id="clearChatSelection" type="button" title="Clear quoted source">x</button></div>` : ""}
-      <label class="thinking-project-context-toggle ${projectCardCount ? "" : "disabled"}">
-        <input id="useProjectContext" type="checkbox" ${state.chatUseProjectContext && projectCardCount ? "checked" : ""} ${projectCardCount ? "" : "disabled"} />
-        <span>Use Project Context</span>
-        <small>${escapeHtml(project)} · ${escapeHtml(projectCardCount)} cards</small>
-      </label>
-      <textarea id="thinkingChatInput" class="sense-textarea" rows="4" placeholder="Ask the agent..." ${state.chatSending ? "disabled" : ""}>${escapeHtml(state.chatDraft || "")}</textarea>
-      <div class="thinking-chat-actions">
-        <button id="sendThinkingChat" class="primary-button" type="button" ${state.chatSending ? "disabled" : ""}>${state.chatSending ? "Thinking..." : "Send"}</button>
-        <details class="manual-ai-output-details">
-          <summary>Paste AI output manually</summary>
-          <div class="manual-ai-output-fields">
-            <input id="thinkingBlockPrompt" class="sense-input" placeholder="Prompt / question for this AI output (optional)" />
-            <textarea id="thinkingBlockContent" class="sense-textarea" rows="5" placeholder="Paste an AI-generated paragraph, outline, review, or draft here..."></textarea>
-            <button id="addThinkingBlock" class="secondary-button" type="button">Add AI Output</button>
-          </div>
-        </details>
+      <p id="thinkingChatError" class="thinking-chat-error" role="alert"${state.chatError ? "" : " hidden"}>${state.chatError ? `Reply failed: ${escapeHtml(state.chatError)}. Your question is kept below; send it again to retry.` : ""}</p>
+      <div class="thinking-chat-input-shell">
+        <textarea id="thinkingChatInput" class="sense-textarea" rows="2" aria-label="Message AI" title="Enter to send; Shift+Enter for a new line" placeholder="Message AI..." ${state.chatSending ? "disabled" : ""}>${escapeHtml(state.chatSending ? "" : state.chatDraft || "")}</textarea>
+        <div class="thinking-chat-actions">
+          <button id="sendThinkingChat" class="primary-button" type="button" ${state.chatSending ? "disabled" : ""}>Send</button>
+        </div>
       </div>
     </section>`;
+}
+
+function manualOutputComposerHtml() {
+  const draft = state.manualOutputDraft;
+  return `<section id="manualOutputComposer" class="manual-ai-output-fields" aria-label="Paste AI output">
+    <label class="sense-label" for="thinkingBlockPrompt">Original question (optional)</label>
+    <input id="thinkingBlockPrompt" class="sense-input" value="${escapeHtml(draft.prompt)}" placeholder="What did you ask the AI?" />
+    <label class="sense-label" for="thinkingBlockContent">AI response</label>
+    <textarea id="thinkingBlockContent" class="sense-textarea" rows="12" placeholder="Paste the full AI response here...">${escapeHtml(draft.content)}</textarea>
+    <div class="thinking-chat-actions">
+      <button id="addThinkingBlock" class="secondary-button" type="button">Save AI output</button>
+      <span class="manual-draft-status muted small-text" role="status"${draft.content || draft.prompt ? "" : " hidden"}>Unsaved draft</span>
+    </div>
+  </section>`;
 }
 
 function navigateThinkingSourceRef(ref) {
@@ -7331,12 +9280,14 @@ function bindThinkingSourceLinks() {
 async function sendThinkingChat() {
   if (!state.currentPaperId || !state.thinking || state.chatSending) return;
   const input = qs("#thinkingChatInput");
-  const message = (input?.value || state.chatDraft || "").trim();
-  if (!message) {
-    toast("Ask the agent something first");
+  const message = input?.value ?? state.chatDraft ?? "";
+  if (!message.trim()) {
+    toast("Write a message first");
     return;
   }
   state.chatDraft = message;
+  state.chatError = "";
+  state.chatScroll = { top: 0, atEnd: true };
   state.chatSending = true;
   renderWritingPane();
   setThinkingSaveState("Thinking...", "saving");
@@ -7351,12 +9302,42 @@ async function sendThinkingChat() {
     newBlockId = response.block?.id || state.thinking.blocks?.[0]?.id || "";
     state.chatDraft = "";
     state.chatSelectionDraft = null;
-    toast("AI output added");
   } catch (error) {
+    state.chatError = error.message;
     setThinkingSaveState("Generate failed", "error");
-    toast(`Agent failed: ${error.message}`);
+    toast(`Reply failed: ${error.message}`);
   } finally {
+    const followReply = state.chatScroll.atEnd;
+    const focus = document.activeElement;
+    const keepComposing = !focus || focus === document.body || Boolean(focus.closest?.("#thinkingChatComposer"));
     state.chatSending = false;
+    renderSensemakingPanel();
+    if (newBlockId && followReply) requestAnimationFrame(() => focusThinkingBlockCard(newBlockId));
+    else if (newBlockId) toast("New AI reply");
+    if (followReply && keepComposing) qs("#thinkingChatInput")?.focus({ preventScroll: true });
+  }
+}
+
+async function generateReadingNarrative() {
+  if (!state.currentPaperId || !state.thinking || state.readingNarrativeGenerating) return;
+  state.readingNarrativeGenerating = true;
+  renderWritingPane();
+  setThinkingSaveState("Generating narrative...", "saving");
+  let newBlockId = "";
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/reading-narrative`, {
+      method: "POST",
+      body: JSON.stringify({ use_project_context: state.chatUseProjectContext, project: currentPaperProject() }),
+    });
+    state.thinking = normalizeThinkingData(response.thinking || state.thinking, { seed: false });
+    if (state.payload) state.payload.thinking = state.thinking;
+    newBlockId = response.block?.id || state.thinking.blocks?.[0]?.id || "";
+    toast("Reading narrative added");
+  } catch (error) {
+    setThinkingSaveState("Narrative failed", "error");
+    toast(`Narrative failed: ${error.message}`);
+  } finally {
+    state.readingNarrativeGenerating = false;
     renderSensemakingPanel();
     if (newBlockId) requestAnimationFrame(() => focusThinkingBlockCard(newBlockId));
   }
@@ -7370,10 +9351,12 @@ function askAiFromCurrentSelection() {
   }
   const y = window.scrollY || document.documentElement.scrollTop || 0;
   state.chatMode = "source";
+  state.thinkingComposerMode = "chat";
   state.chatSelectionDraft = selection;
   state.chatDraft = "请解释这段原文在论文中的含义，并说明它回答了什么问题。";
   activateView("reader");
   setWorkspaceMode("split");
+  setReaderSidePane("sensemaking");
   state.thinkingTab = "writing";
   renderSensemakingPanel();
   requestAnimationFrame(() => {
@@ -7383,32 +9366,74 @@ function askAiFromCurrentSelection() {
 }
 
 function thinkingBlockHtml(block) {
-  const projectContext = block.project_context && block.project_context.card_count ? `<div class="thinking-context-chip">Used Project Context · ${escapeHtml(block.project_context.project || "project")} · ${escapeHtml(block.project_context.card_count)} cards</div>` : "";
-  const promptHtml = block.prompt ? `<div class="thinking-block-prompt"><span>${escapeHtml(modeLabel(block.mode))}</span><p>${escapeHtml(block.prompt)}</p>${selectionRefsHtml(block.selection_refs)}${projectContext}</div>` : "";
+  const projectContext = block.project_context && block.project_context.card_count ? `<span>Project context: ${escapeHtml(block.project_context.project || "project")} · ${escapeHtml(block.project_context.card_count)} cards</span>` : "";
+  const promptHtml = block.prompt ? `<div class="thinking-message thinking-message-user"><span class="thinking-message-role">${block.mode === "reading_narrative" ? "Request" : "You"}</span><div class="thinking-block-prompt"><p>${escapeHtml(block.prompt)}</p>${selectionRefsHtml(block.selection_refs)}</div></div>` : "";
   const sourceLinks = hasInlineParagraphRefs(block.content) ? "" : sourceRefsHtml(block.source_refs);
   return `
     <section class="thinking-block" data-thinking-block-card="${escapeHtml(block.id)}">
-      ${thinkingBlockHeaderHtml(block)}
       ${promptHtml}
-      <div class="thinking-block-body">
-        <div class="thinking-text" data-thinking-block="${escapeHtml(block.id)}" tabindex="0">${applyThinkingHighlights(block.content || "", block.id)}</div>
+      <div class="thinking-message thinking-message-ai">
+        ${thinkingBlockHeaderHtml(block)}
+        <div class="thinking-block-body">
+          <div class="thinking-text" data-thinking-block="${escapeHtml(block.id)}" tabindex="0" aria-label="AI response">${applyThinkingHighlights(block.content || "", block.id)}</div>
+        </div>
+        ${thinkingAnnotationCardsHtml(block.id)}
+        ${sourceLinks}
+        <details class="thinking-edit-details">
+          <summary>Message options</summary>
+          <div class="thinking-message-details">
+            <span>${escapeHtml(modeLabel(block.mode))}${block.model ? ` · ${escapeHtml(block.model)}` : ""}</span>
+            ${projectContext}
+          </div>
+          ${!isAgentThinkingBlock(block) ? `<label class="sense-label">Original question<input class="sense-input" data-thinking-prompt="${escapeHtml(block.id)}" value="${escapeHtml(block.prompt || block.title || "")}" /></label>` : ""}
+          <label class="sense-label">Edit reply<textarea class="sense-textarea" data-thinking-content="${escapeHtml(block.id)}" rows="8" spellcheck="false">${escapeHtml(block.content || "")}</textarea></label>
+          <button class="secondary-button thinking-delete-message" data-delete-thinking-block="${escapeHtml(block.id)}" type="button">Delete conversation turn</button>
+        </details>
       </div>
-      ${thinkingAnnotationCardsHtml(block.id)}
-      ${sourceLinks}
-      <details class="thinking-edit-details">
-        <summary>Edit AI output text</summary>
-        <textarea class="sense-textarea" data-thinking-content="${escapeHtml(block.id)}" rows="8" spellcheck="false">${escapeHtml(block.content || "")}</textarea>
-      </details>
     </section>`;
+}
+
+function rememberThinkingChatScroll(history) {
+  if (!history?.isConnected || !history.clientHeight || history.dataset.paperId !== state.currentPaperId) return;
+  state.chatScroll = {
+    top: history.scrollTop,
+    atEnd: history.scrollHeight - history.clientHeight - history.scrollTop < 24,
+  };
+}
+
+function restoreThinkingChatScroll() {
+  const history = qs("#thinkingChatHistory");
+  const position = state.chatScroll;
+  if (!history || history.dataset.paperId !== state.currentPaperId) return;
+  requestAnimationFrame(() => {
+    if (!history.isConnected || !history.clientHeight || history.dataset.paperId !== state.currentPaperId) return;
+    history.scrollTop = position.atEnd ? history.scrollHeight : position.top;
+  });
+}
+
+function resizeThinkingChatInput() {
+  const input = qs("#thinkingChatInput");
+  if (!input?.clientHeight) return;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(160, input.scrollHeight)}px`;
+  if (state.chatScroll.atEnd) restoreThinkingChatScroll();
+}
+
+function scrollThinkingContentIntoView(node, align = "start") {
+  const history = node.closest("#thinkingChatHistory");
+  if (!history) {
+    node.scrollIntoView({ behavior: "smooth", block: align });
+    return;
+  }
+  const inset = align === "center" ? Math.max(12, (history.clientHeight - node.offsetHeight) / 2) : 12;
+  history.scrollTop += node.getBoundingClientRect().top - history.getBoundingClientRect().top - inset;
+  rememberThinkingChatScroll(history);
 }
 
 function focusThinkingBlockCard(blockId) {
   const card = document.querySelector(`[data-thinking-block-card="${cssEscape(blockId)}"]`);
-  if (!card) {
-    qs("#sensemakingPanel")?.scrollTo({ top: 0, behavior: "smooth" });
-    return;
-  }
-  card.scrollIntoView({ behavior: "smooth", block: "start" });
+  if (!card) return;
+  scrollThinkingContentIntoView(card);
   card.classList.add("focus-flash");
   setTimeout(() => card.classList.remove("focus-flash"), 1200);
 }
@@ -7446,25 +9471,63 @@ function bindThinkingAnnotationControls(root = document) {
 function renderWritingPane() {
   const root = qs("#writingPane");
   if (!root || !state.thinking) return;
-  const blocks = state.thinking.blocks || [];
+  const blocks = [...(state.thinking.blocks || [])].reverse();
+  const manual = state.thinkingComposerMode === "paste";
   root.innerHTML = `
-    <div class="thinking-block-list">
-      ${blocks.length ? blocks.map(thinkingBlockHtml).join("") : '<p class="muted">Paste AI outputs here, then highlight key phrases and attach your own thoughts.</p>'}
+    <div id="thinkingChatHistory" class="thinking-block-list" role="log" aria-label="Conversation" aria-live="off" data-paper-id="${escapeHtml(state.currentPaperId)}">
+      ${blocks.map(thinkingBlockHtml).join("")}
+      ${state.chatSending ? `<section class="thinking-block thinking-pending-turn" data-chat-pending>
+        <div class="thinking-message thinking-message-user"><span class="thinking-message-role">You</span><div class="thinking-block-prompt"><p>${escapeHtml(state.chatDraft)}</p></div></div>
+        <div class="thinking-message thinking-message-ai"><span class="thinking-message-role">AI</span><p class="thinking-chat-pending" role="status">Thinking...</p></div>
+      </section>` : ""}
     </div>
-    ${chatComposerHtml()}`;
+    <div class="thinking-compose-dock">
+      <div class="thinking-compose-modes" role="group" aria-label="Message input">
+        <button class="reader-side-tab ${manual ? "" : "active"}" data-thinking-composer="chat" aria-pressed="${!manual}" type="button" ${state.chatSending ? "disabled" : ""}>Chat</button>
+        <button class="reader-side-tab ${manual ? "active" : ""}" data-thinking-composer="paste" aria-pressed="${manual}" type="button" ${state.chatSending ? "disabled" : ""}>Paste AI output</button>
+      </div>
+      ${manual ? manualOutputComposerHtml() : chatComposerHtml()}
+    </div>`;
+  const history = qs("#thinkingChatHistory");
+  history.addEventListener("scroll", () => rememberThinkingChatScroll(history), { passive: true });
+  resizeThinkingChatInput();
+  restoreThinkingChatScroll();
+  qsa("[data-thinking-composer]").forEach(button => button.addEventListener("click", () => {
+    state.thinkingComposerMode = button.dataset.thinkingComposer;
+    renderWritingPane();
+    qs(state.thinkingComposerMode === "paste" ? "#thinkingBlockContent" : "#thinkingChatInput")?.focus({ preventScroll: true });
+  }));
   qsa("[data-chat-mode]").forEach(button => button.addEventListener("click", () => {
     state.chatMode = button.dataset.chatMode || "source";
     renderWritingPane();
   }));
-  qs("#thinkingChatInput")?.addEventListener("input", event => { state.chatDraft = event.target.value; });
+  qs("#thinkingChatInput")?.addEventListener("input", event => {
+    state.chatDraft = event.target.value;
+    state.chatError = "";
+    qs("#thinkingChatError").hidden = true;
+    resizeThinkingChatInput();
+  });
+  const updateManualDraftStatus = () => {
+    const status = qs(".manual-draft-status");
+    if (status) status.hidden = !state.manualOutputDraft.prompt && !state.manualOutputDraft.content;
+  };
+  qs("#thinkingBlockPrompt")?.addEventListener("input", event => {
+    state.manualOutputDraft.prompt = event.target.value;
+    updateManualDraftStatus();
+  });
+  qs("#thinkingBlockContent")?.addEventListener("input", event => {
+    state.manualOutputDraft.content = event.target.value;
+    updateManualDraftStatus();
+  });
   qs("#useProjectContext")?.addEventListener("change", event => { state.chatUseProjectContext = event.target.checked; });
   qs("#thinkingChatInput")?.addEventListener("keydown", event => {
-    if (event.key === "Enter" && !event.shiftKey) {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
       event.preventDefault();
       sendThinkingChat();
     }
   });
   qs("#sendThinkingChat")?.addEventListener("click", sendThinkingChat);
+  qs("#generateReadingNarrative")?.addEventListener("click", generateReadingNarrative);
   qs("#clearChatSelection")?.addEventListener("click", () => {
     state.chatSelectionDraft = null;
     renderWritingPane();
@@ -7496,6 +9559,7 @@ function renderSensemakingPanel() {
     updateAnnotationToolbarVisibility();
     return;
   }
+  if (state.workspaceMode === "read") return;
   if (!state.thinking) state.thinking = normalizeThinkingData(state.payload.thinking || {});
   renderExplainPane();
   renderWritingPane();
@@ -7503,12 +9567,12 @@ function renderSensemakingPanel() {
   updateAnnotationToolbarVisibility();
 }
 
-function addThinkingBlockFromForm() {
+async function addThinkingBlockFromForm() {
   if (!state.thinking) return;
   const promptInput = qs("#thinkingBlockPrompt");
   const contentInput = qs("#thinkingBlockContent");
-  const content = contentInput?.value?.trim() || "";
-  if (!content) {
+  const content = contentInput?.value || "";
+  if (!content.trim()) {
     toast("Paste an AI output first");
     return;
   }
@@ -7517,16 +9581,23 @@ function addThinkingBlockFromForm() {
     id: `tb-${Date.now().toString(36)}`,
     type: "ai_output",
     title: "AI output",
-    prompt: promptInput?.value?.trim() || "",
+    prompt: promptInput?.value || "",
     content,
     created_at: now,
     updated_at: now,
   });
   if (promptInput) promptInput.value = "";
   if (contentInput) contentInput.value = "";
+  state.manualOutputDraft = { prompt: "", content: "" };
   renderSensemakingPanel();
   requestAnimationFrame(() => focusThinkingBlockCard(state.thinking.blocks[0]?.id || ""));
-  saveThinking({ silent: true }).then(() => toast("AI output added"));
+  try {
+    await saveThinking({ silent: true });
+    toast("AI output saved");
+  } catch (error) {
+    setThinkingSaveState("Save failed", "error");
+    toast(`AI output is not saved: ${error.message}. Keep this tab open and retry.`);
+  }
 }
 
 function updateThinkingBlockField(blockId, field, value) {
@@ -7540,14 +9611,14 @@ function updateThinkingBlockField(blockId, field, value) {
 async function deleteThinkingBlock(blockId) {
   if (!state.thinking || !blockId) return;
   const block = thinkingBlockById(blockId);
-  const confirmed = window.confirm(`Delete this AI output block?\n\n${block?.prompt || block?.title || blockId}`);
+  const confirmed = window.confirm(`Delete this conversation turn and its highlights/notes?\n\n${block?.prompt || block?.title || blockId}`);
   if (!confirmed) return;
   try {
     const response = await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/thinking/blocks/${encodeURIComponent(blockId)}`, { method: "DELETE" });
     state.thinking = normalizeThinkingData(response.thinking || state.thinking, { seed: false });
     if (state.payload) state.payload.thinking = state.thinking;
     renderSensemakingPanel();
-    toast("AI output deleted");
+    toast("Conversation turn deleted");
   } catch (error) {
     toast(`Delete failed: ${error.message}`);
   }
@@ -7580,6 +9651,7 @@ function getThinkingSelection(blockId = "") {
 }
 
 function openThinkingAnnotationDrawer(blockId, color, selectionInfo = null) {
+  if (noteDrawerHasChanges() && !closeDrawer()) return;
   const selection = selectionInfo || getThinkingSelection(blockId);
   if (!selection) {
     toast("Select text inside this AI output first");
@@ -7597,6 +9669,7 @@ function openThinkingAnnotationDrawer(blockId, color, selectionInfo = null) {
 }
 
 function openExistingThinkingAnnotationDrawer(annotationId) {
+  if (noteDrawerHasChanges() && !closeDrawer()) return;
   const annotation = state.thinking?.annotations?.find(item => item.id === annotationId);
   if (!annotation) return;
   const block = thinkingBlockById(annotation.block_id);
@@ -7630,11 +9703,11 @@ async function savePendingThinkingAnnotation(includeNote) {
     const annotation = state.thinking.annotations.find(item => item.id === state.pendingThinkingAnnotation.editing_id);
     if (!annotation) return;
     const blockId = annotation.block_id;
-    annotation.note = includeNote ? qs("#noteText").value.trim() : "";
+    annotation.note = includeNote ? qs("#noteText").value : annotation.note || "";
     annotation.tags = selectedDrawerTags();
     annotation.updated_at = new Date().toISOString();
+    closeDrawer({ saved: true });
     await saveThinking({ silent: true });
-    closeDrawer();
     refreshThinkingAnnotationSurfaces(blockId);
     toast("Note updated");
     return;
@@ -7644,14 +9717,14 @@ async function savePendingThinkingAnnotation(includeNote) {
     type: "range",
     target: "thinking",
     ...state.pendingThinkingAnnotation,
-    note: includeNote ? qs("#noteText").value.trim() : "",
+    note: includeNote ? qs("#noteText").value : "",
     tags: selectedDrawerTags(),
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
   state.thinking.annotations.push(item);
+  closeDrawer({ saved: true });
   await saveThinking({ silent: true });
-  closeDrawer();
   refreshThinkingAnnotationSurfaces(item.block_id);
   toast("Saved locally");
 }
@@ -7668,7 +9741,7 @@ function focusThinkingAnnotation(annotationId) {
     if (annotation?.block_id) setWorkspaceMode("think");
     return;
   }
-  mark.scrollIntoView({ behavior: "smooth", block: "center" });
+  scrollThinkingContentIntoView(mark, "center");
   mark.classList.add("focus-flash");
   setTimeout(() => mark.classList.remove("focus-flash"), 1200);
 }
@@ -7684,13 +9757,16 @@ async function deleteThinkingAnnotation(annotationId) {
 
 async function deleteThinkingAnnotationFromPaper(paperId, annotationId) {
   if (!paperId || !annotationId) return;
+  if (paperId === state.currentPaperId) {
+    await deleteThinkingAnnotation(annotationId);
+    refreshAllNotesInBackground();
+    return;
+  }
   const payload = paperId === state.currentPaperId ? state.payload : await api(`/api/papers/${encodeURIComponent(paperId)}`);
   const thinking = normalizeThinkingData(payload?.thinking || {}, { seed: false });
   thinking.annotations = (thinking.annotations || []).filter(item => item.id !== annotationId);
-  const response = await api(`/api/papers/${encodeURIComponent(paperId)}/thinking`, {
-    method: "POST",
-    body: JSON.stringify(thinking),
-  });
+  const response = await queuePaperWrite(paperId, "thinking", thinking);
+  invalidatePaperCache(paperId);
   state.notesPreviewCache.delete(paperId);
   if (paperId === state.currentPaperId) {
     state.thinking = normalizeThinkingData(response.thinking || thinking, { seed: false });
@@ -7742,12 +9818,17 @@ function bindReaderProcessButtons() {
 }
 
 function renderReader() {
+  renderTranslationStatus();
+  updateMarginLayout();
+  renderReadingTeacherStatus();
   if (!state.payload) {
     disconnectReadingProgressTracker();
     const toolbar = qs("#annotationToolbar");
     if (toolbar) toolbar.style.display = "none";
     qs("#paperMeta").innerHTML = '<div class="meta-title">No paper selected</div>';
     qs("#documentRoot").innerHTML = '<p class="muted">Add a PDF in Library to begin.</p>';
+    window.CSS?.highlights?.delete("reading-teacher");
+    window.CSS?.highlights?.delete("reading-teacher-focus");
     renderSensemakingPanel();
     return;
   }
@@ -7758,15 +9839,26 @@ function renderReader() {
   const mode = processingMode(metadata);
   const status = processingStatus(metadata);
   updateAnnotationToolbarVisibility();
+  if (!paragraphs.length && paperParsingPending(metadata)) {
+    disconnectReadingProgressTracker();
+    root.innerHTML = '<section class="process-card"><h2>正在准备 Markdown 原文</h2></section>';
+    renderSensemakingPanel();
+    return;
+  }
+  if (!paragraphs.length && status === "failed") {
+    disconnectReadingProgressTracker();
+    root.innerHTML = `<section class="process-card"><h2>PDF 解析失败</h2><p class="error-text">${escapeHtml(metadata.processing_error || "请检查 PDF 和本地解析器。")}</p><button class="secondary-button" data-process-paper="${escapeHtml(state.currentPaperId)}" data-mode="deep">重试解析原文</button></section>`;
+    bindReaderProcessButtons();
+    renderSensemakingPanel();
+    return;
+  }
   if (mode === "library-only" || status === "not_processed") {
     disconnectReadingProgressTracker();
     root.innerHTML = `
       <section class="process-card" id="skim-summary">
-        <h2>这篇论文还在 Library 里，尚未处理</h2>
-        <p>先选择略读或精读。略读只生成主干摘要，精读会运行全文解析、图表和逐段翻译。</p>
+        <h2>准备阅读全文</h2>
         <div class="process-actions">
-          <button class="primary-button" data-process-paper="${escapeHtml(state.currentPaperId)}" data-mode="skim">略读</button>
-          <button class="secondary-button" data-process-paper="${escapeHtml(state.currentPaperId)}" data-mode="deep">精读</button>
+          <button class="primary-button" data-process-paper="${escapeHtml(state.currentPaperId)}" data-mode="deep">解析原文并阅读</button>
         </div>
       </section>`;
     bindReaderProcessButtons();
@@ -7788,7 +9880,7 @@ function renderReader() {
       <article class="process-card skim-card" id="skim-summary">
         <div class="skim-card-header">
           <span class="pill">略读模式</span>
-          <button class="secondary-button" data-process-paper="${escapeHtml(state.currentPaperId)}" data-mode="deep">升级为精读</button>
+          <button class="secondary-button" data-process-paper="${escapeHtml(state.currentPaperId)}" data-mode="deep">解析 PDF 全文</button>
         </div>
         <h2>略读模式</h2>
         <p>这里保持轻量：先抓论文主线、贡献和可写作的切入点。右侧 Sensemaking 可以粘贴 AI output，并按时间继续批注你的想法。</p>
@@ -7801,6 +9893,7 @@ function renderReader() {
   root.innerHTML = `${paperBriefCardHtml()}${paragraphs.map(paragraphHtml).join("")}`;
   bindPaperBriefCard();
   bindReaderDynamicEvents(root);
+  refreshReadingTeacher();
   updateToolbarStatus();
   initReadingProgressTracker();
   renderSensemakingPanel();
@@ -7827,11 +9920,63 @@ function bindReaderDynamicEvents(root = document) {
       if (event.target.closest("[data-delete-annotation], [data-edit-annotation]")) return;
       focusAnnotation(button.dataset.jumpAnnotation);
     });
-    button.addEventListener("keydown", event => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        focusAnnotation(button.dataset.jumpAnnotation);
-      }
+  });
+  readerScoped(root, "[data-expand-annotation]").forEach(button => {
+    button.addEventListener("click", () => {
+      const id = button.dataset.expandAnnotation;
+      const expanded = !state.expandedMarginNotes.has(id);
+      if (expanded) state.expandedMarginNotes.add(id);
+      else state.expandedMarginNotes.delete(id);
+      button.closest(".comment-card").classList.toggle("is-collapsed", !expanded);
+      button.setAttribute("aria-expanded", String(expanded));
+      button.textContent = expanded ? "Show less" : "Read full note";
+    });
+  });
+  readerScoped(root, "[data-teacher-source]").forEach(button => {
+    button.addEventListener("click", () => focusTeacherSource(button.dataset.teacherSource, Number(button.dataset.evidenceIndex)));
+  });
+  readerScoped(root, "[data-teacher-open]").forEach(button => {
+    button.addEventListener("click", () => focusTeacherSource(button.dataset.teacherOpen, -1, { scroll: false, moveFocus: true }));
+  });
+  readerScoped(root, "[data-teacher-close]").forEach(button => {
+    button.addEventListener("click", closeReadingTeacherCard);
+  });
+  readerScoped(root, "[data-teacher-card]").forEach(card => {
+    card.addEventListener("keydown", event => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeReadingTeacherCard();
+    });
+  });
+  readerScoped(root, "[data-teacher-reflect]").forEach(button => {
+    button.addEventListener("click", () => reflectOnTeacherCard(button.dataset.teacherReflect));
+  });
+  readerScoped(root, "[data-teacher-adopt]").forEach(button => {
+    button.addEventListener("click", () => adoptTeacherDefinition(button.dataset.teacherAdopt));
+  });
+  readerScoped(root, "[data-open-definition-note]").forEach(button => {
+    button.addEventListener("click", () => toggleSavedDefinitionNote(button.dataset.openDefinitionNote, true));
+  });
+  readerScoped(root, "[data-close-definition-note]").forEach(button => {
+    button.addEventListener("click", () => toggleSavedDefinitionNote(button.dataset.closeDefinitionNote, false));
+  });
+  readerScoped(root, "[data-retry-definition-save]").forEach(button => {
+    button.addEventListener("click", () => retrySavedDefinitionNote(button.dataset.retryDefinitionSave));
+  });
+  readerScoped(root, "[data-saved-definition]").forEach(card => {
+    card.addEventListener("keydown", event => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      event.stopPropagation();
+      toggleSavedDefinitionNote(card.dataset.savedDefinition, false);
+    });
+  });
+  readerScoped(root, "[data-teacher-disclosure]").forEach(details => {
+    details.addEventListener("toggle", () => {
+      if (!details.isConnected) return;
+      if (details.open) state.readingTeacher.openDetails.add(details.dataset.teacherDisclosure);
+      else state.readingTeacher.openDetails.delete(details.dataset.teacherDisclosure);
     });
   });
   readerScoped(root, "[data-delete-annotation]").forEach(button => {
@@ -7874,6 +10019,7 @@ function refreshReaderSegments(segmentIds = []) {
     refreshed = true;
   }
   if (refreshed) {
+    refreshReadingTeacher();
     updateToolbarStatus();
     applyReadingProgressDecorations();
   }
@@ -7921,17 +10067,33 @@ function openFigureModal(number) {
 }
 
 function openFigureModalBySrc(src) {
-  const figure = Object.values(state.figures).find(item => item.src === src) || { number: "", src, caption: "" };
+  const figure = Object.values(state.figures).find(item => item.src === src || item.images?.some(image => image.src === src)) || { number: "", src, caption: "" };
   renderFigureModal(figure);
 }
 
 function renderFigureModal(figure) {
   const modal = ensureFigureModal();
   const body = qs("#figureModalBody");
+  const images = figure.images?.length ? figure.images : figure.src ? [{ src: figure.src }] : [];
+  const page = Number(figure.page);
+  const pdfUrl = `/api/papers/${encodeURIComponent(state.currentPaperId)}/pdf${Number.isInteger(page) && page > 0 ? `#page=${page}` : ""}`;
   qs("#figureModalTitle").textContent = figure.number ? `Figure ${figure.number}` : "Figure";
   body.innerHTML = `
-    ${figure.src ? `<img class="figure-modal-image" src="${escapeHtml(figure.src)}" alt="${escapeHtml(figure.caption || "Paper figure")}">` : '<p class="muted">No figure image was found for this caption.</p>'}
+    <div class="figure-source-actions">
+      ${images.length > 1 ? `<p>Showing ${images.length} extracted parts together. For the original layout, open the PDF.</p>` : ""}
+      ${state.payload?.metadata?.source_pdf ? `<a class="secondary-button mini-button" href="${escapeHtml(pdfUrl)}" target="_blank" rel="noopener">Open original PDF${Number.isInteger(page) && page > 0 ? ` · page ${page}` : ""}</a>` : ""}
+    </div>
+    ${images.length ? images.map((image, index) => `<figure class="figure-part">
+      <img class="figure-modal-image" src="${escapeHtml(image.src)}" alt="${escapeHtml(figure.number ? `Figure ${figure.number}, part ${index + 1}` : "Paper figure")}" decoding="async">
+      ${images.length > 1 ? `<figcaption>Part ${index + 1} / ${images.length}</figcaption>` : ""}
+    </figure>`).join("") : '<p class="muted">No complete figure image was found. Please use the original PDF.</p>'}
     ${figure.caption ? `<p class="figure-caption-text">${escapeHtml(figure.caption)}</p>` : ""}`;
+  body.querySelectorAll("img").forEach(image => image.addEventListener("error", () => {
+    const message = document.createElement("p");
+    message.className = "figure-image-error";
+    message.textContent = "This extracted image is unavailable. Check the original PDF.";
+    image.replaceWith(message);
+  }, { once: true }));
   modal.classList.add("open");
   modal.setAttribute("aria-hidden", "false");
 }
@@ -7980,21 +10142,26 @@ async function openReferenceModal(numbers) {
 
 async function loadReferenceCard(number) {
   if (state.referenceLoads[number]) return state.referenceLoads[number];
-  state.referenceLoads[number] = loadReferenceCardOnce(number).finally(() => {
-    delete state.referenceLoads[number];
+  const loads = state.referenceLoads;
+  loads[number] = loadReferenceCardOnce(number).finally(() => {
+    delete loads[number];
   });
-  return state.referenceLoads[number];
+  return loads[number];
 }
 
 async function loadReferenceCardOnce(number) {
+  const paperId = state.currentPaperId;
   const selector = `[data-reference-card="${cssEscape(number)}"]`;
   const cardNode = document.querySelector(selector);
+  captureReferenceIntakeDraft(number);
   try {
-    const data = await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/references/${encodeURIComponent(number)}`);
+    const data = await api(`/api/papers/${encodeURIComponent(paperId)}/references/${encodeURIComponent(number)}`);
+    if (paperId !== state.currentPaperId) return;
     state.references[number] = data.reference;
     const latestNode = document.querySelector(selector) || cardNode;
     if (latestNode) latestNode.outerHTML = referenceCardHtml(data.reference);
   } catch (error) {
+    if (paperId !== state.currentPaperId) return;
     if (cardNode) cardNode.outerHTML = referenceCardHtml({ number, raw: `Reference [${number}] not found`, error: error.message });
   }
   bindReferenceAddButtons();
@@ -8023,6 +10190,48 @@ function bindReferenceAddButtons() {
     if (button.dataset.bound === "true") return;
     button.dataset.bound = "true";
     button.addEventListener("click", () => setReferenceImportance(button.dataset.referenceImportance, button.dataset.importanceLevel));
+  });
+  bindReferenceDraftInputs();
+}
+
+function emptyReferenceIntakeDraft() {
+  return { selectedTag: "", customTag: "", selectedProject: "", customProject: "", importance: 0 };
+}
+
+function referenceIntakeDraft(number) {
+  const key = String(number || "");
+  if (!state.referenceIntakeDrafts[key]) state.referenceIntakeDrafts[key] = emptyReferenceIntakeDraft();
+  return state.referenceIntakeDrafts[key];
+}
+
+function patchReferenceIntakeDraft(number, patch = {}) {
+  const key = String(number || "");
+  if (!key) return emptyReferenceIntakeDraft();
+  state.referenceIntakeDrafts[key] = { ...referenceIntakeDraft(key), ...patch };
+  return state.referenceIntakeDrafts[key];
+}
+
+function captureReferenceIntakeDraft(number) {
+  const key = String(number || "");
+  if (!key) return emptyReferenceIntakeDraft();
+  const node = document.querySelector(`[data-reference-card="${cssEscape(key)}"]`);
+  if (!node) return referenceIntakeDraft(key);
+  return patchReferenceIntakeDraft(key, {
+    selectedTag: node.querySelector(`[data-reference-tag-select="${cssEscape(key)}"]`)?.value?.trim() || "",
+    customTag: node.querySelector(`[data-reference-tag-input="${cssEscape(key)}"]`)?.value?.trim() || "",
+    selectedProject: normalizeProjectName(node.querySelector(`[data-reference-project-select="${cssEscape(key)}"]`)?.value || ""),
+    customProject: normalizeProjectName(node.querySelector(`[data-reference-project-input="${cssEscape(key)}"]`)?.value || ""),
+    importance: selectedReferenceImportance(key),
+  });
+}
+
+function bindReferenceDraftInputs() {
+  qsa("[data-reference-tag-select], [data-reference-tag-input], [data-reference-project-select], [data-reference-project-input]").forEach(input => {
+    if (input.dataset.draftBound === "true") return;
+    input.dataset.draftBound = "true";
+    const number = input.dataset.referenceTagSelect || input.dataset.referenceTagInput || input.dataset.referenceProjectSelect || input.dataset.referenceProjectInput || "";
+    const eventName = input.tagName === "SELECT" ? "change" : "input";
+    input.addEventListener(eventName, () => captureReferenceIntakeDraft(number));
   });
 }
 
@@ -8058,6 +10267,7 @@ function setReferenceImportance(number, level) {
   if (label) label.textContent = next ? `${next}/${maxImportanceStars}` : "No stars";
   const editor = document.querySelector(`[data-reference-card="${cssEscape(number)}"] .importance-star-editor`);
   editor?.classList.toggle("is-empty", !next);
+  patchReferenceIntakeDraft(number, { importance: next });
 }
 
 async function openExistingReferencePaper(paperId) {
@@ -8071,9 +10281,11 @@ function referenceCardHtml(card) {
   const number = card.number || card.id || "";
   const abstract = card.abstract || "";
   const abstractZh = card.abstract_zh || "";
+  const pdfUrl = card.pdf_url || card.open_access_pdf_url || card.arxiv_pdf_url || "";
   const tagOptions = allLibraryTags();
   const projectOptions = allLibraryProjects();
   const existingPaper = libraryDuplicateByTitle(card.title || "");
+  const draft = referenceIntakeDraft(number);
   return `
     <section class="reference-card" data-reference-card="${escapeHtml(number)}">
       <div class="reference-raw">${escapeHtml(card.raw || "")}</div>
@@ -8081,33 +10293,33 @@ function referenceCardHtml(card) {
         ${existingPaper
           ? `<button class="secondary-button reference-add-button" disabled type="button">已在 Library</button><button class="secondary-button" data-open-existing-reference="${escapeHtml(existingPaper.id)}" type="button">Open existing</button>`
           : `<button class="primary-button reference-add-button" data-add-reference="${escapeHtml(number)}">+ 添加</button>`}
-        <span class="reference-help">${existingPaper ? `Already in Library · ${escapeHtml(duplicatePaperSummary(existingPaper) || paperTitle(existingPaper))}` : card.loadingOnline && !abstract ? "已显示本地解析，正在后台补在线摘要..." : "添加该文章以便稍后阅读，status: unread"}</span>
+        <span class="reference-help">${existingPaper ? `Already in Library · ${escapeHtml(duplicatePaperSummary(existingPaper) || paperTitle(existingPaper))}` : card.loadingOnline && !abstract ? "已显示本地解析，正在后台补在线摘要..." : pdfUrl ? "添加后会尝试自动下载开放 PDF" : "添加该文章以便稍后阅读，status: unread"}</span>
         ${existingPaper ? "" : `<div class="reference-intake-grid">
           <label class="reference-field">
             <span>Paper tag</span>
             <select data-reference-tag-select="${escapeHtml(number)}">
               <option value="">Add existing tag...</option>
-              ${tagOptions.map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(libraryTagLabel(tag))}</option>`).join("")}
+              ${tagOptions.map(tag => `<option value="${escapeHtml(tag)}" ${tag === draft.selectedTag ? "selected" : ""}>${escapeHtml(libraryTagLabel(tag))}</option>`).join("")}
             </select>
           </label>
           <label class="reference-field">
             <span>Custom tag</span>
-            <input data-reference-tag-input="${escapeHtml(number)}" placeholder="Custom tag" />
+            <input data-reference-tag-input="${escapeHtml(number)}" placeholder="Custom tag" value="${escapeHtml(draft.customTag)}" />
           </label>
           <label class="reference-field">
             <span>Project</span>
             <select data-reference-project-select="${escapeHtml(number)}">
               <option value="">Add project...</option>
-              ${projectOptions.map(project => `<option value="${escapeHtml(project)}">${escapeHtml(project)}</option>`).join("")}
+              ${projectOptions.map(project => `<option value="${escapeHtml(project)}" ${project === draft.selectedProject ? "selected" : ""}>${escapeHtml(project)}</option>`).join("")}
             </select>
           </label>
           <label class="reference-field">
             <span>New project</span>
-            <input data-reference-project-input="${escapeHtml(number)}" placeholder="New project" />
+            <input data-reference-project-input="${escapeHtml(number)}" placeholder="New project" value="${escapeHtml(draft.customProject)}" />
           </label>
           <div class="reference-field reference-importance-field">
             <span>Importance</span>
-            ${referenceImportanceEditorHtml(number)}
+            ${referenceImportanceEditorHtml(number, draft.importance)}
           </div>
         </div>`}
       </div>`}
@@ -8118,6 +10330,7 @@ function referenceCardHtml(card) {
         <dd>${escapeHtml(card.authors || "Unknown authors")}</dd>
         ${card.venue || card.year ? `<dt>来源</dt><dd>${escapeHtml([card.venue, card.year].filter(Boolean).join(" · "))}</dd>` : ""}
         ${card.url ? `<dt>链接</dt><dd><a href="${escapeHtml(card.url)}" target="_blank" rel="noreferrer">${escapeHtml(card.url)}</a></dd>` : ""}
+        ${pdfUrl ? `<dt>PDF</dt><dd><a href="${escapeHtml(pdfUrl)}" target="_blank" rel="noreferrer">${escapeHtml(pdfUrl)}</a></dd>` : ""}
         <dt>摘要</dt>
         <dd>${abstract ? escapeHtml(abstract) : '<span class="muted">未从在线元数据中找到摘要。</span>'}</dd>
         <dt>中文摘要</dt>
@@ -8130,10 +10343,11 @@ async function addReferenceToLibrary(number) {
   const card = state.references[number] || {};
   const cardNode = document.querySelector(`[data-reference-card="${cssEscape(number)}"]`);
   const button = document.querySelector(`[data-add-reference="${cssEscape(number)}"]`);
-  const selectedTag = document.querySelector(`[data-reference-tag-select="${cssEscape(number)}"]`)?.value?.trim() || "";
-  const customTag = document.querySelector(`[data-reference-tag-input="${cssEscape(number)}"]`)?.value?.trim() || "";
-  const selectedProject = normalizeProjectName(document.querySelector(`[data-reference-project-select="${cssEscape(number)}"]`)?.value || "");
-  const customProject = normalizeProjectName(document.querySelector(`[data-reference-project-input="${cssEscape(number)}"]`)?.value || "");
+  const draft = captureReferenceIntakeDraft(number);
+  const selectedTag = draft.selectedTag;
+  const customTag = draft.customTag;
+  const selectedProject = draft.selectedProject;
+  const customProject = draft.customProject;
   const projects = uniqueTags([selectedProject, customProject].filter(Boolean));
   if (customProject && !allLibraryProjects().includes(customProject)) {
     state.libraryCustomProjects = uniqueTags([...state.libraryCustomProjects, customProject]);
@@ -8141,9 +10355,15 @@ async function addReferenceToLibrary(number) {
   }
   const body = {
     title: cardNode?.querySelector(".reference-meta dd")?.textContent?.trim() || card.title,
+    doi: card.doi || "",
+    url: card.url || "",
+    pdf_url: card.pdf_url || card.open_access_pdf_url || card.arxiv_pdf_url || "",
+    open_access_pdf_url: card.open_access_pdf_url || "",
+    semantic_scholar_url: card.semantic_scholar_url || "",
+    arxiv_id: card.arxiv_id || "",
     tags: [...new Set([selectedTag, customTag].filter(Boolean))],
     projects,
-    importance: selectedReferenceImportance(number) || "",
+    importance: draft.importance || "",
   };
   if (button) {
     button.disabled = true;
@@ -8155,13 +10375,17 @@ async function addReferenceToLibrary(number) {
   });
   if (response.duplicate) {
     toast("Already in Library");
+    delete state.referenceIntakeDrafts[String(number || "")];
     await loadLibrary();
     const latestNode = document.querySelector(`[data-reference-card="${cssEscape(number)}"]`);
-    if (latestNode) latestNode.outerHTML = referenceCardHtml({ ...card, title: body.title || card.title });
+    if (latestNode) latestNode.outerHTML = referenceCardHtml({ ...card, title: response.existing?.title || body.title || card.title });
     bindReferenceAddButtons();
     return;
   }
-  toast("已添加到 Library，status: unread");
+  if (response.pdf_attached) toast("已添加到 Library，并开始后台解析 PDF");
+  else if (response.pdf_error) toast(`已添加到 Library；PDF 自动下载失败：${response.pdf_error}`);
+  else toast("已添加到 Library，status: unread");
+  delete state.referenceIntakeDrafts[String(number || "")];
   if (button) button.textContent = "已添加";
   await loadLibrary();
 }
@@ -8175,6 +10399,11 @@ function textOffsetWithin(container, node, offset) {
     if (!current || found) return;
     if (isIgnored(current)) {
       if (current === node || current.contains?.(node)) found = true;
+      return;
+    }
+    if (current.nodeType === Node.ELEMENT_NODE && current.hasAttribute("data-annotation-source-length")
+      && current !== node && !current.contains(node)) {
+      length += Number(current.dataset.annotationSourceLength);
       return;
     }
     if (current === node) {
@@ -8344,8 +10573,8 @@ function sentenceAlignedPairedRange(fromText, toText, selectionInfo, target) {
 
 function pairedRangeForSelection(segment, selectionInfo) {
   const target = selectionInfo.target === "source" ? "translation" : "source";
-  const fromText = selectionInfo.target === "source" ? displayText(segment.markdown, { trim: false }) : displayText(segment.translation, { trim: false });
-  const toText = target === "source" ? displayText(segment.markdown, { trim: false }) : displayText(segment.translation, { trim: false });
+  const fromText = selectionInfo.target === "source" ? displayTextPreservingMath(segment.markdown, { trim: false }) : displayTextPreservingMath(segment.translation, { trim: false });
+  const toText = target === "source" ? displayTextPreservingMath(segment.markdown, { trim: false }) : displayTextPreservingMath(segment.translation, { trim: false });
   if (!fromText || !toText) return null;
   const midpoint = (selectionInfo.range.start + selectionInfo.range.end) / 2;
   const ratioHint = midpoint / Math.max(1, fromText.length);
@@ -8413,11 +10642,15 @@ function getReaderSelection() {
   const target = startText.dataset.target || "source";
   if ((endText.dataset.target || "source") !== target) return null;
   if (startText !== endText) return getMultiSegmentReaderSelection(range, startText, endText, target, text);
-  const start = textOffsetWithin(startText, range.startContainer, range.startOffset);
-  const end = textOffsetWithin(startText, range.endContainer, range.endOffset);
+  let start = textOffsetWithin(startText, range.startContainer, range.startOffset);
+  let end = textOffsetWithin(startText, range.endContainer, range.endOffset);
   if (end <= start) return null;
   const segment = state.payload?.segments?.find(item => item.id === startText.dataset.pid);
   if (!segment) return null;
+  if (target === "translation") {
+    start = originalTranslationOffset(segment, start, "start");
+    end = originalTranslationOffset(segment, end, "end");
+  }
   const info = {
     segment_id: startText.dataset.pid,
     target: startText.dataset.target || "source",
@@ -8430,8 +10663,8 @@ function getReaderSelection() {
 
 function annotationTextValue(segment, target) {
   return target === "translation"
-    ? displayText(segment?.translation || "", { trim: false })
-    : displayText(segment?.markdown || "", { trim: false });
+    ? displayTextPreservingMath(segment?.translation || "", { trim: false })
+    : displayTextPreservingMath(segment?.markdown || "", { trim: false });
 }
 
 function selectedAnnotationTextNodes(range, target) {
@@ -8443,7 +10676,7 @@ function selectedAnnotationTextNodes(range, target) {
 function selectionPartForNode(node, range, startText, endText, target) {
   const segment = state.payload?.segments?.find(item => item.id === node.dataset.pid);
   if (!segment) return null;
-  const text = annotationTextValue(segment, target);
+  const text = target === "translation" ? translationPresentation(segment).text : annotationTextValue(segment, target);
   let start = 0;
   let end = text.length;
   if (node === startText) start = textOffsetWithin(node, range.startContainer, range.startOffset);
@@ -8452,6 +10685,10 @@ function selectionPartForNode(node, range, startText, endText, target) {
   end = Math.max(start, Math.min(text.length, end));
   const quote = text.slice(start, end).trim();
   if (!quote || end <= start) return null;
+  if (target === "translation") {
+    start = originalTranslationOffset(segment, start, "start");
+    end = originalTranslationOffset(segment, end, "end");
+  }
   const info = { segment_id: node.dataset.pid, target, quote, range: { start, end } };
   info.paired_range = pairedRangeForSelection(segment, info);
   return info;
@@ -8483,7 +10720,7 @@ function updateToolbarStatus() {
     ? `${selection.target === "translation" ? "中文" : "原文"} · ${selection.multi ? `${selection.parts.length} segments · ` : ""}${selection.quote.length} chars selected`
     : thinkingSelection
       ? `AI output · ${thinkingSelection.quote.length} chars selected`
-    : "Select text to annotate";
+    : "";
   positionAnnotationToolbar();
 }
 
@@ -8503,6 +10740,7 @@ function fallbackSegmentSelection(paragraphId, color) {
 }
 
 function openAnnotationDrawer(paragraphId, color, selectionInfo = null) {
+  if (noteDrawerHasChanges() && !closeDrawer()) return;
   const selection = selectionInfo || fallbackSegmentSelection(paragraphId, color);
   if (!selection) return;
   state.pendingAnnotation = { ...selection, color };
@@ -8516,6 +10754,7 @@ function openAnnotationDrawer(paragraphId, color, selectionInfo = null) {
 }
 
 function openExistingAnnotationDrawer(annotationId) {
+  if (noteDrawerHasChanges() && !closeDrawer()) return;
   let annotation = state.annotations.find(item => item.id === annotationId);
   if (!annotation) return;
   const groupId = annotationGroupId(annotation);
@@ -8534,6 +10773,7 @@ function openExistingAnnotationDrawer(annotationId) {
 }
 
 function openMediaAnnotationDrawer(segmentId, target) {
+  if (noteDrawerHasChanges() && !closeDrawer()) return;
   const existing = mediaAnnotationFor(segmentId, target);
   if (existing) {
     openExistingAnnotationDrawer(existing.id);
@@ -8617,13 +10857,26 @@ function addHighlightFromSelection(color, includeNote) {
   savePendingAnnotation(false);
 }
 
-function closeDrawer() {
+function noteDrawerSnapshot() {
+  return JSON.stringify({ note: qs("#noteText")?.value || "", tags: selectedDrawerTags() });
+}
+
+function noteDrawerHasChanges() {
+  return Boolean((state.pendingAnnotation || state.pendingThinkingAnnotation)
+    && qs("#noteDrawer")?.classList.contains("open") && noteDrawerSnapshot() !== state.drawerInitialValue);
+}
+
+function closeDrawer(options = {}) {
+  if (!options.saved && noteDrawerHasChanges() && !window.confirm("Discard the unsaved note? Use Save to keep your original words.")) return false;
   if (qs("#noteDrawer")?.contains(document.activeElement)) document.activeElement?.blur();
   qs("#noteDrawer").classList.remove("open");
   qs("#noteDrawer").setAttribute("aria-hidden", "true");
   state.pendingAnnotation = null;
   state.pendingThinkingAnnotation = null;
+  state.drawerInitialValue = "";
   refreshDrawerMode();
+  renderReaderSaveStatus();
+  return true;
 }
 
 function waitForNextFrame() {
@@ -8635,7 +10888,7 @@ function setNoteDrawerSaving(isSaving) {
   const saveHighlight = qs("#saveHighlightOnly");
   if (saveNote) {
     saveNote.disabled = Boolean(isSaving);
-    saveNote.textContent = isSaving ? "Saving..." : "Send Note";
+    saveNote.textContent = isSaving ? "Saving..." : "Save Note";
   }
   if (saveHighlight) {
     saveHighlight.disabled = Boolean(isSaving);
@@ -8643,6 +10896,8 @@ function setNoteDrawerSaving(isSaving) {
 }
 
 async function persistCurrentPaperAnnotations(toastMessage = "", options = {}) {
+  const paperId = state.currentPaperId;
+  if (!paperId) return;
   const optimistic = options.optimistic !== false;
   if (optimistic) {
     if (state.payload?.annotations) state.payload.annotations.annotations = state.annotations;
@@ -8650,20 +10905,17 @@ async function persistCurrentPaperAnnotations(toastMessage = "", options = {}) {
     syncCurrentPaperNotesLocally({ renderNotes: shouldRenderNotesImmediately(), renderSidebar: false });
     refreshReaderSegmentsOrRender(options.segmentIds || []);
     markReadingProgressDirtyFromAnnotations();
-    if (toastMessage) toast(toastMessage);
   }
-  await api(`/api/papers/${encodeURIComponent(state.currentPaperId)}/annotations`, {
-    method: "POST",
-    body: JSON.stringify({ version: 1, paper_id: state.currentPaperId, annotations: state.annotations }),
-  });
-  if (!optimistic) {
+  await queuePaperWrite(paperId, "annotations", { version: 1, paper_id: paperId, annotations: state.annotations });
+  if (!optimistic && paperId === state.currentPaperId) {
     if (state.payload?.annotations) state.payload.annotations.annotations = state.annotations;
     state.notesPreviewCache.delete(state.currentPaperId);
     syncCurrentPaperNotesLocally({ renderNotes: shouldRenderNotesImmediately(), renderSidebar: false });
     refreshReaderSegmentsOrRender(options.segmentIds || []);
     markReadingProgressDirtyFromAnnotations();
-    if (toastMessage) toast(toastMessage);
   }
+  if (toastMessage) toast(toastMessage);
+  if (paperId === state.currentPaperId) capturePaperSession();
   refreshAllNotesInBackground();
 }
 
@@ -8687,19 +10939,18 @@ async function savePendingAnnotation(includeNote) {
   if (state.pendingAnnotation.editing_id) {
     const annotation = state.annotations.find(item => item.id === state.pendingAnnotation.editing_id);
     if (!annotation) return;
-    annotation.note = includeNote ? qs("#noteText").value.trim() : annotation.note || "";
+    annotation.note = includeNote ? qs("#noteText").value : annotation.note || "";
     annotation.tags = selectedDrawerTags();
     annotation.updated_at = new Date().toISOString();
     const segmentIds = [annotation.segment_id].filter(Boolean);
-    closeDrawer();
-    await waitForNextFrame();
-    void persistCurrentPaperAnnotations("Note updated", { segmentIds }).catch(error => toast(`Save failed: ${error.message}`));
+    closeDrawer({ saved: true });
+    await persistCurrentPaperAnnotations("Note updated", { segmentIds });
     return;
   }
   const now = new Date().toISOString();
   if (state.pendingAnnotation.multi && Array.isArray(state.pendingAnnotation.parts)) {
     const groupId = `ag-${Date.now().toString(36)}`;
-    const noteText = includeNote ? qs("#noteText").value.trim() : "";
+    const noteText = includeNote ? qs("#noteText").value : "";
     const tags = selectedDrawerTags();
     const groupItems = state.pendingAnnotation.parts.map((part, index) => ({
       id: `${groupId}-${index}`,
@@ -8717,24 +10968,22 @@ async function savePendingAnnotation(includeNote) {
     }));
     state.annotations.push(...groupItems);
     const segmentIds = groupItems.map(item => item.segment_id).filter(Boolean);
-    closeDrawer();
-    await waitForNextFrame();
-    void persistCurrentPaperAnnotations("Saved multi-segment note", { segmentIds }).catch(error => toast(`Save failed: ${error.message}`));
+    closeDrawer({ saved: true });
+    await persistCurrentPaperAnnotations("Saved multi-segment note", { segmentIds });
     return;
   }
   const item = {
     id: `a-${Date.now().toString(36)}`,
     type: "range",
     ...state.pendingAnnotation,
-    note: includeNote ? qs("#noteText").value.trim() : "",
+    note: includeNote ? qs("#noteText").value : "",
     tags: selectedDrawerTags(),
     created_at: now,
     updated_at: now,
   };
   state.annotations.push(item);
-  closeDrawer();
-  await waitForNextFrame();
-  void persistCurrentPaperAnnotations("Saved locally", { segmentIds: [item.segment_id].filter(Boolean) }).catch(error => toast(`Save failed: ${error.message}`));
+  closeDrawer({ saved: true });
+  await persistCurrentPaperAnnotations("Saved locally", { segmentIds: [item.segment_id].filter(Boolean) });
   } catch (error) {
     toast(`Save failed: ${error.message}`);
   } finally {
@@ -8754,10 +11003,13 @@ async function deleteAnnotation(annotationId, paperId = state.currentPaperId) {
   const groupId = annotationGroupId(target);
   const changedSegmentIds = annotations.filter(item => groupId ? annotationGroupId(item) === groupId : item.id === annotationId).map(item => item.segment_id).filter(Boolean);
   const nextAnnotations = annotations.filter(item => groupId ? annotationGroupId(item) !== groupId : item.id !== annotationId);
-  await api(`/api/papers/${encodeURIComponent(paperId)}/annotations`, {
-    method: "POST",
-    body: JSON.stringify({ version: 1, paper_id: paperId, annotations: nextAnnotations }),
-  });
+  if (paperId === state.currentPaperId) {
+    state.annotations = nextAnnotations;
+    await persistCurrentPaperAnnotations("Note deleted", { segmentIds: changedSegmentIds });
+    return;
+  }
+  await queuePaperWrite(paperId, "annotations", { version: 1, paper_id: paperId, annotations: nextAnnotations });
+  invalidatePaperCache(paperId);
   state.notesPreviewCache.delete(paperId);
   if (state.notesPreview.paperId === paperId && (state.notesPreview.annotationId === annotationId || (groupId && annotationGroupId(state.notesPreview.note) === groupId))) {
     state.notesPreview = { paperId: "", annotationId: "", segmentId: "", note: null, payload: null, loading: false, error: "" };
@@ -8781,10 +11033,13 @@ async function mutateAnnotationTags(paperId, annotationId, updater) {
   if (!annotation) return;
   updater(annotation);
   annotation.updated_at = new Date().toISOString();
-  await api(`/api/papers/${encodeURIComponent(paperId)}/annotations`, {
-    method: "POST",
-    body: JSON.stringify({ version: 1, paper_id: paperId, annotations }),
-  });
+  if (paperId === state.currentPaperId) {
+    state.annotations = annotations;
+    await persistCurrentPaperAnnotations("", { segmentIds: [annotation.segment_id].filter(Boolean) });
+    return;
+  }
+  await queuePaperWrite(paperId, "annotations", { version: 1, paper_id: paperId, annotations });
+  invalidatePaperCache(paperId);
   state.notesPreviewCache.delete(paperId);
   if (paperId === state.currentPaperId) {
     state.annotations = annotations;
@@ -8842,8 +11097,10 @@ function focusAnnotation(annotationId) {
 }
 
 function previewInlineMarkdown(text, paperId, options = {}) {
-  let safe = escapeHtml(displayText(text, { trim: options.trim !== false }));
+  return renderInlineContent(text, options, rawPart => {
+  let safe = escapeHtml(displayText(options.images === false ? stripTranslationImages(rawPart) : rawPart, { trim: false }));
   safe = safe.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, alt, src) => {
+    if (options.images === false) return "";
     const url = assetUrlForPaper(paperId, src);
     if (!url) return match;
     return `<img class="notes-source-image" src="${escapeHtml(url)}" alt="${escapeHtml(alt || "Paper image")}" loading="lazy">`;
@@ -8852,15 +11109,14 @@ function previewInlineMarkdown(text, paperId, options = {}) {
   safe = safe.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
   safe = safe.replace(/\*([^*]+)\*/g, "<em>$1</em>");
   safe = safe.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+  safe = autolinkPlainUrlsAndDois(safe);
   return safe;
+  });
 }
 
 function splitPreviewInlineHtmlWithHighlights(text, annotations, target, paperId, options = {}) {
-  const raw = displayText(text, { trim: false });
-  const ranges = annotations
-    .map(annotation => ({ annotation, range: normalizedAnnotationRange(annotation, raw, target) }))
-    .filter(item => item.range && item.range.end > item.range.start)
-    .sort((a, b) => a.range.start - b.range.start || a.range.end - b.range.end);
+  const { text: raw, ranges } = annotationDisplayRanges(displayTextPreservingMath(text, { trim: false }),
+    annotations, target, options.omissions);
   if (!ranges.length) return previewInlineMarkdown(raw, paperId, options);
   const parts = [];
   let cursor = 0;
@@ -8892,8 +11148,10 @@ function previewEffectiveAnnotationsFor(segment, payload, target) {
   });
 }
 
-function previewApplyHighlights(text, segment, target, payload, paperId) {
-  return splitPreviewInlineHtmlWithHighlights(text, previewEffectiveAnnotationsFor(segment, payload, target), target, paperId, { citations: false });
+function previewApplyHighlights(text, segment, target, payload, paperId, options = {}) {
+  return splitPreviewInlineHtmlWithHighlights(text, previewEffectiveAnnotationsFor(segment, payload, target), target, paperId, {
+    ...options, citations: false, images: target !== "translation",
+  });
 }
 
 function previewHtmlTable(text) {
@@ -8903,7 +11161,7 @@ function previewHtmlTable(text) {
   const parser = new DOMParser();
   const doc = parser.parseFromString(raw, "text/html");
   const table = doc.querySelector("table");
-  if (!table) return `<pre class="source-text">${escapeHtml(displayText(text))}</pre>`;
+  if (!table) return `<pre class="source-text">${escapeHtml(displayTextPreservingMath(text))}</pre>`;
   const rows = Array.from(table.querySelectorAll("tr")).map(row => {
     const cells = Array.from(row.children).filter(cell => /^(td|th)$/i.test(cell.tagName));
     const html = cells.map(cell => {
@@ -8911,11 +11169,11 @@ function previewHtmlTable(text) {
       const rowspan = Math.max(1, Math.min(20, Number(cell.getAttribute("rowspan") || 1)));
       const colspan = Math.max(1, Math.min(20, Number(cell.getAttribute("colspan") || 1)));
       const attrs = `${rowspan > 1 ? ` rowspan="${rowspan}"` : ""}${colspan > 1 ? ` colspan="${colspan}"` : ""}`;
-      return `<${tag}${attrs}>${escapeHtml(displayText(cell.textContent))}</${tag}>`;
+      return `<${tag}${attrs}>${previewInlineMarkdown(cell.textContent, state.notesPreview.paperId)}</${tag}>`;
     }).join("");
     return html ? `<tr>${html}</tr>` : "";
   }).filter(Boolean).join("");
-  if (!rows) return `<pre class="source-text">${escapeHtml(displayText(text))}</pre>`;
+  if (!rows) return `<pre class="source-text">${escapeHtml(displayTextPreservingMath(text))}</pre>`;
   return `${caption ? `<div class="table-caption source-text">${previewInlineMarkdown(caption, state.notesPreview.paperId)}</div>` : ""}<div class="table-wrap"><table class="paper-table">${rows}</table></div>`;
 }
 
@@ -8924,24 +11182,28 @@ function previewParagraphHtml(segment, payload, annotation) {
   const pid = segment.id;
   const type = segment.kind || "paragraph";
   const text = segment.markdown || "";
+  const isTableSegment = isTextTableSegment(segment);
   const active = pid === annotation?.segment_id ? " is-target" : "";
   let body = "";
   if (type === "heading") {
     const level = Math.min(Math.max(Number(segment.level || 2), 1), 3);
-    const headingText = displayText(text, { trim: false }).replace(/^#{1,6}\s+/, "");
+    const headingText = displayTextPreservingMath(text, { trim: false }).replace(/^#{1,6}\s+/, "");
     body = `<h${level}>${previewInlineMarkdown(headingText, paperId)}</h${level}>`;
   } else if (type === "code") {
     body = `<pre><code>${escapeHtml(text)}</code></pre>`;
   } else if (isHtmlTable(text)) {
     body = previewHtmlTable(text);
-  } else if (type === "table" || text.includes("\n|")) {
+  } else if (isTableSegment) {
     body = renderPipeTable(text);
   } else {
-    body = `<div class="source-text">${previewApplyHighlights(displayText(text, { trim: false }), segment, "source", payload, paperId)}</div>`;
+    body = `<div class="source-text">${previewApplyHighlights(displayTextPreservingMath(text, { trim: false }), segment, "source", payload, paperId)}</div>`;
   }
-  const translation = segment.translation
-    ? `<div class="translation">${previewApplyHighlights(displayText(segment.translation, { trim: false }), segment, "translation", payload, paperId)}</div>`
-    : "";
+  const translated = isTableSegment ? null : translationPresentation(segment);
+  const translation = isTableSegment
+    ? renderTableTranslation(segment)
+    : stripTranslationImages(translated.text).trim()
+      ? `<div class="translation">${previewApplyHighlights(displayTextPreservingMath(segment.translation, { trim: false }), segment, "translation", payload, paperId, { omissions: translated.omissions })}</div>`
+      : "";
   return `<article class="notes-source-paragraph${active}" data-preview-pid="${escapeHtml(pid)}"><div class="notes-source-segment-id">${escapeHtml(pid)}</div>${body}${translation}</article>`;
 }
 
@@ -8976,7 +11238,7 @@ function notesSourcePanelEmptyHtml() {
   return `
     <div class="notes-source-empty">
       <h2>Source Context</h2>
-      <p>Select a note's paper link to review the original passage without leaving Notes.</p>
+      <p>Select a note.</p>
     </div>`;
 }
 
@@ -9043,6 +11305,7 @@ function renderNotesSourcePanel() {
     </div>
     ${annotation ? `<section class="notes-source-note" aria-label="Selected note">
       <div class="notes-source-note-header">
+        ${isTeacherDefinition(annotation) ? '<span class="note-block-label">Saved AI definition</span>' : ""}
         <span>${escapeHtml(annotation.segment_id || state.notesPreview.segmentId || "Selected note")}</span>
         <button class="note-delete-button" data-delete-source-note="${escapeHtml(annotation.id || "")}" data-paper-id="${escapeHtml(state.notesPreview.paperId || "")}" title="Delete note" aria-label="Delete note">x</button>
       </div>
@@ -9124,6 +11387,7 @@ async function openNotesSourceInWorkspace() {
 
 function renderNotes() {
   const root = qs("#notesRoot");
+  if (document.body.dataset.activeView !== "notes") return;
   renderNoteProjectFilters();
   renderNoteTagFilters();
   const notes = state.allNotes || [];
@@ -9141,7 +11405,7 @@ function renderNotes() {
       <div class="note-row-header">
         <div class="note-main-content">
           ${item.note ? `<div class="note-user-block">
-            <span class="note-block-label">Your note</span>
+            <span class="note-block-label">${isTeacherDefinition(item) ? "Saved AI definition" : "Your note"}</span>
             <p class="note-text note-text-primary">${escapeHtml(item.note)}</p>
           </div>` : '<span class="note-row-kind">Highlight only</span>'}
           ${annotationMediaSrc(item, item.paper_id) ? `<img class="note-media-thumb" src="${escapeHtml(annotationMediaSrc(item, item.paper_id))}" alt="${escapeHtml(item.quote || "Media note")}" loading="lazy" decoding="async">` : ""}
@@ -9324,8 +11588,7 @@ function renderLibraryUploadStatus() {
 
 async function openPaperInWorkspace(paperId) {
   if (!paperId) return;
-  await loadPaper(paperId);
-  activateView("reader");
+  if (await loadPaper(paperId)) activateView("reader");
 }
 
 function beginLibraryUpload(files, paperId = "") {
@@ -9356,13 +11619,14 @@ function finishLibraryUpload(result, files, paperId = "") {
     if (paper.processing_error) return { name: file.name || paper.filename || "PDF", status: "error", detail: paper.processing_error, paperId: paper.paper_id || paper.metadata?.id || "" };
     if (paper.error) return { name: file.name || paper.filename || "PDF", status: "error", detail: paper.error };
     const title = paper.metadata?.title || paper.title || paper.paper_id || "已加入 Library";
-    return { name: file.name || paper.filename || "PDF", status: "done", detail: paper.replaced ? `已替换并解析：${title}` : `已解析：${title}`, paperId: paper.paper_id || paper.metadata?.id || "" };
+    const detail = paperParsingPending(paper.metadata) ? `已入库，后台解析中：${title}` : `已入库：${title}`;
+    return { name: file.name || paper.filename || "PDF", status: "done", detail, paperId: paper.paper_id || paper.metadata?.id || "" };
   });
   const doneCount = items.filter(item => item.status === "done").length;
   const duplicateCount = items.filter(item => item.status === "duplicate").length;
   const errorCount = items.filter(item => item.status === "error").length;
   const parts = [];
-  if (doneCount) parts.push(`${doneCount} 篇完成`);
+  if (doneCount) parts.push(`${doneCount} 篇已入库`);
   if (duplicateCount) parts.push(`${duplicateCount} 篇重复`);
   if (errorCount) parts.push(`${errorCount} 篇失败`);
   state.libraryUpload = {
@@ -9370,7 +11634,7 @@ function finishLibraryUpload(result, files, paperId = "") {
     total: files.length,
     completed: doneCount + duplicateCount + errorCount,
     files: items,
-    message: paperId ? "PDF 附加解析完成" : `批量上传完成：${parts.join("，") || "无变化"}`,
+    message: paperId ? "PDF 已附加，解析状态见阅读页" : `批量上传完成：${parts.join("，") || "无变化"}`,
     error: "",
   };
   if (!paperId) clearLibraryIntakeSelection();
@@ -9424,7 +11688,8 @@ async function uploadPdfFiles(fileList, paperId = "") {
         : `${result.count || files.length} PDF(s) added and parsed`);
     await loadLibrary();
     if (promptPaperIds.length) openLibraryTagPrompt(promptPaperIds);
-    if (paperId && paperId === state.currentPaperId) await loadPaper(paperId);
+    if (paperId) invalidatePaperCache(paperId);
+    if (paperId && paperId === state.currentPaperId) await loadPaper(paperId, { force: true });
   } catch (error) {
     failLibraryUpload(files, error);
     throw error;
@@ -9505,12 +11770,13 @@ async function submitAddPaperRequest(body) {
 }
 
 async function completeAddPaperResult(result, pathInput, titleInput, options = {}) {
-  toast(result.processing_error ? "Added, but Parse + Brief failed" : result.replaced ? "Existing paper replaced and parsed" : "Added and parsed");
-  state.currentPaperId = result.paper_id;
+  toast(result.processing_error ? "Added, but Markdown parsing failed"
+    : paperParsingPending(result.metadata) ? "Added; Markdown parsing runs in the background" : "Added to Library");
   if (pathInput) pathInput.value = defaultPdfLibraryPath;
   if (titleInput) titleInput.value = "";
   clearLibraryIntakeSelection();
   await loadLibrary();
+  if (result.paper_id) invalidatePaperCache(result.paper_id);
   if (options.promptTags && result.paper_id) openLibraryTagPrompt([result.paper_id]);
   activateView("library");
 }
@@ -9558,40 +11824,343 @@ async function addPaperFromForm() {
 
 async function processPaper(paperId, mode) {
   if (!paperId || !mode) return;
-  const label = "Parse + Brief";
+  const label = "Markdown";
   toast(`${label}处理中...`);
   qsa(`[data-process-paper="${cssEscape(paperId)}"]`).forEach(button => { button.disabled = true; });
   try {
-    await api(`/api/papers/${encodeURIComponent(paperId)}/process`, {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/process`, {
       method: "POST",
       body: JSON.stringify({ mode }),
     });
-    toast(`${label}完成`);
-    state.currentPaperId = paperId;
+    toast(response.metadata?.processing_status === "ready" ? "Markdown ready" : "Markdown parsing queued");
+    invalidatePaperCache(paperId);
     await loadLibrary();
-    activateView("reader");
+    if (await loadPaper(paperId, { force: true })) activateView("reader");
   } catch (error) {
     toast(`${label}失败: ${error.message}`);
     await loadLibrary();
   }
 }
 
+function translationJob(paperId) {
+  if (!state.translationJobs.has(paperId)) state.translationJobs.set(paperId, { cursor: 0, cursorJobId: "" });
+  return state.translationJobs.get(paperId);
+}
+
+function renderTranslationStatus() {
+  const root = qs("#readerTranslationStatus");
+  if (!root) return;
+  root.hidden = !state.currentPaperId || !state.payload?.segments?.length;
+  if (root.hidden) return;
+  const job = translationJob(state.currentPaperId);
+  const status = job.status || state.payload.translation?.status || "not_started";
+  const active = ["queued", "processing", "pausing", "retrying"].includes(status);
+  const labels = {
+    not_started: state.translationConfig.auto_start ? "Preparing background translation" : "Translation",
+    queued: "Translation queued", processing: "Translating in background",
+    pausing: "Pausing after the current paragraph", paused: "Translation paused",
+    retrying: "Translation waiting before retry",
+    waiting_for_source: "Waiting for Markdown source",
+    ready: "Translation complete", failed: "Translation stopped", interrupted: "Translation interrupted",
+    source_changed: "Source changed — reload before continuing",
+  };
+  root.dataset.status = status;
+  qs("#translationStatusLabel").textContent = labels[status] || status;
+  qs("#translationStatusDetail").textContent = job.error || [
+    job.total ? `${job.completed || 0} / ${job.total} paragraphs` : "",
+    job.backend || state.translationConfig.model || "",
+  ].filter(Boolean).join(" · ");
+  const progress = qs("#translationProgress");
+  progress.max = Math.max(1, job.total || 1);
+  progress.value = job.completed || 0;
+  progress.hidden = !job.total;
+  const button = qs("#translateCurrentPaper");
+  button.textContent = active ? "Pause" : status === "source_changed" ? "Reload from disk"
+    : ["failed", "interrupted"].includes(status) ? "Retry" : status === "paused" ? "Resume" : "Translate";
+  button.disabled = Boolean(job.requesting) || status === "pausing";
+  button.hidden = status === "ready" || (status === "not_started" && state.translationConfig.auto_start && !job.error);
+}
+
+function applyTranslationResponse(paperId, response) {
+  if (response.paper_id && response.paper_id !== paperId) throw new Error("Translation response belongs to another paper.");
+  const session = state.paperSessions.get(paperId);
+  const payload = paperId === state.currentPaperId ? state.payload : session?.payload;
+  if (!payload) return;
+  const job = translationJob(paperId);
+  if (response.translation) Object.assign(job, response.translation);
+  const active = paperId === state.currentPaperId && !state.paperLoadingId;
+  const viewportTop = readerViewportTop();
+  const anchor = active ? qsa("#documentRoot .paragraph").find(node => node.getBoundingClientRect().bottom > viewportTop) : null;
+  const anchorTop = anchor?.getBoundingClientRect().top;
+  let changedSource = false;
+  for (const update of response.updates || []) {
+    if (typeof update.translation !== "string" || !update.translation.trim()) throw new Error("Received an empty translation update.");
+    const paragraph = payload.segments.find(item => item.id === update.id);
+    if (!paragraph || paragraph.markdown !== update.markdown) {
+      changedSource = true;
+      continue;
+    }
+    if (paragraph.translation === update.translation) continue;
+    paragraph.translation = update.translation;
+    if (!active) continue;
+    const article = document.getElementById(paragraph.id);
+    if (!article) continue;
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = paragraphHtml(paragraph);
+    const translated = wrapper.querySelector(".paragraph > .translation");
+    const previous = article.querySelector(":scope > .translation");
+    if (!translated) {
+      previous?.remove();
+      continue;
+    }
+    if (previous) previous.replaceWith(translated);
+    else article.insertBefore(translated, article.querySelector(":scope > .comment-stack"));
+    bindReaderDynamicEvents(translated);
+  }
+  if (anchor && anchorTop !== undefined) {
+    const shift = anchor.getBoundingClientRect().top - anchorTop;
+    if (Math.abs(shift) > 0.5) window.scrollTo({ top: window.scrollY + shift, behavior: "instant" });
+  }
+  if (changedSource) {
+    job.status = "source_changed";
+    job.error = "The source was changed on disk. Saved notes are kept; use Reload from disk.";
+  } else if (response.translation) {
+    job.cursor = response.translation.revision || 0;
+    job.cursorJobId = response.translation.job_id || "";
+  }
+  payload.translation = response.translation || payload.translation;
+  Object.assign(payload.metadata || {}, { translation_status: job.status, translation_error: job.error || "" });
+  const paper = state.library?.papers?.find(item => item.id === paperId);
+  if (paper) {
+    Object.assign(paper, { translation_status: job.status, translation_error: job.error || "" });
+    state.libraryDirty = true;
+  }
+  state.notesPreviewCache.delete(paperId);
+  if (active) renderTranslationStatus();
+}
+
+function stopReaderBackground() {
+  clearTimeout(state.readerBackgroundTimer);
+  state.readerBackgroundTimer = null;
+  state.readerBackgroundVersion += 1;
+}
+
+function watchReaderBackground({ automatic = true, start = true } = {}) {
+  stopReaderBackground();
+  renderTranslationStatus();
+  const parsing = paperParsingPending(state.payload?.metadata || {});
+  if (!state.currentPaperId || !state.payload || state.paperLoadingId
+    || document.body.dataset.activeView !== "reader"
+    || (automatic && !state.translationConfig.auto_start && !parsing)) return;
+  const paperId = state.currentPaperId;
+  const version = state.readerBackgroundVersion;
+  const stillCurrent = () => version === state.readerBackgroundVersion && paperId === state.currentPaperId
+    && document.body.dataset.activeView === "reader" && !state.paperLoadingId;
+  let shouldStart = start;
+  const poll = async () => {
+    if (!stillCurrent()) return;
+    try {
+      if (!state.payload.segments?.length) {
+        const metadata = state.payload.metadata || {};
+        const pending = paperParsingPending(metadata);
+        if (!pending && (!metadata.source_pdf || processingStatus(metadata) === "failed"
+          || processingMode(metadata) === "reference-card")) return;
+        if (!pending) {
+          const result = await api(`/api/papers/${encodeURIComponent(paperId)}/process`, {
+            method: "POST", body: JSON.stringify({ mode: "deep" }),
+          });
+          if (!stillCurrent()) return;
+          Object.assign(state.payload.metadata, result.metadata || {});
+          renderReader();
+        } else {
+          const payload = await api(`/api/papers/${encodeURIComponent(paperId)}`);
+          if (!stillCurrent()) return;
+          if (payload.segments?.length || payload.metadata?.processing_status === "failed") {
+            await loadPaper(paperId, { force: true });
+            return;
+          }
+        }
+      } else {
+        const job = translationJob(paperId);
+        if (shouldStart) {
+          const result = await api(`/api/papers/${encodeURIComponent(paperId)}/translate`, {
+            method: "POST", body: JSON.stringify({ action: "start", automatic }),
+          });
+          if (!stillCurrent()) return;
+          if (result.translation) Object.assign(job, result.translation);
+          shouldStart = false;
+        }
+        const query = new URLSearchParams({ job_id: job.cursorJobId || "", after: String(job.cursor || 0) });
+        const response = await api(`/api/papers/${encodeURIComponent(paperId)}/translation?${query}`);
+        if (!stillCurrent()) return;
+        applyTranslationResponse(paperId, response);
+        if (!["queued", "processing", "pausing", "retrying"].includes(job.status)) return;
+      }
+      if (stillCurrent()) state.readerBackgroundTimer = setTimeout(poll, 1200);
+    } catch (error) {
+      console.error(`Background reading failed for ${paperId}`, error);
+      if (!stillCurrent()) return;
+      Object.assign(translationJob(paperId), { status: "failed", error: error.message });
+      renderTranslationStatus();
+      toast(`Background reading stopped: ${error.message}. Original text and notes are kept.`);
+    }
+  };
+  state.readerBackgroundTimer = setTimeout(poll, 0);
+}
+
 async function translatePaper(paperId = state.currentPaperId) {
   if (!paperId) return;
-  const buttonList = qsa(`[data-translate-paper="${cssEscape(paperId)}"], #translateCurrentPaper`);
-  buttonList.forEach(button => { button.disabled = true; button.textContent = "Translating..."; });
-  toast("全文翻译处理中...");
-  try {
-    await api(`/api/papers/${encodeURIComponent(paperId)}/translate`, { method: "POST", body: JSON.stringify({}) });
-    toast("全文翻译完成");
-    await loadLibrary();
-    if (paperId === state.currentPaperId) await loadPaper(paperId);
-  } catch (error) {
-    toast(`翻译失败: ${error.message}`);
-    await loadLibrary();
-  } finally {
-    buttonList.forEach(button => { button.disabled = false; button.textContent = "Translate"; });
+  const job = translationJob(paperId);
+  if (job.requesting) return;
+  if (job.status === "source_changed") {
+    await loadPaper(paperId, { force: true });
+    return;
   }
+  const action = ["queued", "processing", "retrying"].includes(job.status) ? "pause" : "resume";
+  if (paperId === state.currentPaperId) stopReaderBackground();
+  job.requesting = true;
+  renderTranslationStatus();
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/translate`, {
+      method: "POST", body: JSON.stringify({ action, automatic: false }),
+    });
+    if (response.translation) Object.assign(job, response.translation);
+    if (paperId === state.currentPaperId) watchReaderBackground({ automatic: false, start: false });
+  } catch (error) {
+    console.error(`Translation ${action} failed for ${paperId}`, error);
+    Object.assign(job, { status: "failed", error: error.message });
+    toast(`Translation stopped: ${error.message}`);
+  } finally {
+    job.requesting = false;
+    renderTranslationStatus();
+  }
+}
+
+function renderTranslationQueue() {
+  const queue = state.translationQueue;
+  const panel = qs("#translationQueuePanel");
+  if (!panel) return;
+  panel.hidden = !queue.open;
+  qs("#toggleTranslationQueue")?.setAttribute("aria-expanded", String(queue.open));
+  if (!queue.open) return;
+  const data = queue.data || { jobs: [] };
+  qs("#translationQueueSummary").textContent = queue.error || (queue.data
+    ? `${data.active_requests || 0} active / ${data.concurrency || 1} maximum · Only papers requested for translation`
+    : "Loading queue…");
+  qs("#translationQueueItems").innerHTML = (data.jobs || []).map(job => {
+    const active = ["queued", "processing", "retrying", "waiting_for_source"].includes(job.status);
+    const title = state.library?.papers?.find(paper => paper.id === job.paper_id);
+    return `<article class="translation-queue-item">
+      <button class="queue-paper-title" data-queue-open="${escapeHtml(job.paper_id)}" type="button">${escapeHtml(title ? paperTitle(title) : cleanPaperTitle(job.title || job.paper_id))}</button>
+      <span class="muted small-text">${escapeHtml(job.status)} · ${job.completed || 0}/${job.total || 0}${job.active_requests ? ` · ${job.active_requests} active` : ""}</span>
+      ${job.error ? `<span class="error-text small-text">${escapeHtml(job.error)}</span>` : ""}
+      ${job.status !== "ready" ? `<button class="secondary-button mini-button" data-queue-action="${active ? "pause" : "resume"}" data-queue-paper="${escapeHtml(job.paper_id)}" type="button">${active ? "Pause" : job.status === "failed" ? "Retry" : "Resume"}</button>` : ""}
+    </article>`;
+  }).join("") || '<p class="muted">Open a paper to add missing translations to the queue.</p>';
+}
+
+async function refreshTranslationQueue() {
+  const queue = state.translationQueue;
+  clearTimeout(queue.timer);
+  if (!queue.open || queue.loading) return;
+  queue.loading = true;
+  try {
+    queue.data = await api("/api/translation-queue");
+    queue.error = "";
+  } catch (error) {
+    console.error("Translation queue refresh failed", error);
+    queue.error = `Queue unavailable: ${error.message}`;
+  } finally {
+    queue.loading = false;
+    renderTranslationQueue();
+    if (queue.open) queue.timer = setTimeout(refreshTranslationQueue, 2500);
+  }
+}
+
+function toggleTranslationQueue(open = !state.translationQueue.open) {
+  if (open) toggleProcessingQueue(false);
+  state.translationQueue.open = open;
+  renderTranslationQueue();
+  if (open) refreshTranslationQueue();
+  else clearTimeout(state.translationQueue.timer);
+}
+
+function renderProcessingQueue() {
+  const queue = state.processingQueue;
+  qs("#processingQueuePanel").hidden = !queue.open;
+  qs("#toggleProcessingQueue").setAttribute("aria-expanded", String(queue.open));
+  if (!queue.open) return;
+  qs("#processingQueueSummary").textContent = queue.error || (queue.data
+    ? `${queue.data.active_jobs} parsing · ${queue.data.queued_count} waiting · one parser maximum`
+    : "Loading queue…");
+  qs("#processingQueueItems").innerHTML = (queue.data?.jobs || []).map(job => `
+    <article class="translation-queue-item">
+      <button class="queue-paper-title" data-parse-open="${escapeHtml(job.paper_id)}" type="button">${escapeHtml(job.title || job.paper_id)}</button>
+      <span class="muted small-text">${escapeHtml(job.status)}${job.position ? ` · queue position ${job.position}` : ""}</span>
+      ${job.error ? `<span class="error-text small-text" role="alert">${escapeHtml(job.error)}</span>` : ""}
+      ${job.status === "failed" ? `<button class="secondary-button mini-button" data-parse-retry="${escapeHtml(job.paper_id)}" type="button">Retry parsing</button>` : ""}
+    </article>`).join("") || '<p class="muted">No parsing jobs requested. Queue a paper from Feishu or add a local PDF.</p>';
+}
+
+async function refreshProcessingQueue() {
+  const queue = state.processingQueue;
+  clearTimeout(queue.timer);
+  if ((!queue.open && !feishuIntakeNeedsPolling()) || queue.loading) return;
+  const watched = feishuIntakeNeedsPolling()
+    ? { paperId: state.feishuIntake.localPaper.id, version: state.feishuIntake.version } : null;
+  queue.loading = true;
+  try {
+    queue.data = await api("/api/processing-queue");
+    await updateFeishuIntakeProcessing(queue.data, watched);
+    queue.error = "";
+  } catch (error) {
+    console.error("Parsing queue refresh failed", error);
+    queue.error = `Queue unavailable: ${error.message}`;
+    if (watched && watched.version === state.feishuIntake.version && watched.paperId === state.feishuIntake.localPaper?.id
+      && feishuIntakeNeedsPolling()) {
+      state.feishuIntake.statusError = `Parsing status unavailable: ${error.message}. The paper has not been queued again.`;
+      renderFeishuIntakeActions();
+    }
+  } finally {
+    queue.loading = false;
+    renderProcessingQueue();
+    if (queue.open || feishuIntakeNeedsPolling()) queue.timer = setTimeout(refreshProcessingQueue, 2500);
+  }
+}
+
+function toggleProcessingQueue(open = !state.processingQueue.open) {
+  if (open) toggleTranslationQueue(false);
+  state.processingQueue.open = open;
+  renderProcessingQueue();
+  if (open || feishuIntakeNeedsPolling()) refreshProcessingQueue();
+  else clearTimeout(state.processingQueue.timer);
+}
+
+async function retryQueuedParsing(paperId, button) {
+  button.disabled = true;
+  try {
+    await api("/api/processing-queue/retry", { method: "POST", body: JSON.stringify({ paper_id: paperId }) });
+    if (paperId === state.currentPaperId) watchReaderBackground({ start: false });
+  } catch (error) {
+    console.error("Parsing retry failed", error);
+    toast(`Could not retry parsing: ${error.message}`);
+  } finally {
+    await refreshProcessingQueue();
+  }
+}
+
+async function controlQueuedTranslation(paperId, action) {
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/translate`, {
+      method: "POST", body: JSON.stringify({ action, automatic: false }),
+    });
+    if (response.translation) Object.assign(translationJob(paperId), response.translation);
+    if (paperId === state.currentPaperId) watchReaderBackground({ automatic: false, start: false });
+  } catch (error) {
+    console.error(`Queue action failed for ${paperId}`, error);
+    toast(`Queue action failed: ${error.message}`);
+  }
+  await refreshTranslationQueue();
 }
 
 async function refreshCitation(paperId) {
@@ -9634,6 +12203,32 @@ async function refreshVideos(paperId) {
     if (button) {
       button.disabled = false;
       button.textContent = "Refresh Videos";
+    }
+  }
+}
+
+async function findPdfForPaper(paperId) {
+  const button = document.querySelector(`[data-find-pdf="${cssEscape(paperId)}"]`);
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Finding...";
+  }
+  try {
+    const response = await api(`/api/papers/${encodeURIComponent(paperId)}/find-pdf`, { method: "POST", body: JSON.stringify({ force: true }) });
+    const paper = state.library?.papers?.find(item => item.id === paperId);
+    if (paper && response.metadata) Object.assign(paper, response.metadata);
+    refreshLibraryRowOrRender(paperId);
+    if (response.pdf_attached) toast(response.pdf_existing ? "PDF already attached" : "PDF found, attached, and parsing started");
+    else if (response.pdf_error) toast(`PDF search finished: ${response.pdf_error}`);
+    else toast("PDF search finished; no open PDF found");
+    await loadLibrary();
+  } catch (error) {
+    toast(`Find PDF failed: ${error.message}`);
+    await loadLibrary();
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Find PDF";
     }
   }
 }
@@ -9710,12 +12305,24 @@ async function deletePaper(paperId) {
   const paper = state.library?.papers?.find(item => item.id === paperId);
   const confirmed = window.confirm(`Delete this paper from Library and local storage?\n\n${paperTitle(paper || { id: paperId })}`);
   if (!confirmed) return;
+  if (state.currentPaperId === paperId) await flushCurrentPaperEdits();
   await fetch(`/api/papers/${encodeURIComponent(paperId)}`, { method: "DELETE" }).then(response => {
     if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
     return response.json();
   });
   toast("Paper deleted");
   if (state.currentPaperId === paperId) state.currentPaperId = null;
+  state.paperTabs = state.paperTabs.filter(id => id !== paperId);
+  state.paperSessions.delete(paperId);
+  if (!state.currentPaperId) {
+    disconnectReadingProgressTracker();
+    state.payload = null;
+    state.annotations = [];
+    state.thinking = null;
+    renderReader();
+    renderSidebar();
+  }
+  persistPaperTabs();
   if (state.notesPreview.paperId === paperId) state.notesPreview = { paperId: "", annotationId: "", segmentId: "", note: null, payload: null, loading: false, error: "" };
   state.notesPreviewCache.delete(paperId);
   await loadLibrary();
@@ -10059,8 +12666,7 @@ function libraryScoped(root, selector) {
 
 function bindLibraryRowEvents(root = document) {
   libraryScoped(root, "[data-open-paper]").forEach(button => button.addEventListener("click", async () => {
-    await loadPaper(button.dataset.openPaper);
-    activateView("reader");
+    if (await loadPaper(button.dataset.openPaper)) activateView("reader");
   }));
   libraryScoped(root, "[data-preview-paper]").forEach(button => button.addEventListener("click", () => openLibraryPreview(button.dataset.previewPaper)));
   bindImportanceStarEditors(root);
@@ -10087,6 +12693,7 @@ function bindLibraryRowEvents(root = document) {
   }));
   libraryScoped(root, "[data-translate-paper]").forEach(button => button.addEventListener("click", () => translatePaper(button.dataset.translatePaper)));
   libraryScoped(root, "[data-refresh-citation]").forEach(button => button.addEventListener("click", () => refreshCitation(button.dataset.refreshCitation)));
+  libraryScoped(root, "[data-find-pdf]").forEach(button => button.addEventListener("click", () => findPdfForPaper(button.dataset.findPdf)));
   libraryScoped(root, "[data-refresh-videos]").forEach(button => button.addEventListener("click", () => refreshVideos(button.dataset.refreshVideos)));
   libraryScoped(root, "[data-add-video]").forEach(button => button.addEventListener("click", () => addVideoLink(button.dataset.addVideo)));
   libraryScoped(root, "[data-video-input]").forEach(input => input.addEventListener("keydown", event => {
@@ -10379,8 +12986,8 @@ function paperHasParsedBrief(paper) {
 
 function libraryPrimaryActionHtml(paper) {
   return paperHasParsedBrief(paper)
-    ? `<button class="secondary-button" data-translate-paper="${escapeHtml(paper.id)}">Translate</button>`
-    : `<button class="secondary-button" data-process-paper="${escapeHtml(paper.id)}" data-mode="skim">Parse + Brief</button>`;
+    ? `<button class="secondary-button" data-open-paper="${escapeHtml(paper.id)}">Read</button>`
+    : `<button class="secondary-button" data-process-paper="${escapeHtml(paper.id)}" data-mode="deep">Parse Markdown</button>`;
 }
 
 function sortedLibraryPapers(papers) {
@@ -10533,14 +13140,17 @@ function libraryRowHtml(paper) {
         </select>${readingProgressSummaryHtml(paper)}</td>
         <td><span class="mode-pill">${escapeHtml(processingLabel(paper))}</span><br><span class="muted small-text">${escapeHtml(processingStatus(paper))}</span>${paper.processing_error ? `<br><span class="error-text">${escapeHtml(paper.processing_error)}</span>` : ""}${paper.translation_status ? `<br><span class="muted small-text">Translation: ${escapeHtml(paper.translation_status)}</span>` : ""}${paper.translation_error ? `<br><span class="error-text">${escapeHtml(paper.translation_error)}</span>` : ""}</td>
         <td class="library-pdf-cell">
-          ${paper.source_pdf ? `<a class="secondary-button mini-button" href="/api/papers/${encodeURIComponent(paper.id)}/pdf" target="_blank">PDF</a>` : '<span class="muted small-text">No PDF</span>'}
+          ${paper.source_pdf ? `<a class="secondary-button mini-button" href="/api/papers/${encodeURIComponent(paper.id)}/pdf" target="_blank">PDF</a>` : `<span class="muted small-text">No PDF</span>`}
           <input type="file" accept="application/pdf,.pdf" hidden data-attach-pdf-input="${escapeHtml(paper.id)}">
-          <button class="secondary-button mini-button" data-attach-pdf="${escapeHtml(paper.id)}">Attach</button>
+          <div class="library-pdf-actions">
+            ${paper.source_pdf ? "" : `<button class="secondary-button mini-button" data-find-pdf="${escapeHtml(paper.id)}" type="button">Find PDF</button>`}
+            <button class="secondary-button mini-button" data-attach-pdf="${escapeHtml(paper.id)}" type="button">Attach</button>
+          </div>
+          ${paper.reference_pdf_error ? `<span class="error-text small-text">${escapeHtml(paper.reference_pdf_error)}</span>` : ""}
         </td>
         <td class="library-actions">
           <div class="library-action-buttons">
             ${libraryPrimaryActionHtml(paper)}
-            <button class="secondary-button" data-add-library-paper-to-mindmap="${escapeHtml(paper.id)}" type="button">Mindmap</button>
             <button class="danger-button" data-delete-paper="${escapeHtml(paper.id)}">Delete</button>
           </div>
         </td>
@@ -10549,6 +13159,7 @@ function libraryRowHtml(paper) {
 
 function renderLibrary() {
   const root = qs("#libraryRoot");
+  state.libraryDirty = false;
   const papers = state.library?.papers || [];
   renderLibraryTagPrompt();
   const projects = allLibraryProjects();
@@ -10556,6 +13167,13 @@ function renderLibrary() {
     state.libraryProject = "all";
   }
   const visiblePapers = sortedLibraryPapers(papers);
+  const pagingKey = JSON.stringify([state.libraryFilter, state.libraryProject, state.librarySort, state.libraryGroup]);
+  if (state.libraryPagingKey !== pagingKey) state.libraryPage = 0;
+  state.libraryPagingKey = pagingKey;
+  const pageCount = Math.max(1, Math.ceil(visiblePapers.length / libraryPageSize));
+  state.libraryPage = Math.min(Math.max(0, state.libraryPage), pageCount - 1);
+  const pageStart = state.libraryPage * libraryPageSize;
+  const pagePapers = visiblePapers.slice(pageStart, pageStart + libraryPageSize);
   const viewChips = uniqueTags(["all", "Unassigned", ...projects]);
   root.innerHTML = `
     <div class="library-view-tabs" aria-label="Project views">
@@ -10584,22 +13202,37 @@ function renderLibrary() {
       <button class="secondary-button mini-button icon-text-button" id="toggleLibraryTitles" type="button" title="${state.libraryTitlesCollapsed ? "Show full titles" : "Collapse titles"}" aria-label="${state.libraryTitlesCollapsed ? "Show full titles" : "Collapse titles"}"><span class="button-icon" aria-hidden="true">Aa</span><span>${state.libraryTitlesCollapsed ? "Full" : "Collapse"}</span></button>
       <button class="secondary-button mini-button icon-text-button library-preview-toggle ${state.libraryPreviewThumbnailsVisible ? "active" : ""}" id="toggleLibraryPreviewThumbs" type="button" aria-pressed="${state.libraryPreviewThumbnailsVisible ? "true" : "false"}" title="${state.libraryPreviewThumbnailsVisible ? "Hide previews" : "Show previews"}" aria-label="${state.libraryPreviewThumbnailsVisible ? "Hide previews" : "Show previews"}"><span class="button-icon" aria-hidden="true">Img</span><span>${state.libraryPreviewThumbnailsVisible ? "Hide" : "Preview"}</span></button>
     </div>
-    <div class="library-view-summary">${escapeHtml(visiblePapers.length)} of ${escapeHtml(papers.length)} papers${state.libraryProject !== "all" ? ` · ${escapeHtml(state.libraryProject)}` : ""}</div>
+    <div class="library-view-summary">${escapeHtml(visiblePapers.length)} of ${escapeHtml(papers.length)} papers${state.libraryProject !== "all" ? ` · ${escapeHtml(state.libraryProject)}` : ""}
+      <nav class="library-pagination" aria-label="Library pages">
+        <button type="button" class="secondary-button mini-button" id="libraryPreviousPage" ${state.libraryPage === 0 ? "disabled" : ""}>Previous</button>
+        <span aria-live="polite">${visiblePapers.length ? pageStart + 1 : 0}–${Math.min(pageStart + libraryPageSize, visiblePapers.length)} · Page ${state.libraryPage + 1} / ${pageCount}</span>
+        <button type="button" class="secondary-button mini-button" id="libraryNextPage" ${state.libraryPage + 1 >= pageCount ? "disabled" : ""}>Next</button>
+      </nav>
+    </div>
     ${visiblePapers.length ? `
     <div class="library-table-wrap" data-density="${escapeHtml(state.libraryDensity)}">
     <table class="library-table">
       ${libraryColGroupHtml()}
       ${libraryHeaderHtml()}
       <tbody>
-        ${libraryRowsHtml(visiblePapers)}
+        ${libraryRowsHtml(pagePapers)}
       </tbody>
     </table>
     </div>` : '<p class="muted">No papers match the current Library view.</p>'}`;
   qs("#libraryFilter")?.addEventListener("input", event => {
     state.libraryFilter = event.target.value;
     saveCurrentLibraryViewSettings();
-    renderLibrary();
+    const selection = event.target.selectionStart;
+    if (state.libraryFilterTimer) clearTimeout(state.libraryFilterTimer);
+    state.libraryFilterTimer = setTimeout(() => {
+      renderLibrary();
+      const input = qs("#libraryFilter");
+      input?.focus({ preventScroll: true });
+      if (input && selection !== null) input.setSelectionRange(selection, selection);
+    }, 120);
   });
+  qs("#libraryPreviousPage")?.addEventListener("click", () => { state.libraryPage -= 1; renderLibraryPreservingScroll(); });
+  qs("#libraryNextPage")?.addEventListener("click", () => { state.libraryPage += 1; renderLibraryPreservingScroll(); });
   qs("#librarySort")?.addEventListener("change", event => {
     state.librarySort = event.target.value;
     saveCurrentLibraryViewSettings();
@@ -10649,6 +13282,15 @@ function renderLibrary() {
   });
   initLibraryColumnResize();
   bindLibraryRowEvents(root);
+  for (const [paperId, draft] of state.metadataDrafts) {
+    const row = root.querySelector(`[data-paper-row="${cssEscape(paperId)}"]`);
+    row?.querySelectorAll("[data-field]").forEach(field => {
+      if (Object.prototype.hasOwnProperty.call(draft, field.dataset.field)) {
+        const value = draft[field.dataset.field];
+        field.value = Array.isArray(value) ? value.join(", ") : value;
+      }
+    });
+  }
 }
 
 function createLibraryProjectView() {
@@ -10684,6 +13326,7 @@ async function refreshProjectContextFromPanel() {
 }
 
 function setMetadataSaveState(paperId, message, kind = "") {
+  renderReaderSaveStatus();
   const node = document.querySelector(`[data-save-state="${cssEscape(paperId)}"]`);
   if (!node) return;
   node.textContent = message;
@@ -10691,6 +13334,15 @@ function setMetadataSaveState(paperId, message, kind = "") {
 }
 
 function scheduleMetadataSave(paperId, delay = 650) {
+  const row = document.querySelector(`[data-paper-row="${cssEscape(paperId)}"]`);
+  if (row) {
+    const draft = {};
+    row.querySelectorAll("[data-field]").forEach(field => {
+      draft[field.dataset.field] = field.dataset.field === "tags" ? normalizeTagsInput(field.value) : field.value;
+    });
+    state.metadataDrafts.set(paperId, draft);
+  }
+  if (!state.metadataDrafts.has(paperId)) return;
   if (state.metadataSaveTimers.has(paperId)) clearTimeout(state.metadataSaveTimers.get(paperId));
   setMetadataSaveState(paperId, "Editing...", "pending");
   const timer = setTimeout(() => {
@@ -10704,18 +13356,15 @@ function scheduleMetadataSave(paperId, delay = 650) {
 }
 
 async function saveMetadataRow(paperId, options = {}) {
-  const row = document.querySelector(`[data-paper-row="${cssEscape(paperId)}"]`);
-  if (!row) return;
-  const data = {};
-  row.querySelectorAll("[data-field]").forEach(field => {
-    const key = field.dataset.field;
-    data[key] = key === "tags" ? normalizeTagsInput(field.value) : field.value;
-  });
+  const data = state.metadataDrafts.get(paperId);
+  if (!data) return;
   setMetadataSaveState(paperId, "Saving...", "saving");
-  const response = await api(`/api/papers/${encodeURIComponent(paperId)}/metadata`, { method: "POST", body: JSON.stringify(data) });
+  const response = await queuePaperWrite(paperId, "metadata", data);
+  if (state.metadataDrafts.get(paperId) === data) state.metadataDrafts.delete(paperId);
   const paper = state.library?.papers?.find(item => item.id === paperId);
   if (paper) Object.assign(paper, data, response.metadata || {});
   if (state.currentPaperId === paperId && state.payload?.metadata) Object.assign(state.payload.metadata, data, response.metadata || {});
+  invalidatePaperCache(paperId);
   setMetadataSaveState(paperId, "Saved", "saved");
   if (!options.silent) toast("Metadata saved");
 }
@@ -10723,6 +13372,8 @@ async function saveMetadataRow(paperId, options = {}) {
 function scrollToParagraph(paragraphId) {
   const target = document.getElementById(paragraphId);
   if (!target) return;
+  state.stopScrollRestore?.();
+  if (target.tagName === "DETAILS") target.open = true;
   history.replaceState(null, "", `#${paragraphId}`);
   updateCurrentOutlineHint(state.payload?.outline?.outline || [], paragraphId);
   target.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -10736,18 +13387,68 @@ function scrollToParagraph(paragraphId) {
 function saveWorkspaceScrollPosition() {
   if (document.body.dataset.activeView !== "reader" || !state.currentPaperId) return;
   state.workspaceScrollByPaper[state.currentPaperId] = window.scrollY || document.documentElement.scrollTop || 0;
+  const viewportTop = readerViewportTop();
+  const paragraph = qsa("#documentRoot .paragraph").find(node => node.getBoundingClientRect().bottom > viewportTop);
+  if (paragraph) state.workspaceAnchorsByPaper[state.currentPaperId] = { segmentId: paragraph.id, offset: paragraph.getBoundingClientRect().top };
+  persistPaperTabs();
+}
+
+function readerViewportTop() {
+  return Math.max(108, qs("#workspaceToolbar")?.getBoundingClientRect().bottom || 0) + 16;
 }
 
 function restoreWorkspaceScrollPosition() {
   if (!state.currentPaperId) return;
-  const y = Number(state.workspaceScrollByPaper[state.currentPaperId]);
+  const paperId = state.currentPaperId;
+  const y = Number(state.workspaceScrollByPaper[paperId] || 0);
   if (!Number.isFinite(y)) return;
-  requestAnimationFrame(() => window.scrollTo({ top: y, behavior: "auto" }));
+  state.stopScrollRestore?.();
+  const saved = state.workspaceAnchorsByPaper[paperId];
+  const anchor = saved ? document.getElementById(saved.segmentId) : null;
+  let stopped = false;
+  const apply = () => {
+    if (stopped || state.currentPaperId !== paperId || document.body.dataset.activeView !== "reader") return;
+    const top = anchor ? window.scrollY + anchor.getBoundingClientRect().top - saved.offset : y;
+    window.scrollTo({ top: Math.max(0, top), behavior: "instant" });
+  };
+  const images = anchor ? qsa("#documentRoot img").filter(image => !image.complete
+    && (anchor.contains(image) || (image.compareDocumentPosition(anchor) & Node.DOCUMENT_POSITION_FOLLOWING))) : [];
+  const pending = new Set(images);
+  // Keep the same paragraph in view while preceding figure parts finish loading.
+  const onImage = event => {
+    pending.delete(event.currentTarget);
+    requestAnimationFrame(() => {
+      apply();
+      if (!pending.size) stop();
+    });
+  };
+  const stop = () => {
+    stopped = true;
+    images.forEach(image => { image.removeEventListener("load", onImage); image.removeEventListener("error", onImage); });
+    window.removeEventListener("wheel", stop);
+    window.removeEventListener("pointerdown", stop);
+    window.removeEventListener("keydown", stop);
+    if (state.stopScrollRestore === stop) state.stopScrollRestore = null;
+  };
+  state.stopScrollRestore = stop;
+  images.forEach(image => { image.addEventListener("load", onImage, { once: true }); image.addEventListener("error", onImage, { once: true }); });
+  window.addEventListener("wheel", stop, { once: true, passive: true });
+  window.addEventListener("pointerdown", stop, { once: true, passive: true });
+  window.addEventListener("keydown", stop, { once: true });
+  requestAnimationFrame(() => {
+    apply();
+    if (!pending.size) stop();
+  });
 }
 
 function activateView(view) {
   const previousView = document.body.dataset.activeView;
-  if (previousView === "reader" && view !== "reader") saveWorkspaceScrollPosition();
+  if (previousView === "reader" && view !== "reader") {
+    saveWorkspaceScrollPosition();
+    state.stopScrollRestore?.();
+    stopReaderBackground();
+    clearTimeout(state.feishuPollTimer);
+  }
   if (previousView === "library" && view !== "library") captureLibraryScroll();
   tickReadingProgress({ skipSchedule: true });
   document.body.dataset.activeView = view;
@@ -10756,18 +13457,116 @@ function activateView(view) {
   qs(`#${view}View`).classList.add("active");
   state.readingLastTick = performance.now();
   if (previousView === "reader" && view !== "reader") scheduleReadingProgressSave(200);
-  if (previousView !== "reader" && view === "reader") restoreWorkspaceScrollPosition();
-  if (view === "library") restoreLibraryScroll();
+  if (previousView !== "reader" && view === "reader") {
+    restoreWorkspaceScrollPosition();
+    watchReaderBackground();
+    watchFeishuMetadata();
+  }
+  if (view === "library") {
+    if (state.libraryDirty || !qs("#libraryRoot")?.children.length) renderLibrary();
+    restoreLibraryScroll();
+  }
+  if (view === "notes") {
+    if (!state.allNotesLoaded) qs("#notesRoot").innerHTML = '<p class="muted">Loading original highlights and notes…</p>';
+    loadAllNotes().catch(error => {
+      toast(`Notes load failed: ${error.message}`);
+      const root = qs("#notesRoot");
+      if (!state.allNotesLoaded) root.textContent = `Notes could not be loaded: ${error.message}. Reopen All Notes to retry.`;
+    });
+  }
   if (view === "canvas" && !state.canvasBoard) loadCanvasBoards().catch(error => toast(`Canvas load failed: ${error.message}`));
   if (view === "mindmap" && !state.mindmap) loadMindmap().catch(error => toast(`Mindmap load failed: ${error.message}`));
   updateAnnotationToolbarVisibility();
 }
 
 function bindEvents() {
+  qs("#toggleProcessingQueue")?.addEventListener("click", () => toggleProcessingQueue());
+  qs("#closeProcessingQueue")?.addEventListener("click", () => toggleProcessingQueue(false));
+  qs("#processingQueueItems")?.addEventListener("click", async event => {
+    const open = event.target.closest("[data-parse-open]");
+    if (open) {
+      await openPaperInWorkspace(open.dataset.parseOpen);
+      if (state.currentPaperId === open.dataset.parseOpen) toggleProcessingQueue(false);
+    }
+    const retry = event.target.closest("[data-parse-retry]");
+    if (retry) retryQueuedParsing(retry.dataset.parseRetry, retry);
+  });
+  qs("#openFeishuIntake")?.addEventListener("click", openFeishuIntake);
+  qs("#publishReadingToFeishu")?.addEventListener("click", openFeishuPublication);
+  qs("#refreshFeishuPublish")?.addEventListener("click", openFeishuPublication);
+  qs("#confirmFeishuPublish")?.addEventListener("click", confirmFeishuPublication);
+  qs("#closeFeishuPublish")?.addEventListener("click", () => qs("#feishuPublishDialog").close());
+  qs("#feishuPublishDialog")?.addEventListener("close", () => {
+    cancelPublicationPolling();
+    state.feishuPublication.version += 1;
+  });
+  qs("#feishuPublishDialog")?.addEventListener("keydown", event => {
+    if (event.key === "Escape") event.stopPropagation();
+  });
+  qs("#closeFeishuIntake")?.addEventListener("click", () => qs("#feishuIntakeDialog").close());
+  qs("#feishuIntakeDialog")?.addEventListener("close", watchFeishuIntakeProcessing);
+  qs("#feishuIntakeDialog")?.addEventListener("keydown", event => {
+    if (event.key === "Escape") event.stopPropagation();
+  });
+  qs("#feishuIntakeSearchForm")?.addEventListener("submit", searchFeishuIntake);
+  qs("#feishuIntakeResults")?.addEventListener("click", event => {
+    const button = event.target.closest("[data-preview-feishu-record]");
+    if (button && !state.feishuIntake.busy) previewFeishuIntake(button.dataset.previewFeishuRecord);
+  });
+  qs("#feishuIntakePreview")?.addEventListener("input", event => {
+    if (event.target.id === "feishuLocalPdfPath") state.feishuIntake.localPath = event.target.value;
+  });
+  qs("#feishuIntakePreview")?.addEventListener("change", event => {
+    if (event.target.id === "feishuAttachmentSelect") {
+      state.feishuIntake.fileToken = event.target.value;
+      renderFeishuIntake();
+    }
+  });
+  qs("#feishuIntakePreview")?.addEventListener("click", async event => {
+    const brief = event.target.closest("[data-feishu-brief]");
+    if (brief) { state.feishuIntake.brief = brief.dataset.feishuBrief; renderFeishuIntake(); }
+    if (event.target.closest("#queueFeishuPaper")) queueFeishuIntake();
+    if (event.target.closest("[data-retry-feishu-parse]")) retryFeishuIntakeParsing();
+    if (event.target.closest("[data-view-feishu-queue]")) {
+      qs("#feishuIntakeDialog").close();
+      toggleProcessingQueue(true);
+    }
+    const open = event.target.closest("[data-open-feishu-paper]");
+    if (open && feishuIntakePhase() === "ready" && open.dataset.openFeishuPaper === state.feishuIntake.localPaper?.id) {
+      const cached = state.paperSessions.get(open.dataset.openFeishuPaper);
+      if (cached?.payload && (!cached.payload.segments?.length || processingStatus(cached.payload.metadata) !== "ready")) {
+        cached.loadedAt = 0;
+      }
+      await openPaperInWorkspace(open.dataset.openFeishuPaper);
+      if (state.currentPaperId === open.dataset.openFeishuPaper) qs("#feishuIntakeDialog").close();
+    }
+  });
+  qs("#toggleTranslationQueue")?.addEventListener("click", () => toggleTranslationQueue());
+  qs("#closeTranslationQueue")?.addEventListener("click", () => toggleTranslationQueue(false));
+  qs("#translationQueueItems")?.addEventListener("click", event => {
+    const open = event.target.closest("[data-queue-open]");
+    if (open) openPaperInWorkspace(open.dataset.queueOpen);
+    const control = event.target.closest("[data-queue-action]");
+    if (control) controlQueuedTranslation(control.dataset.queuePaper, control.dataset.queueAction);
+  });
+  qs("#toggleFeishuMetadata")?.addEventListener("click", () => {
+    state.feishuPanelOpen = !state.feishuPanelOpen;
+    renderFeishuMetadata();
+  });
+  qs("#feishuMetadataPanel")?.addEventListener("input", event => {
+    if (event.target.id === "feishuSearchKeyword") feishuPaperState(state.currentPaperId).query = event.target.value;
+  });
+  qs("#feishuMetadataPanel")?.addEventListener("click", event => {
+    if (event.target.closest("[data-close-feishu]")) { state.feishuPanelOpen = false; renderFeishuMetadata(); }
+    if (event.target.closest("[data-search-feishu]")) searchFeishuPapers();
+    if (event.target.closest("[data-refresh-feishu]")) syncFeishuPaper();
+    const match = event.target.closest("[data-link-feishu]");
+    if (match) syncFeishuPaper(state.currentPaperId, { record_id: match.dataset.linkFeishu });
+  });
   document.addEventListener("pointerdown", event => {
     state.lastPointerPosition = { x: event.clientX, y: event.clientY };
-    if (event.target.closest("#noteDrawer, #annotationToolbar, [data-media-note], [data-edit-annotation], [data-inline-thinking-note], mark[data-annotation-id]")) return;
-    if (qs("#noteDrawer")?.classList.contains("open")) closeDrawer();
+    if (event.target.closest("#noteDrawer, #annotationToolbar, .paper-tab-strip, [data-media-note], [data-edit-annotation], [data-inline-thinking-note], mark[data-annotation-id]")) return;
+    if (qs("#noteDrawer")?.classList.contains("open") && !noteDrawerHasChanges()) closeDrawer();
   });
   document.addEventListener("pointerup", event => {
     state.lastPointerPosition = { x: event.clientX, y: event.clientY };
@@ -10777,7 +13576,46 @@ function bindEvents() {
     if (event.target.closest(".library-tag-menu-wrap")) return;
     closeLibraryTagMenus();
   });
-  qs("#paperSelect").addEventListener("change", event => loadPaper(event.target.value));
+  qs("#paperSelect").addEventListener("change", event => {
+    if (event.target.value) openPaperInWorkspace(event.target.value);
+    else activateView("library");
+  });
+  qs("#paperTabs")?.addEventListener("click", event => {
+    const close = event.target.closest("[data-close-paper-tab]");
+    if (close) { closePaperTab(close.dataset.closePaperTab); return; }
+    const tab = event.target.closest("[data-paper-tab]");
+    if (tab) openPaperInWorkspace(tab.dataset.paperTab);
+  });
+  qs("#paperTabs")?.addEventListener("keydown", event => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    const tabs = qsa("#paperTabs [data-paper-tab]");
+    if (!tabs.length) return;
+    const index = tabs.indexOf(document.activeElement);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1
+      : (index + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    event.preventDefault();
+    tabs[next].focus();
+    openPaperInWorkspace(tabs[next].dataset.paperTab);
+  });
+  qs("#openPaperLibrary")?.addEventListener("click", () => activateView("library"));
+  qs("#exportNotesMarkdown")?.addEventListener("click", () => exportReadingData("md"));
+  qs("#exportReadingJson")?.addEventListener("click", () => exportReadingData("json"));
+  qs("#reloadCurrentPaper")?.addEventListener("click", () => {
+    if (state.currentPaperId) loadPaper(state.currentPaperId, { force: true });
+  });
+  qs("#toggleReadingTeacher")?.addEventListener("click", () => {
+    state.readingTeacher.enabled = !state.readingTeacher.enabled;
+    refreshReadingTeacher();
+    capturePaperSession();
+  });
+  qs("#toggleTeacherDepth")?.addEventListener("click", () => {
+    state.readingTeacher.showDeep = !state.readingTeacher.showDeep;
+    state.readingTeacher.openCardId = "";
+    state.readingTeacher.activeCardId = "";
+    refreshReadingTeacher();
+    capturePaperSession();
+  });
+  qs("#documentRoot")?.addEventListener("click", handleReadingTeacherSourceClick);
   qsa(".tab").forEach(tab => tab.addEventListener("click", () => activateView(tab.dataset.view)));
   qs("#canvasProject")?.addEventListener("change", event => loadCanvasBoards(event.target.value).catch(error => toast(`Canvas load failed: ${error.message}`)));
   qs("#createCanvasBoard")?.addEventListener("click", () => createCanvasBoard().catch(error => toast(`Create board failed: ${error.message}`)));
@@ -10901,7 +13739,31 @@ function bindEvents() {
       searchMindmapPapers();
     }
   });
-  qsa("[data-workspace-mode]").forEach(button => button.addEventListener("click", () => setWorkspaceMode(button.dataset.workspaceMode)));
+  qsa(".workspace-mode").forEach(button => button.addEventListener("click", () => setWorkspaceMode(button.dataset.workspaceMode)));
+  const moreActions = qs("#readerMoreActions");
+  moreActions?.addEventListener("click", event => {
+    if (!event.target.closest("button, a")) return;
+    const restoreFocus = moreActions.contains(document.activeElement);
+    moreActions.open = false;
+    if (restoreFocus) moreActions.querySelector("summary")?.focus({ preventScroll: true });
+  });
+  moreActions?.addEventListener("change", event => {
+    if (event.target.id === "paperSelect") moreActions.open = false;
+  });
+  document.addEventListener("click", event => {
+    if (moreActions?.open && !moreActions.contains(event.target)) moreActions.open = false;
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape" && moreActions?.open) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      moreActions.open = false;
+      moreActions.querySelector("summary")?.focus();
+    }
+  });
+  document.addEventListener("input", event => {
+    if (event.target.closest("#noteDrawer, #sensemakingPanel")) renderReaderSaveStatus();
+  });
   qs("#toggleWorkspaceMetadata")?.addEventListener("click", toggleWorkspaceMetadataEditor);
   qs("#workspaceMetadataPanel")?.addEventListener("click", handleWorkspaceMetadataClick);
   qsa("[data-reader-side-pane]").forEach(button => button.addEventListener("click", () => {
@@ -10976,10 +13838,18 @@ function bindEvents() {
   });
   document.addEventListener("visibilitychange", () => {
     tickReadingProgress({ skipSchedule: true });
-    if (document.hidden) flushReadingProgress({ silent: true });
+    if (document.hidden) {
+      saveWorkspaceScrollPosition();
+      flushReadingProgress({ silent: true });
+    }
     else state.readingLastTick = performance.now();
   });
-  window.addEventListener("beforeunload", () => {
+  window.addEventListener("beforeunload", event => {
+    saveWorkspaceScrollPosition();
+    if (hasUnsavedPaperChanges()) {
+      event.preventDefault();
+      event.returnValue = "";
+    }
     tickReadingProgress({ skipSchedule: true });
     if (!state.currentPaperId || !state.readingProgressDirty || !navigator.sendBeacon) return;
     const blob = new Blob([JSON.stringify({ segments: state.readingProgress?.segments || {} })], { type: "application/json" });
@@ -10999,6 +13869,13 @@ function bindEvents() {
     button.addEventListener("click", () => addHighlightFromSelection(button.dataset.toolbarColor, false));
   });
   qs("#toolbarNote").addEventListener("click", () => addHighlightFromSelection("yellow", true));
+  qs("#toolbarQuestion")?.addEventListener("click", () => {
+    addHighlightFromSelection("blue", true);
+    if (state.pendingAnnotation || state.pendingThinkingAnnotation) {
+      renderNoteTagOptions(["question"]);
+      state.drawerInitialValue = noteDrawerSnapshot();
+    }
+  });
   qs("#toolbarAskAi")?.addEventListener("click", askAiFromCurrentSelection);
   qs("#closeDrawer").addEventListener("click", closeDrawer);
   qs("#addCustomTag").addEventListener("click", addCustomDrawerTag);
@@ -11041,6 +13918,7 @@ initLibraryPreferences();
 initPaperMapCollapse();
 initSidebarResize();
 initSensemakingResize();
+initReaderWidth();
 initReportResize();
 bindEvents();
 loadLibrary().catch(error => {

@@ -3,7 +3,8 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Paper Reader Agent</title>
+    <title>Paper Reader</title>
+    <link rel="stylesheet" href="/vendor/katex/katex.min.css" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body data-active-view="reader">
@@ -11,30 +12,77 @@
       <div class="brand">
         <span class="brand-mark">P</span>
         <div>
-          <strong>Paper Reader Agent</strong>
+          <strong>Paper Reader</strong>
           <span id="workspaceLabel">Local workspace</span>
         </div>
       </div>
       <nav class="tabs" aria-label="Views">
-        <button class="tab active" data-view="reader">Workspace</button>
+        <button class="tab active" data-view="reader">Reader</button>
         <button class="tab" data-view="notes">All Notes</button>
         <button class="tab" data-view="library">Library</button>
-        <button class="tab" data-view="mindmap">Mindmap</button>
       </nav>
-      <select id="paperSelect" class="paper-select" aria-label="Select paper"></select>
+      <button id="toggleTranslationQueue" class="secondary-button mini-button" type="button" aria-expanded="false" aria-controls="translationQueuePanel" aria-label="Translation queue"><span class="queue-label-prefix">Translation </span>queue</button>
     </header>
+    <nav class="paper-tab-strip" aria-label="Open papers">
+      <div id="paperTabs" class="paper-tabs" role="tablist" aria-label="Paper tabs"></div>
+      <span id="paperLoadStatus" class="paper-load-status" role="status">Loading library…</span>
+      <button id="toggleProcessingQueue" class="secondary-button mini-button" type="button" aria-expanded="false" aria-controls="processingQueuePanel">Parse queue</button>
+      <button id="openPaperLibrary" class="secondary-button mini-button" type="button">+ Open paper</button>
+    </nav>
+    <aside id="translationQueuePanel" class="translation-queue-panel" aria-label="Background translation queue" hidden>
+      <div class="queue-heading"><strong>Background translation</strong><button id="closeTranslationQueue" class="icon-button" type="button" aria-label="Close translation queue">×</button></div>
+      <p id="translationQueueSummary" class="muted small-text" role="status">Loading queue…</p>
+      <div id="translationQueueItems"></div>
+    </aside>
+    <aside id="processingQueuePanel" class="translation-queue-panel" aria-label="PDF parsing queue" hidden>
+      <div class="queue-heading"><strong>PDF → Markdown</strong><button id="closeProcessingQueue" class="icon-button" type="button" aria-label="Close parsing queue">×</button></div>
+      <p id="processingQueueSummary" class="muted small-text" role="status"></p>
+      <div id="processingQueueItems"></div>
+    </aside>
 
-    <button id="paperMapRail" class="paper-map-rail" type="button" aria-label="Open Paper Map" title="Open Paper Map">Map</button>
+    <dialog id="feishuIntakeDialog" class="feishu-intake-dialog" aria-labelledby="feishuIntakeTitle">
+      <div class="queue-heading">
+        <h2 id="feishuIntakeTitle">Open from Feishu</h2>
+        <button id="closeFeishuIntake" class="icon-button" type="button" aria-label="Close Feishu intake">×</button>
+      </div>
+      <form id="feishuIntakeSearchForm" class="feishu-intake-search">
+        <input id="feishuIntakeQuery" type="search" aria-label="Paper title, Feishu record link, or record ID" placeholder="Paper title, record link, or rec… ID" required />
+        <button id="searchFeishuIntake" class="secondary-button" type="submit" title="Preview only; no PDF download or parsing">Search / preview</button>
+      </form>
+      <p id="feishuIntakeStatus" class="muted small-text" role="status" aria-live="polite"></p>
+      <div class="feishu-intake-body">
+        <div id="feishuIntakeResults" class="feishu-intake-results"></div>
+        <section id="feishuIntakePreview" class="feishu-intake-preview" aria-label="Read-only Feishu preview"></section>
+      </div>
+    </dialog>
+
+    <dialog id="feishuPublishDialog" class="feishu-publish-dialog" aria-labelledby="feishuPublishTitle">
+      <div class="queue-heading">
+        <h2 id="feishuPublishTitle">Publish reading records</h2>
+        <button id="closeFeishuPublish" class="icon-button" type="button" aria-label="Close publication preview">×</button>
+      </div>
+      <p id="feishuPublishPaper" class="feishu-publish-paper"></p>
+      <p id="feishuPublishStatus" role="status" aria-live="polite"></p>
+      <p id="feishuPublishError" class="error-text" role="alert" hidden></p>
+      <div id="feishuPublishDestination" class="feishu-publish-destination"></div>
+      <div id="feishuPublishPreview"></div>
+      <div class="feishu-publish-actions">
+        <button id="refreshFeishuPublish" class="secondary-button" type="button">Refresh preview</button>
+        <button id="confirmFeishuPublish" class="primary-button" type="button" disabled>Confirm &amp; publish</button>
+      </div>
+    </dialog>
+
+    <button id="paperMapRail" class="paper-map-rail" type="button" aria-label="Open outline" title="Open outline">Outline</button>
 
     <main class="app-shell">
       <aside class="sidebar" id="sidebar">
         <section id="outlinePane">
           <div class="sidebar-heading-row">
-            <h2>Paper Map</h2>
-            <button id="togglePaperMap" class="icon-button sidebar-toggle-button" type="button" title="Collapse Paper Map" aria-label="Collapse Paper Map">×</button>
+            <h2>Contents</h2>
+            <button id="togglePaperMap" class="icon-button sidebar-toggle-button" type="button" title="Collapse outline" aria-label="Collapse outline">×</button>
           </div>
           <div class="paper-map-tabs" aria-label="Paper Map views">
-            <button class="paper-map-tab active" data-paper-map-tab="map" type="button">Map</button>
+            <button class="paper-map-tab active" data-paper-map-tab="map" type="button">Outline</button>
             <button class="paper-map-tab" data-paper-map-tab="media" type="button">Figures / Tables</button>
           </div>
           <div id="outlineList" class="outline-list paper-map-pane"></div>
@@ -55,56 +103,94 @@
               <button class="toolbar-color swatch-rose" data-toolbar-color="rose" title="Highlight rose"></button>
             </div>
             <button id="toolbarNote" class="secondary-button toolbar-command" title="Add note to selection" aria-label="Add note to selection"><span class="button-icon" aria-hidden="true">+</span><span>Note</span></button>
-            <button id="toolbarAskAi" class="secondary-button toolbar-command" title="Ask AI about selection" aria-label="Ask AI about selection"><span class="button-icon" aria-hidden="true">AI</span><span>Ask</span></button>
-            <span id="toolbarStatus" class="toolbar-status">Select text to annotate</span>
+            <button id="toolbarQuestion" class="secondary-button toolbar-command" title="Save your question without calling AI" aria-label="Save a question"><span class="button-icon" aria-hidden="true">?</span><span>Question</span></button>
+            <span id="toolbarStatus" class="toolbar-status"></span>
           </div>
-          <div id="paperMeta" class="paper-meta"></div>
           <div id="workspaceToolbar" class="workspace-toolbar" aria-label="Paper workspace controls">
+            <button id="togglePaperMapMain" class="secondary-button mini-button" type="button" aria-controls="sidebar">Outline</button>
             <div class="workspace-mode-tabs" aria-label="Workspace mode">
-              <button class="workspace-mode" data-workspace-mode="read" data-mode-icon="Aa" aria-label="Read mode">Read</button>
-              <button class="workspace-mode active" data-workspace-mode="split" data-mode-icon="II" aria-label="Split mode">Split</button>
-              <button class="workspace-mode" data-workspace-mode="think" data-mode-icon="AI" aria-label="Think mode">Think</button>
+              <button class="workspace-mode" data-workspace-mode="read" aria-label="Read mode">Read</button>
+              <button class="workspace-mode active" data-workspace-mode="split" aria-label="Split mode" title="Read alongside notes and saved writing">Split</button>
+              <button class="workspace-mode" data-workspace-mode="think" aria-label="Notes only mode" title="Show only notes and saved writing">Notes only</button>
             </div>
-            <button id="translateCurrentPaper" class="secondary-button icon-text-button" type="button" title="Translate current paper" aria-label="Translate current paper"><span class="button-icon" aria-hidden="true">T</span><span>Translate</span></button>
-            <button id="toggleWorkspaceMetadata" class="secondary-button icon-text-button" type="button" title="Change paper metadata" aria-label="Change paper metadata"><span class="button-icon" aria-hidden="true">Md</span><span>Metadata</span></button>
+            <label class="reader-width-control" for="readerWidth" title="Maximum text width in Read and Split; always fits the available space">
+              <span>Width</span>
+              <select id="readerWidth" aria-label="Reading text width">
+                <option value="comfortable">Comfortable</option>
+                <option value="wide" selected>Wide</option>
+                <option value="full">Full width</option>
+              </select>
+            </label>
+            <button id="toggleReadingTeacher" class="secondary-button mini-button" type="button" aria-pressed="true" hidden>AI teacher</button>
+            <button id="toggleTeacherDepth" class="secondary-button mini-button" type="button" aria-pressed="false" hidden>深入思考</button>
+            <nav id="readingTeacherNav" class="reading-teacher-nav" aria-label="AI annotation locations" hidden>
+              <button id="previousTeacherCard" class="secondary-button mini-button" type="button" aria-label="Previous AI annotation" title="Previous AI annotation">&lsaquo;</button>
+              <select id="readingTeacherLocation" aria-label="Go to AI annotation"></select>
+              <button id="nextTeacherCard" class="secondary-button mini-button" type="button" aria-label="Next AI annotation" title="Next AI annotation">&rsaquo;</button>
+            </nav>
+            <span id="readerSaveStatus" class="reader-save-status" role="status" aria-live="polite"></span>
+            <details id="readerMoreActions" class="reader-more-actions">
+              <summary>More</summary>
+              <div class="reader-data-actions" aria-label="Original reading data">
+                <label for="paperSelect">Open papers</label>
+                <select id="paperSelect" class="paper-select" aria-label="Select paper"></select>
+                <button id="toggleWorkspaceMetadata" class="secondary-button mini-button" type="button">Paper details</button>
+                <button id="toggleFeishuMetadata" class="secondary-button mini-button" type="button" hidden>Feishu metadata</button>
+                <button id="publishReadingToFeishu" class="secondary-button mini-button" type="button" title="Preview and copy saved reading records into the linked Feishu row, without generating a summary" hidden>Publish to Feishu</button>
+                <button id="exportNotesMarkdown" class="secondary-button mini-button" type="button" title="Export original highlights and notes without AI rewriting">Notes Markdown</button>
+                <button id="exportReadingJson" class="secondary-button mini-button" type="button" title="Export structured original reading data for agents">Raw JSON</button>
+                <button id="reloadCurrentPaper" class="secondary-button mini-button" type="button" title="Reload files changed by an agent after saving current edits">Reload from disk</button>
+                <div id="readerFileLinks" class="reader-file-links"></div>
+                <div id="readerImportance"></div>
+              </div>
+            </details>
           </div>
+          <div class="reader-status-line" aria-label="Reading status">
+            <div id="readerTranslationStatus" class="reader-translation-status" role="status" aria-live="polite" hidden>
+              <div class="translation-status-copy">
+                <strong id="translationStatusLabel">Background translation</strong>
+                <span id="translationStatusDetail"></span>
+              </div>
+              <progress id="translationProgress" max="1" value="0" aria-label="Translated paragraphs" hidden></progress>
+              <button id="translateCurrentPaper" class="secondary-button mini-button" type="button" title="Only paper text is sent for translation; your notes are not included">Pause</button>
+            </div>
+            <span id="feishuSyncStatus" class="muted small-text" role="status"></span>
+          </div>
+          <div id="readingTeacherStatus" class="reading-teacher-status" role="status" aria-live="polite" hidden></div>
+          <div id="paperMeta" class="paper-meta"></div>
+          <section id="feishuMetadataPanel" class="feishu-metadata-panel" aria-label="Feishu metadata mapping" hidden></section>
           <aside id="workspaceMetadataPanel" class="workspace-metadata-panel" aria-hidden="true" aria-live="polite" hidden></aside>
-          <div class="reader-workspace" data-workspace-mode="split">
-            <div id="documentRoot" class="document-root"></div>
-            <div id="sensemakingResizeHandle" class="sensemaking-resize-handle" title="Drag to resize sensemaking panel" aria-hidden="true"></div>
-            <aside id="sensemakingPanel" class="sensemaking-panel" data-side-pane="sensemaking" aria-label="Paper sensemaking">
-              <div class="sensemaking-header">
-                <div>
-                  <h2 id="readerSidePanelTitle">Sensemaking</h2>
-                  <p id="readerSidePanelDescription">Chronological AI outputs and your reading thoughts.</p>
-                </div>
-                <span id="thinkingSaveState" class="thinking-save-state">Ready</span>
-              </div>
-              <div class="reader-side-tabs" aria-label="Reader side panel">
-                <button class="reader-side-tab active" data-reader-side-pane="sensemaking" type="button">Sensemaking</button>
-                <button class="reader-side-tab" data-reader-side-pane="takeaway" type="button">Takeaway Report</button>
-              </div>
-              <div id="sensemakingPane" class="reader-side-pane reader-side-pane-active">
-                <section id="explainPane" class="thinking-pane thinking-pane-hidden"></section>
-                <section id="writingPane" class="thinking-pane"></section>
-              </div>
-              <section id="takeawayPane" class="reader-side-pane takeaway-side-pane" hidden>
-                <div class="presentation-report-header">
+          <div class="reader-workspace-container">
+            <div class="reader-workspace" data-workspace-mode="split">
+              <div id="documentRoot" class="document-root" data-reader-width="wide"></div>
+              <div id="sensemakingResizeHandle" class="sensemaking-resize-handle" title="Drag to resize chat panel" aria-hidden="true"></div>
+              <aside id="sensemakingPanel" class="sensemaking-panel" data-side-pane="sensemaking" aria-label="AI chat and saved writing">
+                <div class="sensemaking-header">
                   <div>
-                    <span class="sense-kicker">Reading Synthesis</span>
-                    <h2 id="presentationReportTitle">Takeaway Report</h2>
+                    <h2 id="readerSidePanelTitle">AI chat</h2>
                   </div>
-                  <button id="closePresentationReport" class="icon-button" title="Back to Sensemaking" aria-label="Back to Sensemaking">x</button>
+                  <span id="thinkingSaveState" class="thinking-save-state">Ready</span>
+                  <button id="closePresentationReport" class="icon-button" title="Back to chat" aria-label="Back to chat">×</button>
                 </div>
-                <div id="presentationReportRoot" class="presentation-root muted">Waiting for agent analysis.</div>
-              </section>
-            </aside>
+                <div class="reader-side-tabs" aria-label="Reader side panel">
+                  <button class="reader-side-tab active" data-reader-side-pane="sensemaking" type="button">AI chat</button>
+                  <button class="reader-side-tab" data-reader-side-pane="takeaway" type="button">Saved Takeaway</button>
+                </div>
+                <div id="sensemakingPane" class="reader-side-pane reader-side-pane-active">
+                  <section id="explainPane" class="thinking-pane thinking-pane-hidden"></section>
+                  <section id="writingPane" class="thinking-pane"></section>
+                </div>
+                <section id="takeawayPane" class="reader-side-pane takeaway-side-pane" hidden>
+                  <h2 id="presentationReportTitle" hidden>Saved Takeaway</h2>
+                  <div id="presentationReportRoot" class="presentation-root muted">No saved writing yet.</div>
+                </section>
+              </aside>
+            </div>
           </div>
         </div>
         <div id="notesView" class="view">
           <div class="view-heading">
             <h1>Notes</h1>
-            <p>All papers' highlights and notes are collected here.</p>
           </div>
           <div class="notes-workspace">
             <section class="notes-list-panel" aria-label="All notes">
@@ -115,15 +201,15 @@
             <aside id="notesSourcePanel" class="notes-source-panel" aria-label="Source context">
               <div class="notes-source-empty">
                 <h2>Source Context</h2>
-                <p>Select a note's paper link to review the original passage without leaving Notes.</p>
+                <p>Select a note.</p>
               </div>
             </aside>
           </div>
         </div>
         <div id="libraryView" class="view">
           <div class="view-heading">
-            <h1>Library</h1>
-            <p>Add PDFs to automatically convert them to Markdown and generate a Paper Brief. Translate full text when a paper is worth deep reading.</p>
+            <h1>Local Library</h1>
+            <button id="openFeishuIntake" class="secondary-button" type="button" hidden>From Feishu</button>
           </div>
           <div class="library-intake">
             <div class="library-intake-main">
@@ -135,7 +221,6 @@
           <div id="libraryDropZone" class="library-drop-zone" tabindex="0">
             <input id="pdfFilePicker" type="file" accept="application/pdf,.pdf" multiple hidden />
             <strong>Drop PDFs here</strong>
-            <span>or choose multiple PDF files from your computer.</span>
             <button id="choosePdfFiles" class="secondary-button" type="button">Choose PDFs</button>
             <div id="libraryUploadStatus" class="library-upload-status" aria-live="polite" hidden></div>
             <aside id="libraryTagPrompt" class="library-tag-prompt" aria-hidden="true" aria-live="polite" hidden></aside>
@@ -283,7 +368,7 @@
       </div>
       <div class="drawer-actions">
         <button id="deleteDrawerNote" class="danger-button" type="button" hidden>Delete Note</button>
-        <button id="saveNote" class="primary-button">Send Note</button>
+        <button id="saveNote" class="primary-button">Save Note</button>
         <button id="saveHighlightOnly" class="secondary-button">Keep Highlight</button>
       </div>
     </aside>
@@ -319,6 +404,7 @@
     </aside>
 
     <div id="toast" class="toast" role="status"></div>
+    <script src="/vendor/katex/katex.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

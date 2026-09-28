@@ -10,15 +10,20 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 import html
+import ipaddress
 import json
+import math
 import mimetypes
 import os
+import queue
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -29,33 +34,42 @@ import urllib.request
 import uuid
 import webbrowser
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+import feishu_metadata
+import feishu_publish
+from reading_teacher import is_teacher_definition, validate_reading_teacher
+
 TOOL_VERSION = "0.1.0"
 DEFAULT_WORKSPACE_NAME = "paper_reading_workspace"
 CONFIG_FILE = ".paper-reader-agent.json"
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEB_DIR = SCRIPT_DIR / "web"
-WRITE_LOCKS: dict[Path, threading.Lock] = {}
+WRITE_LOCKS: dict[Path, threading.RLock] = {}
 WRITE_LOCKS_GUARD = threading.Lock()
 EXPORT_TIMERS: dict[Path, threading.Timer] = {}
 EXPORT_TIMERS_GUARD = threading.Lock()
-BACKGROUND_PROCESSING_TASKS: set[str] = set()
-BACKGROUND_PROCESSING_LOCK = threading.Lock()
+PROCESSING_JOBS: PaperProcessingJobManager | None = None
+PROCESSING_JOBS_GUARD = threading.Lock()
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 ENV_FILES_LOADED = False
+TRANSLATION_JOBS: TranslationJobManager | None = None
+TRANSLATION_JOBS_GUARD = threading.Lock()
+PUBLICATION_SERVICE: feishu_publish.PublicationService | None = None
+PUBLICATION_SERVICE_GUARD = threading.Lock()
 
 
-def write_lock_for(path: Path) -> threading.Lock:
+def write_lock_for(path: Path) -> threading.RLock:
     key = path.resolve()
     with WRITE_LOCKS_GUARD:
         lock = WRITE_LOCKS.get(key)
         if lock is None:
-            lock = threading.Lock()
+            lock = threading.RLock()
             WRITE_LOCKS[key] = lock
         return lock
 
@@ -298,7 +312,7 @@ def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def read_json(path: Path, default: Any) -> Any:
+def read_json(path: Path, default: Any, *, strict: bool = False) -> Any:
     for attempt in range(8):
         try:
             if not path.exists():
@@ -306,12 +320,14 @@ def read_json(path: Path, default: Any) -> Any:
             with write_lock_for(path):
                 if not path.exists():
                     return default
-                return json.loads(path.read_text(encoding="utf-8"))
+                return json.loads(path.read_text(encoding="utf-8-sig"))
         except PermissionError:
             if attempt == 7:
                 raise
             time.sleep(0.04 * (attempt + 1))
         except json.JSONDecodeError:
+            if strict:
+                raise
             return default
     return default
 
@@ -595,6 +611,130 @@ def render_pdf_preview_image(paper_dir: Path) -> dict[str, str]:
     return {"preview_image": preview_rel, "preview_image_alt": "PDF page 1 preview"} if preview_path.exists() else {}
 
 
+def render_pdf_page_preview(paper_dir: Path, page_number: int) -> str:
+    pdf_path = paper_dir / "original.pdf"
+    if page_number < 1 or not pdf_path.exists() or not pdf_path.is_file():
+        return ""
+    preview_rel = f"assets/page_previews/page_{page_number}.png"
+    preview_path = paper_dir / preview_rel
+    if preview_path.exists() and preview_path.stat().st_size > 0:
+        return preview_rel
+    try:
+        import pypdfium2 as pdfium  # type: ignore[import-not-found]
+
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        if page_number > len(pdf):
+            return ""
+        page = pdf[page_number - 1]
+        bitmap = page.render(scale=1.8)
+        image = bitmap.to_pil()
+        if image.mode == "RGBA":
+            from PIL import Image  # type: ignore[import-not-found]
+
+            background = Image.new("RGB", image.size, "white")
+            background.paste(image, mask=image.getchannel("A"))
+            image = background
+        elif image.mode != "RGB":
+            image = image.convert("RGB")
+        image.thumbnail((1500, 2000))
+        preview_path.parent.mkdir(parents=True, exist_ok=True)
+        image.save(preview_path, format="PNG", optimize=True)
+        for resource in (bitmap, page, pdf):
+            close = getattr(resource, "close", None)
+            if callable(close):
+                close()
+    except Exception:  # noqa: BLE001 - page fallback generation is best-effort
+        return ""
+    return preview_rel if preview_path.exists() else ""
+
+
+def pdf_page_texts(pdf_path: Path) -> list[str]:
+    if not pdf_path.exists() or not pdf_path.is_file():
+        return []
+    try:
+        import pypdf  # type: ignore[import-not-found]
+
+        reader = pypdf.PdfReader(str(pdf_path))
+        return [str(page.extract_text() or "") for page in reader.pages]
+    except Exception:  # noqa: BLE001 - figure fallback should not block opening a paper
+        return []
+
+
+def first_markdown_image_path(markdown: str) -> str:
+    match = re.search(r"!\[[^\]]*\]\(([^)]+)\)", str(markdown or ""))
+    return match.group(1).strip() if match else ""
+
+
+def figure_caption_image_presence(paper_dir: Path, segments: list[dict[str, Any]]) -> dict[str, bool]:
+    presence: dict[str, bool] = {}
+    pending_image_path = ""
+    pending_image_exists = False
+    for segment in segments:
+        markdown = str(segment.get("markdown") or "")
+        image_path = first_markdown_image_path(markdown)
+        if image_path:
+            pending_image_path = image_path
+            pending_image_exists = (paper_dir / image_path).exists()
+        caption_match = re.search(r"(?:^|\n)\s*(?:fig(?:ure)?\.?)\s*(\d+)(?:\s*(?:[.\-]\s*)?\(?[a-z]\)?)?\s*[:.]\s*(.+)", markdown, flags=re.I | re.S)
+        if caption_match:
+            presence[caption_match.group(1)] = bool(pending_image_path and pending_image_exists)
+            pending_image_path = ""
+            pending_image_exists = False
+    return presence
+
+
+def figure_fallbacks_from_pdf(paper_dir: Path, segments: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Explicit/offline fallback generation, never part of a reader GET."""
+    caption_numbers: list[str] = []
+    for segment in segments:
+        caption_match = re.search(r"(?:^|\n)\s*(?:fig(?:ure)?\.?)\s*(\d+)(?:\s*(?:[.\-]\s*)?\(?[a-z]\)?)?\s*[:.]\s*(.+)", str(segment.get("markdown") or ""), flags=re.I | re.S)
+        if caption_match and caption_match.group(1) not in caption_numbers:
+            caption_numbers.append(caption_match.group(1))
+    if not caption_numbers:
+        return {}
+    image_presence = figure_caption_image_presence(paper_dir, segments)
+    if all(image_presence.get(number, False) for number in caption_numbers):
+        return {}
+    page_texts = pdf_page_texts(paper_dir / "original.pdf")
+    if not page_texts:
+        return {}
+    fallbacks: dict[str, dict[str, Any]] = {}
+    for segment in segments:
+        markdown = str(segment.get("markdown") or "")
+        caption_match = re.search(r"(?:^|\n)\s*(?:fig(?:ure)?\.?)\s*(\d+)(?:\s*(?:[.\-]\s*)?\(?[a-z]\)?)?\s*[:.]\s*(.+)", markdown, flags=re.I | re.S)
+        if not caption_match:
+            continue
+        number = caption_match.group(1)
+        if number in fallbacks:
+            continue
+        caption = markdown_plain_text(markdown)
+        caption_probe = re.sub(r"\s+", " ", caption[:180]).strip()
+        if not caption_probe:
+            continue
+        page_number = 0
+        caption_key = re.sub(r"\s+", " ", f"Figure {number}")
+        for index, page_text in enumerate(page_texts, start=1):
+            normalized_page = re.sub(r"\s+", " ", page_text)
+            if caption_probe in normalized_page or (caption_key in normalized_page and caption_probe[:60] in normalized_page):
+                page_number = index
+                break
+        if not page_number:
+            continue
+        src = render_pdf_page_preview(paper_dir, page_number)
+        if not src:
+            continue
+        fallbacks[number] = {
+            "number": number,
+            "src": src,
+            "caption_segment_id": str(segment.get("id") or ""),
+            "caption": markdown,
+            "page": page_number,
+            "fallback": "pdf-page",
+            "replace_existing": not image_presence.get(number, False),
+        }
+    return fallbacks
+
+
 def infer_paper_preview_image(paper_dir: Path, metadata: dict[str, Any] | None = None, *, generate_pdf_preview: bool = False) -> dict[str, str]:
     metadata = metadata or {}
     explicit = clean_preview_image_path(metadata.get("preview_image") or metadata.get("cover_image") or metadata.get("thumbnail"), paper_dir)
@@ -650,7 +790,7 @@ def paper_brief_annotation_counts(paper_dir: Path) -> dict[str, int]:
     }
 
 
-def normalized_metadata(paper_dir: Path, metadata: dict[str, Any], *, generate_pdf_preview: bool = False) -> dict[str, Any]:
+def normalized_metadata(paper_dir: Path, metadata: dict[str, Any], *, generate_pdf_preview: bool = False, discover_preview: bool = True) -> dict[str, Any]:
     fields = infer_processing_fields(paper_dir, metadata)
     result = {**metadata}
     if "author" in result and not result.get("authors"):
@@ -668,7 +808,7 @@ def normalized_metadata(paper_dir: Path, metadata: dict[str, Any], *, generate_p
     if result.get("preview_image") and not clean_preview_image_path(result.get("preview_image"), paper_dir):
         result["preview_image"] = ""
         result["preview_image_alt"] = ""
-    if not result.get("preview_image"):
+    if discover_preview and not result.get("preview_image"):
         preview = infer_paper_preview_image(paper_dir, result, generate_pdf_preview=generate_pdf_preview)
         if preview.get("preview_image"):
             result.update(preview)
@@ -689,7 +829,7 @@ def should_replace_title(metadata: dict[str, Any], candidate: str) -> bool:
     candidate = str(candidate or "").strip()
     if not candidate:
         return False
-    if metadata.get("title_locked") or metadata.get("title_source") == "user":
+    if metadata.get("title_locked") or metadata.get("title_source") in {"user", "feishu"}:
         return False
     current = str(metadata.get("title") or "").strip()
     if not current:
@@ -848,7 +988,6 @@ def default_project_context_source(project: str) -> str:
 
 
 def read_project_contexts(workspace: Path) -> dict[str, Any]:
-    ensure_workspace(workspace)
     raw = read_json(project_contexts_path(workspace), {"version": 1, "contexts": {}})
     contexts = raw.get("contexts") if isinstance(raw.get("contexts"), dict) else {}
     for project in CANONICAL_PROJECTS:
@@ -1048,6 +1187,12 @@ def normalize_title_key(title: Any) -> str:
     return "".join(char for char in normalized if char.isalnum())
 
 
+def normalize_title_key_without_leading_articles(title: Any) -> str:
+    normalized = unicodedata.normalize("NFKC", html.unescape(str(title or ""))).casefold()
+    normalized = re.sub(r"^\s*(?:the|a|an)\s+", "", normalized)
+    return "".join(char for char in normalized if char.isalnum())
+
+
 def title_key_is_usable(title_key: str) -> bool:
     if not title_key:
         return False
@@ -1080,6 +1225,8 @@ def find_duplicate_paper_by_title(workspace: Path, title: Any, exclude_paper_id:
     title_key = normalize_title_key(title)
     if not title_key_is_usable(title_key):
         return None
+    title_keys = {title_key, normalize_title_key_without_leading_articles(title)}
+    title_keys = {key for key in title_keys if title_key_is_usable(key)}
     library = load_library_raw(workspace)
     for paper in library.get("papers", []):
         paper_id = str(paper.get("id") or "")
@@ -1094,7 +1241,12 @@ def find_duplicate_paper_by_title(workspace: Path, title: Any, exclude_paper_id:
         if not existing_key and paper_dir.exists():
             metadata = read_json(paper_dir / "metadata.json", {})
             existing_key = str(metadata.get("title_key") or normalize_title_key(metadata.get("title") or ""))
-        if existing_key and existing_key == title_key:
+        existing_title = paper.get("title") or metadata.get("title") or ""
+        existing_keys = {existing_key, normalize_title_key_without_leading_articles(existing_title)}
+        existing_keys = {key for key in existing_keys if title_key_is_usable(key)}
+        if title_keys & existing_keys:
+            return paper
+        if existing_title and reference_title_match_score(title, existing_title) >= 0.9:
             return paper
     return None
 
@@ -1106,6 +1258,22 @@ def duplicate_paper_response(workspace: Path, title: str, source_name: str, exis
         "candidate": {"title": title, "source_name": source_name, "title_key": normalize_title_key(title)},
         "existing": duplicate_existing_summary(workspace, existing),
     }
+
+
+def paper_record_dir(workspace: Path, paper: dict[str, Any]) -> Path:
+    return workspace / str(paper.get("paper_dir") or f"papers/{paper.get('id', '')}")
+
+
+def paper_record_has_pdf(workspace: Path, paper: dict[str, Any]) -> bool:
+    paper_dir = paper_record_dir(workspace, paper)
+    if (paper_dir / "original.pdf").exists():
+        return True
+    metadata = read_json(paper_dir / "metadata.json", {}) if paper_dir.exists() else {}
+    return bool(metadata.get("source_pdf") or paper.get("source_pdf"))
+
+
+def duplicate_can_accept_pdf(workspace: Path, paper: dict[str, Any]) -> bool:
+    return bool(paper.get("id")) and not paper_record_has_pdf(workspace, paper)
 
 
 def backup_paper_before_replace(paper_dir: Path) -> str:
@@ -1122,6 +1290,10 @@ def backup_paper_before_replace(paper_dir: Path) -> str:
         "segments.json",
         "outline.json",
         "reference_cards.json",
+        "source_map.json",
+        "translation_notes.md",
+        "terminology_ledger.json",
+        "paper.md",
         "reader.md",
         "annotated.md",
         "notes.md",
@@ -1187,7 +1359,7 @@ def annotation_counts_by_segment(paper_dir: Path) -> dict[str, dict[str, int]]:
     annotations = read_json(paper_dir / "annotations.json", {"annotations": []}).get("annotations", [])
     counts: dict[str, dict[str, int]] = {}
     for annotation in annotations:
-        if not isinstance(annotation, dict):
+        if not isinstance(annotation, dict) or is_teacher_definition(annotation):
             continue
         segment_id = str(annotation.get("segment_id") or "").strip()
         if not segment_id:
@@ -1498,6 +1670,7 @@ def translation_prompt(text: str) -> str:
 3. 不要扩写，不要总结，不要解释。
 4. 如果原文是标题、表格、引用或公式，保持结构。
 5. 只输出译文。
+6. 原图由阅读器单独展示。只翻译正文、图注和表格文字，不要复制或生成图片标记，也不要凭空转写图中文字。
 {table_hint}
 
 原文：
@@ -1531,10 +1704,130 @@ def translate_text_local(text: str) -> str:
     return ollama_generate(translation_prompt(clean), model, host)
 
 
-def translate_text(text: str) -> str:
-    if cloud_llm_enabled():
+def translation_config() -> dict[str, Any]:
+    selected = env_value("PAPER_READER_TRANSLATION_PROVIDER", default="legacy").strip().lower() or "legacy"
+    if selected == "copilot":
+        return {
+            "auto_start": True,
+            "provider": "copilot",
+            "model": env_value("PAPER_READER_COPILOT_MODEL", default="gpt-4.1").strip() or "gpt-4.1",
+        }
+    provider = ("kimi" if cloud_llm_enabled() else "ollama") if selected == "legacy" else selected
+    model = kimi_model() if provider == "kimi" else env_value("PAPER_READER_TRANSLATION_MODEL", default="qwen2.5:7b-instruct")
+    return {"auto_start": False, "provider": provider, "model": model}
+
+
+def translation_concurrency() -> int:
+    value = env_value("PAPER_READER_TRANSLATION_CONCURRENCY", default="1")
+    try:
+        limit = int(value)
+    except ValueError:
+        raise ValueError("PAPER_READER_TRANSLATION_CONCURRENCY must be an integer from 1 to 4.") from None
+    if not 1 <= limit <= 4:
+        raise ValueError("PAPER_READER_TRANSLATION_CONCURRENCY must be an integer from 1 to 4.")
+    return limit
+
+
+class RetryableTranslationError(RuntimeError):
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+def translation_retry_after(value: str | None) -> float | None:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=dt.timezone.utc)
+            seconds = deadline.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return max(0.0, seconds) if math.isfinite(seconds) else None
+
+
+def copilot_translation_endpoint(value: str | None = None) -> str:
+    value = value or env_value("PAPER_READER_COPILOT_BASE_URL", default="http://127.0.0.1:4141/v1").strip() or "http://127.0.0.1:4141/v1"
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        host = parsed.hostname or ""
+        local = host.lower() == "localhost" or ipaddress.ip_address(host).is_loopback
+        port = parsed.port
+    except ValueError:
+        raise ValueError("Copilot translation requires a loopback HTTP(S) base URL.") from None
+    if not local or parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.query or parsed.fragment or "%" in host:
+        raise ValueError("Copilot translation requires a loopback HTTP(S) base URL without credentials, query or fragment.")
+    # Avoid system proxies and hostname/DNS remapping for local-only requests.
+    hostname = "127.0.0.1" if host.lower() == "localhost" else (f"[{host}]" if ":" in host else host)
+    netloc = f"{hostname}:{port}" if port is not None else hostname
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/chat/completions"):
+        path += "/chat/completions"
+    return urllib.parse.urlunsplit((parsed.scheme, netloc, path, "", ""))
+
+
+class NoTranslationRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+def translate_text_copilot(text: str, model: str, endpoint: str | None = None) -> str:
+    endpoint = copilot_translation_endpoint(endpoint)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "Translate source paper paragraphs into Chinese faithfully. Preserve Markdown structure and technical terms. Output only the complete translation, without summaries or commentary."},
+            {"role": "user", "content": translation_prompt(text)},
+        ],
+        "max_tokens": 1400,
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoTranslationRedirect())
+    try:
+        with opener.open(request, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in {429, 503}:
+            raise RetryableTranslationError(
+                f"Local Copilot translation proxy returned HTTP {exc.code}.",
+                translation_retry_after(exc.headers.get("Retry-After") if exc.headers else None),
+            ) from None
+        raise RuntimeError(f"Local Copilot translation proxy returned HTTP {exc.code}.") from None
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise RetryableTranslationError("Could not reach the local Copilot translation proxy, or the request timed out.") from None
+    except (ValueError, UnicodeError):
+        raise RuntimeError("Local Copilot translation proxy returned invalid JSON.") from None
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    content = message.get("content")
+    if choice.get("finish_reason") != "stop" or message.get("refusal"):
+        raise RuntimeError("Copilot translation was incomplete or refused; no partial translation was saved.")
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Copilot translation was empty; no translation was saved.")
+    return content
+
+
+def translate_text(text: str, config: dict[str, Any] | None = None) -> str:
+    config = config or translation_config()
+    provider = config["provider"]
+    if provider == "copilot":
+        return translate_text_copilot(text, config["model"], config.get("endpoint"))
+    if provider == "kimi":
         return translate_text_cloud(text)
-    return translate_text_local(text)
+    if provider == "ollama":
+        return translate_text_local(text)
+    raise ValueError("Unsupported translation provider; choose copilot, kimi, ollama or legacy.")
 
 
 def appendix_heading_reached(segment: dict[str, Any]) -> bool:
@@ -1545,67 +1838,648 @@ def appendix_heading_reached(segment: dict[str, Any]) -> bool:
     return bool(re.match(r"^(appendix|appendices|附录)\b", clean))
 
 
-def strip_markdown_image_lines(markdown: str) -> str:
-    lines = []
-    for line in str(markdown or "").splitlines():
-        if re.match(r"^!\[[^\]]*\]\([^)]+\)\s*$", line.strip()):
+def strip_translation_images(markdown: str) -> str:
+    text = re.sub(r"!\[(?:\\.|[^\]\\])*\]\((?:\\.|[^\\()]|\([^()]*\))*\)", " ", str(markdown or ""))
+    return re.sub(r"<img\b[^>]*>", " ", text, flags=re.I)
+
+
+_MATH_ENVIRONMENTS = (
+    r"equation\*?|align\*?|alignat\*?|aligned|alignedat|gather\*?|gathered|"
+    r"multline\*?|multlined|eqnarray\*?|split|array|[pbBvV]?matrix\*?|smallmatrix|cases|displaymath"
+)
+_MATH_ENV_TOKEN = re.compile(r"\\(begin|end)\{([^{}\n]+)\}")
+_MATH_OR_CODE = re.compile(
+    r"(?P<fence>^ {0,3}(?:`{3,}|~{3,})[^\n]*)"
+    r"|(?P<indent>^(?: {4}|\t)[^\n]+)"
+    r"|(?P<html><(?P<html_tag>(?i:pre|code))\b[^>]*>)"
+    r"|(?P<comment><!--)"
+    r"|(?P<code>`+)"
+    rf"|(?P<environment>\\begin\{{(?:{_MATH_ENVIRONMENTS})\}})"
+    r"|(?P<delimiter>\$\$|\\\[|\\\(|\$)",
+    re.M,
+)
+
+
+def _math_escaped(text: str, position: int) -> bool:
+    before = position
+    while before and text[before - 1] == "\\":
+        before -= 1
+    return (position - before) % 2 == 1
+
+
+def _balanced_math(expression: str) -> bool:
+    braces = 0
+    fences = 0
+    environments: list[str] = []
+    for match in re.finditer(r"\\(?:begin|end)\{[^{}\n]+\}|\\[A-Za-z]+|\\[\s\S]|[{}$]", expression):
+        token = match.group()
+        environment = _MATH_ENV_TOKEN.fullmatch(token)
+        if environment:
+            action, name = environment.groups()
+            if action == "begin":
+                environments.append(name)
+            elif not environments or environments.pop() != name:
+                return False
+        elif token == "{":
+            braces += 1
+        elif token == "}":
+            braces -= 1
+            if braces < 0:
+                return False
+        elif token == "\\left":
+            fences += 1
+        elif token == "\\right":
+            fences -= 1
+            if fences < 0:
+                return False
+        elif token in {"$", "\\[", "\\]", "\\(", "\\)"}:
+            return False
+    return braces == 0 and fences == 0 and not environments
+
+
+def math_spans(markdown: str) -> list[dict[str, Any]]:
+    """Return nonoverlapping start/end (exclusive), mode and latex spans, excluding code.
+
+    Only closed, structurally balanced math is recognized. Dollar inline math uses
+    tight delimiters except for standalone expressions, and cannot close before a
+    digit (e.g. $5 to $10).
+    Environment spans retain their wrappers in latex; other spans omit delimiters.
+    """
+    text = str(markdown or "")
+    spans: list[dict[str, Any]] = []
+    position = 0
+    while match := _MATH_OR_CODE.search(text, position):
+        start, position = match.span()
+        token = match.group()
+        if _math_escaped(text, start):
             continue
-        lines.append(line)
-    return "\n".join(lines).strip()
+        if match.group("fence"):
+            marker = re.match(r" {0,3}(`+|~+)", token).group(1)
+            closing = re.compile(rf"^ {{0,3}}{re.escape(marker[0])}{{{len(marker)},}}[ \t]*\r?$", re.M).search(text, position)
+            position = closing.end() if closing else len(text)
+            continue
+        if match.group("indent"):
+            continue
+        if match.group("html") or match.group("comment") or match.group("code"):
+            if match.group("html"):
+                pattern = rf"</{match.group('html_tag')}\s*>"
+            elif match.group("comment"):
+                pattern = "-->"
+            else:
+                pattern = rf"(?<!`){re.escape(token)}(?!`)"
+            closing = re.compile(pattern, re.I).search(text, position)
+            position = closing.end() if closing else len(text)
+            continue
+        if match.group("environment"):
+            stack: list[str] = []
+            closing_end = None
+            for environment in _MATH_ENV_TOKEN.finditer(text, start):
+                if _math_escaped(text, environment.start()):
+                    continue
+                action, name = environment.groups()
+                if action == "begin":
+                    stack.append(name)
+                elif not stack or stack.pop() != name:
+                    break
+                elif not stack:
+                    closing_end = environment.end()
+                    body = text[position:environment.start()]
+                    break
+            if closing_end is None:
+                break
+            position = closing_end
+            expression, mode = text[start:position], "display"
+        else:
+            mode = "display" if token in {"$$", "\\["} else "inline"
+            delimiter = {"$$": "$$", "\\[": "\\]", "\\(": "\\)", "$": "$"}[token]
+            if token.startswith("$") and (
+                (start and text[start - 1] == "$") or text[position:position + 1] == "$"
+            ):
+                continue
+            closing_start = position
+            while True:
+                closing_start = text.find(delimiter, closing_start)
+                if closing_start < 0:
+                    break
+                closing_end = closing_start + len(delimiter)
+                if not _math_escaped(text, closing_start) and not (
+                    delimiter.startswith("$") and (
+                        text[closing_start - 1:closing_start] == "$" or text[closing_end:closing_end + 1] == "$"
+                    )
+                ):
+                    break
+                closing_start += len(delimiter)
+            if closing_start < 0:
+                if token != "$":
+                    break
+                continue
+            body = expression = text[position:closing_start]
+            if mode == "inline" and "\n" in body:
+                continue
+            if token == "$" and (
+                not body.strip() or text[closing_end:closing_end + 1].isdigit()
+                or ((body[0].isspace() or body[-1].isspace()) and (text[:start].strip() or text[closing_end:].strip()))
+            ):
+                continue
+            position = closing_end
+        if body.strip() and _balanced_math(expression):
+            spans.append({"start": start, "end": position, "mode": mode, "latex": expression})
+    return spans
+
+
+def _without_math_spans(text: str, spans: list[dict[str, Any]]) -> str:
+    if not spans:
+        return text
+    masked_chunks: list[str] = []
+    position = 0
+    for span in spans:
+        masked_chunks.extend((text[position:span["start"]], re.sub(r"[^\r\n]", " ", text[span["start"]:span["end"]])))
+        position = span["end"]
+    masked = "".join((*masked_chunks, text[position:]))
+    chunks: list[str] = []
+    position = 0
+    for span in spans:
+        start, end = span["start"], span["end"]
+        line_start = text.rfind("\n", 0, start) + 1
+        if not re.search(r"[^\s.,;:，。；：]", masked[line_start:start]):
+            # A number on the equation's line (or its immediate next line) is a
+            # label, not prose. Do not remove separate paragraph/citation numbers.
+            suffix = re.match(
+                r"[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?"
+                r"(?:\\tag\*?\s*\{[^{}\n]+\}|[（(][^\S\r\n]*[A-Za-z]?(?:\d+(?:[.-]\d+)*[A-Za-z]?|[A-Za-z]\.\d+)[^\S\r\n]*[)）])"
+                r"[^\S\r\n]*[.,;:，。；：]?[^\S\r\n]*(?=\r?\n|$)",
+                text[end:],
+            )
+            if suffix:
+                end += suffix.end()
+        chunks.extend((text[position:start], " "))
+        position = end
+    chunks.append(text[position:])
+    return "".join(chunks)
+
+
+def _math_only(text: str, spans: list[dict[str, Any]]) -> bool:
+    return bool(spans) and not re.search(r"[^\s.,;:，。；：]", _without_math_spans(text, spans))
+
+
+def _math_group_end(text: str, start: int) -> int | None:
+    if text[start:start + 1] != "{":
+        return None
+    depth = 0
+    for position in range(start, len(text)):
+        if _math_escaped(text, position):
+            continue
+        if text[position] == "{":
+            depth += 1
+        elif text[position] == "}":
+            depth -= 1
+            if depth == 0:
+                return position + 1
+    return None
+
+
+def _math_key(expression: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    position = 0
+    while position < len(expression):
+        if expression[position].isspace():
+            position += 1
+            continue
+        command = re.match(r"\\[A-Za-z]+|\\[\s\S]", expression[position:])
+        if not command:
+            tokens.append(expression[position])
+            position += 1
+            continue
+        token = command.group()
+        environment = _MATH_ENV_TOKEN.match(expression, position)
+        if environment:
+            action, name = environment.groups()
+            name = name.removesuffix("*")
+            tokens.append(f"\\{action}{{{name}}}")
+            position = environment.end()
+            continue
+        position += len(token)
+        if token in {"\\left", "\\right"}:
+            position += len(expression[position:]) - len(expression[position:].lstrip())
+            if expression[position:position + 1] == ".":
+                position += 1
+            continue
+        group_start = position
+        if token == "\\tag" and expression[group_start:group_start + 1] == "*":
+            group_start += 1
+        while expression[group_start:group_start + 1].isspace():
+            group_start += 1
+        group_end = _math_group_end(expression, group_start)
+        if token in {"\\tag", "\\label"} and group_end is not None:
+            position = group_end
+            continue
+        if token in {"\\text", "\\textrm", "\\textsf", "\\texttt", "\\textnormal", "\\textit", "\\textbf", "\\mbox", "\\operatorname"} and group_end is not None:
+            tokens.append(token + expression[group_start:group_end])
+            position = group_end
+            continue
+        tokens.append(token)
+    layout_environments = {"equation", "displaymath", "align", "alignat", "aligned", "alignedat", "gather", "gathered", "multline", "multlined", "eqnarray", "split"}
+    while len(tokens) > 1:
+        outer = _MATH_ENV_TOKEN.fullmatch(tokens[0])
+        if not outer or outer.group(1) != "begin" or outer.group(2) not in layout_environments:
+            break
+        if tokens[-1] != f"\\end{{{outer.group(2)}}}":
+            break
+        depth = 0
+        for token in tokens[:-1]:
+            environment = _MATH_ENV_TOKEN.fullmatch(token)
+            if environment:
+                depth += 1 if environment.group(1) == "begin" else -1
+            if depth == 0:
+                break
+        if depth == 0:
+            break
+        tokens = tokens[1:-1]
+    return tuple(tokens)
 
 
 def translation_source_for_segment(segment: dict[str, Any]) -> str:
-    markdown = str(segment.get("markdown") or "").strip()
-    if not markdown:
+    """Send prose, inline notation and literal code, omitting display equations."""
+    text = strip_translation_images(str(segment.get("markdown") or ""))
+    if segment.get("kind") == "code":
+        return text.strip()
+    spans = math_spans(text)
+    if _math_only(text, spans):
         return ""
-    if "![" in markdown:
-        return strip_markdown_image_lines(markdown)
-    return markdown
+    return _without_math_spans(text, [span for span in spans if span["mode"] == "display"]).strip()
+
+
+def translation_text_for_segment(segment: dict[str, Any], translation: str | None = None) -> str:
+    """Hide duplicate media/math without mutating saved data.
+
+    Explanatory prose keeps inline notation and unmatched display equations,
+    including when the source itself is math-only. Explicit code remains literal.
+    """
+    text = strip_translation_images(str(segment.get("translation") or "") if translation is None else translation)
+    if segment.get("kind") == "code":
+        return text.strip()
+    source = strip_translation_images(str(segment.get("markdown") or ""))
+    source_spans, spans = math_spans(source), math_spans(text)
+    source_is_math_only, translation_is_math_only = _math_only(source, source_spans), _math_only(text, spans)
+    if source_is_math_only and translation_is_math_only:
+        return ""
+    source_math = {_math_key(span["latex"]) for span in source_spans if source_is_math_only or span["mode"] == "display"}
+    if len(spans) == 1 and translation_is_math_only and _math_key(spans[0]["latex"]) in source_math:
+        return ""
+    duplicates = [span for span in spans if span["mode"] == "display" and _math_key(span["latex"]) in source_math]
+    return _without_math_spans(text, duplicates).strip()
 
 
 def should_translate_segment(segment: dict[str, Any], appendix_started: bool = False) -> bool:
-    if appendix_started:
-        return False
+    """Translate all prose, including appendices; omit image/math-only blocks."""
     return bool(translation_source_for_segment(segment))
 
 
+def translation_segments(paper_dir: Path) -> list[dict[str, Any]]:
+    segments = read_json(paper_dir / "segments.json", [], strict=True)
+    if not isinstance(segments, list) or any(not isinstance(item, dict) for item in segments):
+        raise ValueError("segments.json must contain a list of source segments.")
+    ids = [item.get("id") for item in segments if should_translate_segment(item)]
+    if any(not isinstance(value, str) or not value for value in ids) or len(ids) != len(set(ids)):
+        raise ValueError("Source segments must have unique, nonempty string IDs.")
+    return segments
+
+
+def has_translation(segment: dict[str, Any]) -> bool:
+    return isinstance(segment.get("translation"), str) and bool(translation_text_for_segment(segment))
+
+
+def translation_counts(segments: list[dict[str, Any]]) -> tuple[int, int]:
+    eligible = [item for item in segments if should_translate_segment(item)]
+    return sum(has_translation(item) for item in eligible), len(eligible)
+
+
+def _eligible_force_pending(pending: list[dict[str, Any]], segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    eligible = {item.get("id"): should_translate_segment(item) for item in segments}
+    # Keep missing IDs so the existing stale-source check still fails explicitly.
+    return [item for item in pending if eligible.get(item.get("id"), True)]
+
+
+def translation_fingerprint(segments: list[dict[str, Any]]) -> str:
+    values = [(item.get("id"), item.get("markdown"), item.get("translation")) for item in segments]
+    return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def translation_snapshot(paper_dir: Path, *, job_id: str = "", after: int = -1, segments: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Read durable progress/deltas, never initialize a manager or start work."""
+    state = read_json(paper_dir / "translation_state.json", {}, strict=True)
+    state = state if isinstance(state, dict) else {}
+    segments = translation_segments(paper_dir) if segments is None else segments
+    completed, total = translation_counts(segments)
+    status = str(state.get("status") or ("ready" if total and completed == total else "not_started"))
+    if status == "ready" and completed < total:
+        status = "not_started"
+    live = TRANSLATION_JOBS is not None and TRANSLATION_JOBS.is_live(paper_dir, str(state.get("job_id") or ""))
+    if status in {"queued", "processing", "retrying"} and not live:
+        status = "interrupted"
+    revision = int(state.get("revision") or 0)
+    translation = {
+        "status": status,
+        "completed": completed,
+        "total": total,
+        "error": str(state.get("error") or ""),
+        "backend": str(state.get("backend") or ""),
+        "job_id": str(state.get("job_id") or ""),
+        "revision": revision,
+        "retry_at": state.get("retry_at"),
+        "retry_attempts": int(state.get("retry_attempts") or 0),
+    }
+    full = not job_id or job_id != translation["job_id"] or after < 0 or after > revision
+    full = full or state.get("fingerprint") != translation_fingerprint(segments)
+    changes = state.get("segment_revisions") or {}
+    updates = []
+    for segment in segments:
+        if not has_translation(segment):
+            continue
+        change = changes.get(segment.get("id"), {})
+        if full or (int(change.get("revision") or 0) > after and change.get("markdown") == segment.get("markdown")):
+            updates.append({key: segment.get(key, "") for key in ("id", "markdown", "translation")})
+    return {"translation": translation, "updates": updates}
+
+
+class TranslationJobManager:
+    """Bounded workers share paragraph claims and a global retry cooldown."""
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.pending: queue.Queue[tuple[Path, str] | None] = queue.Queue()
+        self.jobs: dict[Path, str] = {}
+        self.claims: dict[tuple[Path, str], set[str]] = {}
+        self.concurrency = translation_concurrency()
+        self.threads: list[threading.Thread] = []
+        self.thread: threading.Thread | None = None
+        self.stopped = False
+        self.stop_event = threading.Event()
+        self.retry_until = 0.0
+
+    def is_live(self, paper_dir: Path, job_id: str) -> bool:
+        with self.lock:
+            return not self.stopped and bool(job_id) and self.jobs.get(paper_dir.resolve()) == job_id
+
+    def close(self) -> None:
+        with self.lock:
+            self.stopped = True
+            self.stop_event.set()
+            for _ in self.threads:
+                self.pending.put(None)
+        for thread in self.threads:
+            thread.join(timeout=5)
+
+    def queue_snapshot(self, workspace: Path) -> dict[str, Any]:
+        with self.lock:
+            jobs = []
+            for paper_dir in self.jobs:
+                if not paper_dir.is_relative_to(workspace.resolve()) or not paper_dir.is_dir():
+                    continue
+                state = read_json(paper_dir / "translation_state.json", {}, strict=True)
+                metadata = read_json(paper_dir / "metadata.json", {}, strict=True)
+                jobs.append({
+                    **{key: state.get(key) for key in (
+                        "paper_id", "status", "completed", "total", "error", "backend",
+                        "job_id", "revision", "retry_at", "retry_attempts",
+                    )},
+                    "paper_id": metadata.get("id") or state.get("paper_id"),
+                    "title": metadata.get("title") or state.get("paper_id"),
+                    "active_requests": sum(len(ids) for (path, _), ids in self.claims.items() if path == paper_dir),
+                })
+            return {
+                "ok": True, "concurrency": self.concurrency,
+                "active_requests": sum(len(ids) for ids in self.claims.values()),
+                "retry_at": self.retry_until if self.retry_until > time.time() else None,
+                "jobs": jobs,
+            }
+
+    def _save(self, paper_dir: Path, state: dict[str, Any], segments: list[dict[str, Any]]) -> None:
+        if not paper_dir.is_dir():
+            raise FileNotFoundError("Paper was removed while translation was running.")
+        state["completed"], state["total"] = translation_counts(segments)
+        state["revision"] = int(state.get("revision") or 0) + 1
+        state["fingerprint"] = translation_fingerprint(segments)
+        state["updated_at"] = now_iso()
+        write_json(paper_dir / "translation_state.json", state)
+
+    def submit(self, paper_id: str, paper_dir: Path, data: dict[str, Any]) -> dict[str, Any]:
+        action = str(data.get("action") or "start")
+        if action not in {"start", "pause", "resume"}:
+            raise ValueError("Translation action must be start, pause or resume.")
+        automatic = bool(data.get("automatic"))
+        config = translation_config()
+        paper_dir = paper_dir.resolve()
+        with self.lock:
+            if self.stopped:
+                raise RuntimeError("Translation worker has stopped.")
+            state = read_json(paper_dir / "translation_state.json", {}, strict=True)
+            if not isinstance(state, dict):
+                raise ValueError("translation_state.json must contain an object.")
+            segments = translation_segments(paper_dir)
+            if action == "pause":
+                state.setdefault("version", 1)
+                state.setdefault("job_id", uuid.uuid4().hex)
+                state.setdefault("paper_id", paper_id)
+                state.update({"status": "paused", "error": ""})
+                self._save(paper_dir, state, segments)
+                self.jobs[paper_dir] = state["job_id"]
+                return translation_snapshot(paper_dir)["translation"]
+            if automatic and (not config["auto_start"] or state.get("status") in {"paused", "failed"}):
+                return translation_snapshot(paper_dir)["translation"]
+            if self.is_live(paper_dir, str(state.get("job_id") or "")) and state.get("status") in {"queued", "processing", "retrying"}:
+                return translation_snapshot(paper_dir)["translation"]
+            completed, total = translation_counts(segments)
+            if (
+                state.get("status") in {"ready", "waiting_for_source"}
+                and state.get("fingerprint") == translation_fingerprint(segments)
+                and completed == total
+                and (automatic or not data.get("force"))
+            ):
+                return translation_snapshot(paper_dir)["translation"]
+            if config["provider"] == "copilot":
+                config["endpoint"] = copilot_translation_endpoint()
+            elif config["provider"] not in {"kimi", "ollama"}:
+                raise ValueError("Unsupported translation provider; choose copilot, kimi, ollama or legacy.")
+            force_pending = []
+            if bool(data.get("force")) and not automatic:
+                force_pending = [
+                    {"id": item["id"], "markdown": item.get("markdown"), "translation": item.get("translation")}
+                    for item in segments if should_translate_segment(item)
+                ]
+            elif action == "resume" and not automatic:
+                force_pending = _eligible_force_pending(state.get("force_pending") or [], segments)
+            state = {
+                "version": 1, "paper_id": paper_id, "job_id": uuid.uuid4().hex,
+                "status": "queued" if completed < total or force_pending else ("ready" if segments else "waiting_for_source"),
+                "error": "" if segments else "Parse PDF to Markdown before translating.",
+                "backend": f"{config['provider']}:{config['model']}", "config": config,
+                "automatic": automatic, "revision": 0, "segment_revisions": {}, "force_pending": force_pending,
+            }
+            self._save(paper_dir, state, segments)
+            self.jobs[paper_dir] = state["job_id"]
+            if state["status"] == "queued":
+                for _ in range(self.concurrency):
+                    self.pending.put((paper_dir, state["job_id"]))
+                if not self.threads:
+                    for index in range(self.concurrency):
+                        thread = threading.Thread(target=self._run, name=f"paper-reader-translation-{index + 1}", daemon=True)
+                        self.threads.append(thread)
+                        thread.start()
+                    self.thread = self.threads[0]
+            return translation_snapshot(paper_dir)["translation"]
+
+    def _run(self) -> None:
+        while True:
+            work = self.pending.get()
+            if work is None:
+                return
+            paper_dir, job_id = work
+            while not self.stopped:
+                with self.lock:
+                    delay = self.retry_until - time.time()
+                if delay <= 0 or self.stop_event.wait(min(delay, 60.0)):
+                    break
+            if self.stopped:
+                return
+            again = False
+            try:
+                again = self._step(paper_dir, job_id)
+            except Exception as exc:  # noqa: BLE001 - fail only this persisted job
+                again = self._record_failure(paper_dir, job_id, exc)
+            finally:
+                with self.lock:
+                    if self.jobs.get(paper_dir) == job_id:
+                        if not paper_dir.is_dir():
+                            self.jobs.pop(paper_dir, None)
+                        elif again and not self.stopped:
+                            self.pending.put(work)
+
+    def _record_failure(self, paper_dir: Path, job_id: str, exc: Exception) -> bool:
+        with self.lock:
+            if not paper_dir.is_dir():
+                return False
+            try:
+                state = read_json(paper_dir / "translation_state.json", {}, strict=True)
+                if state.get("job_id") != job_id or state.get("status") not in {"queued", "processing", "retrying"}:
+                    return False
+                again = False
+                if isinstance(exc, RetryableTranslationError):
+                    attempts = int(state.get("retry_attempts") or 0) + 1
+                    delay = exc.retry_after if exc.retry_after is not None else min(30.0, 2.0 ** attempts)
+                    self.retry_until = max(self.retry_until, time.time() + delay)
+                    again = attempts <= 3
+                    state.update({
+                        "status": "retrying" if again else "failed",
+                        "error": str(exc)[:400] + (f" Retrying ({attempts}/3)." if again else " Automatic retries exhausted; retry manually."),
+                        "retry_at": self.retry_until, "retry_attempts": attempts,
+                    })
+                else:
+                    state.update({"status": "failed", "error": str(exc)[:500]})
+                self._save(paper_dir, state, translation_segments(paper_dir))
+                return again
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+                return False
+
+    def _step(self, paper_dir: Path, job_id: str) -> bool:
+        with self.lock:
+            state = read_json(paper_dir / "translation_state.json", {}, strict=True)
+            if self.stopped or state.get("job_id") != job_id or state.get("status") not in {"queued", "processing", "retrying"}:
+                return False
+            if self.retry_until > time.time():
+                return True
+            segments = translation_segments(paper_dir)
+            claimed = self.claims.get((paper_dir, job_id), set())
+            force_pending = state.get("force_pending") or []
+            eligible_pending = _eligible_force_pending(force_pending, segments)
+            if eligible_pending != force_pending:
+                state["force_pending"] = force_pending = eligible_pending
+                self._save(paper_dir, state, segments)
+            if force_pending:
+                expected = next((item for item in force_pending if item["id"] not in claimed), None)
+                if expected is None:
+                    return False
+                source = next((item for item in segments if item.get("id") == expected["id"]), None)
+                if source is None or any(source.get(key) != expected.get(key) for key in ("markdown", "translation")):
+                    raise RuntimeError("Source or translation changed after forced translation was requested; nothing was overwritten.")
+            else:
+                source = next((item for item in segments if item.get("id") not in claimed and should_translate_segment(item) and not has_translation(item)), None)
+            if source is None:
+                if claimed:
+                    return False
+                state.update({"status": "ready", "error": ""})
+                self._save(paper_dir, state, segments)
+                return False
+            source = dict(source)
+            if state["status"] != "processing":
+                state.update({"status": "processing", "error": "", "retry_at": None})
+                self._save(paper_dir, state, segments)
+            config = dict(state["config"])
+            self.claims.setdefault((paper_dir, job_id), set()).add(source["id"])
+        try:
+            result = translate_text(translation_source_for_segment(source), config)
+            if not isinstance(result, str) or not result.strip():
+                raise RuntimeError("Translation was empty; no translation was saved.")
+            result = translation_text_for_segment(source, result)
+            if not result.strip():
+                raise RuntimeError("Translation contained only images or repeated equations, not translated text; no translation was saved.")
+            with self.lock:
+                state = read_json(paper_dir / "translation_state.json", {}, strict=True)
+                if self.stopped or state.get("job_id") != job_id or state.get("status") not in {"queued", "processing", "retrying", "failed"}:
+                    return False
+                # Merge under the shared file lock, never over a stale segment list.
+                with write_lock_for(paper_dir / "segments.json"):
+                    latest = translation_segments(paper_dir)
+                    target = next((item for item in latest if item.get("id") == source["id"]), None)
+                    if target is None or target.get("markdown") != source.get("markdown"):
+                        raise RuntimeError("Source changed while translating; the stale result was not saved.")
+                    if target.get("translation") != source.get("translation"):
+                        raise RuntimeError("Translation was edited while a request was running; the result was not saved.")
+                    target["translation"] = result
+                    write_json(paper_dir / "segments.json", latest)
+                if state.get("force_pending"):
+                    state["force_pending"] = [item for item in state["force_pending"] if item["id"] != source["id"]]
+                next_revision = int(state.get("revision") or 0) + 1
+                state.setdefault("segment_revisions", {})[source["id"]] = {"revision": next_revision, "markdown": source.get("markdown")}
+                if state["status"] != "failed" and not state.get("force_pending") and translation_counts(latest)[0] == translation_counts(latest)[1]:
+                    state.update({"status": "ready", "error": "", "retry_at": None})
+                self._save(paper_dir, state, latest)
+                return state["status"] not in {"ready", "failed"}
+        except Exception as exc:
+            return self._record_failure(paper_dir, job_id, exc)
+        finally:
+            with self.lock:
+                claimed = self.claims.get((paper_dir, job_id), set())
+                claimed.discard(source["id"])
+                if not claimed:
+                    self.claims.pop((paper_dir, job_id), None)
+
+
+def translation_job_manager() -> TranslationJobManager:
+    global TRANSLATION_JOBS
+    with TRANSLATION_JOBS_GUARD:
+        if TRANSLATION_JOBS is None:
+            TRANSLATION_JOBS = TranslationJobManager()
+        return TRANSLATION_JOBS
+
+
+def resume_translation_waiting_for_source(paper_id: str, paper_dir: Path) -> None:
+    state = read_json(paper_dir / "translation_state.json", {})
+    if isinstance(state, dict) and state.get("status") == "waiting_for_source":
+        translation_job_manager().submit(paper_id, paper_dir, {"automatic": bool(state.get("automatic"))})
+
+
 def translate_paper_full(workspace: Path, paper_id: str, paper_dir: Path, force: bool = False) -> dict[str, Any]:
+    """Synchronous compatibility wrapper; HTTP uses the nonblocking job API."""
+    status = translation_job_manager().submit(paper_id, paper_dir, {"force": force})
+    while status["status"] in {"queued", "processing", "retrying"}:
+        time.sleep(0.05)
+        status = translation_snapshot(paper_dir)["translation"]
+    if status["status"] != "ready":
+        raise RuntimeError(status["error"] or f"Translation is {status['status']}.")
     metadata = read_json(paper_dir / "metadata.json", {})
-    segments = load_segments(paper_dir)
-    if not segments and (paper_dir / "raw.md").exists():
-        raw_md = (paper_dir / "raw.md").read_text(encoding="utf-8")
-        segments, outline = build_segments(raw_md)
-        write_json(paper_dir / "segments.json", segments)
-        write_json(paper_dir / "outline.json", {"outline": outline, "core_locations": [], "presentation_flow": build_presentation_flow(metadata, segments, outline)})
-    if not segments:
-        raise RuntimeError("No parsed segments found. Run Convert PDF to Markdown + Paper Brief first.")
-    metadata.update({"translation_status": "processing", "translation_error": "", "translation_backend": llm_backend_label(), "updated_at": now_iso()})
-    write_json(paper_dir / "metadata.json", metadata)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-    try:
-        appendix_started = False
-        for segment in segments:
-            if appendix_heading_reached(segment):
-                appendix_started = True
-                continue
-            if segment.get("translation") and not force:
-                continue
-            if not should_translate_segment(segment, appendix_started):
-                continue
-            segment["translation"] = translate_text(translation_source_for_segment(segment))
-            write_json(paper_dir / "segments.json", segments)
-        source_name = metadata.get("source_pdf") or "raw.md"
-        write_text_atomic(paper_dir / "reader.md", make_reader_markdown(segments, source_name))
-        export_notes_and_annotated(paper_dir)
-        metadata.update({"translation_status": "ready", "translation_error": "", "updated_at": now_iso()})
-    except Exception as exc:  # noqa: BLE001
-        metadata.update({"translation_status": "failed", "translation_error": str(exc), "updated_at": now_iso()})
-        write_json(paper_dir / "metadata.json", metadata)
-        sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-        raise
-    write_json(paper_dir / "metadata.json", metadata)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-    return metadata
+    return {**metadata, "translation_status": status["status"], "translation_error": status["error"], "translation_backend": status["backend"]}
 
 
 def multipart_boundary(content_type: str) -> bytes:
@@ -1821,7 +2695,7 @@ def apply_candidate_title(candidate: dict[str, Any], title: str, source: str) ->
 def metadata_title_should_update(metadata: dict[str, Any], title: str, source: str) -> bool:
     if not title:
         return False
-    if metadata.get("title_locked") or str(metadata.get("title_source") or "").strip() == "user":
+    if metadata.get("title_locked") or str(metadata.get("title_source") or "").strip() in {"user", "feishu"}:
         return False
     current = str(metadata.get("title") or "").strip()
     if not current:
@@ -2192,48 +3066,157 @@ def update_candidate_metadata(workspace: Path, candidate_id: str, data: dict[str
     return saved
 
 
-def start_background_paper_processing(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *, mode: str = "deep", refresh_citations: bool = True, refresh_videos: bool = True) -> bool:
-    task_key = f"{workspace.resolve()}::{paper_id}::{mode}"
-    with BACKGROUND_PROCESSING_LOCK:
-        if task_key in BACKGROUND_PROCESSING_TASKS:
-            return False
-        BACKGROUND_PROCESSING_TASKS.add(task_key)
+class PaperProcessingJobManager:
+    """One FIFO parser worker; durable requests live with each paper's metadata."""
 
-    workspace = workspace.resolve()
-    paper_dir = paper_dir.resolve()
-    options = dict(options or {})
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.pending: queue.Queue[str | None] = queue.Queue()
+        self.jobs: dict[str, dict[str, Any]] = {}
+        self.thread: threading.Thread | None = None
+        self.closed = False
+        self.sequence = 0
 
-    def worker() -> None:
-        try:
-            metadata = process_paper_skim(workspace, paper_id, paper_dir, options) if mode == "skim" else process_paper_deep(workspace, paper_id, paper_dir, options)
-            if refresh_citations:
+    def submit(self, workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *,
+               mode: str = "deep", refresh_citations: bool = False, refresh_videos: bool = False,
+               queued_at: str = "") -> bool:
+        if mode not in {"deep", "skim"}:
+            raise ValueError("Processing mode must be deep or skim.")
+        workspace, paper_dir = workspace.resolve(), paper_dir.resolve()
+        key = f"{workspace}::{paper_id}"
+        parse_options = {name: value for name, value in (options or {}).items()
+                         if name in {"backend", "method", "lang", "start", "end"}}
+        if any(value is not None and not isinstance(value, (str, int)) for value in parse_options.values()):
+            raise ValueError("Invalid PDF parsing options.")
+        with self.lock:
+            if self.closed:
+                raise RuntimeError("The parsing queue is shutting down. Retry after restarting the reader.")
+            existing = self.jobs.get(key)
+            if existing and existing["status"] in {"queued", "processing"}:
+                if existing["mode"] != mode:
+                    raise ValueError("This paper is already processing in another mode. Wait for it to finish.")
+                return False
+            request = {
+                "mode": mode, "options": parse_options,
+                "queued_at": queued_at or dt.datetime.now(dt.timezone.utc).isoformat(timespec="microseconds"),
+                "refresh_citations": bool(refresh_citations), "refresh_videos": bool(refresh_videos),
+            }
+            metadata = save_processing_fields(workspace, paper_id, paper_dir, {
+                "processing_mode": mode, "reading_mode": mode, "processing_status": "processing_queued",
+                "processing_background": "queued", "processing_error": "", "processing_request": request,
+                "processing_started_at": "", "processing_finished_at": "",
+            })
+            self.sequence += 1
+            self.jobs[key] = {
+                **request, "workspace": workspace, "paper_dir": paper_dir, "paper_id": paper_id,
+                "title": metadata.get("title") or paper_id, "status": "queued", "error": "",
+                "started_at": "", "finished_at": "", "sequence": self.sequence,
+            }
+            self.pending.put(key)
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._run, name="paper-reader-parser", daemon=True)
+                self.thread.start()
+        return True
+
+    def restore_finished(self, workspace: Path, paper_id: str, paper_dir: Path, metadata: dict[str, Any]) -> None:
+        request = metadata.get("processing_request")
+        if not isinstance(request, dict) or metadata.get("processing_status") not in {"ready", "failed"}:
+            return
+        key = f"{workspace.resolve()}::{paper_id}"
+        with self.lock:
+            if key in self.jobs:
+                return
+            self.sequence += 1
+            self.jobs[key] = {
+                **request, "workspace": workspace.resolve(), "paper_dir": paper_dir.resolve(), "paper_id": paper_id,
+                "title": metadata.get("title") or paper_id, "status": metadata["processing_status"],
+                "error": metadata.get("processing_error", ""), "started_at": metadata.get("processing_started_at", ""),
+                "finished_at": metadata.get("processing_finished_at", ""), "sequence": self.sequence,
+            }
+
+    def snapshot(self, workspace: Path) -> dict[str, Any]:
+        with self.lock:
+            ordered = sorted(self.jobs.values(), key=lambda job: job["sequence"])
+            positions = {id(job): index + 1 for index, job in enumerate(job for job in ordered if job["status"] == "queued")}
+            jobs = [{
+                **{name: job.get(name, "") for name in ("paper_id", "title", "mode", "status", "error", "queued_at", "started_at", "finished_at")},
+                "position": positions.get(id(job)),
+            } for job in ordered if job["workspace"] == workspace.resolve()]
+            return {"ok": True, "concurrency": 1,
+                    "active_jobs": sum(job["status"] == "processing" for job in ordered),
+                    "queued_count": len(positions), "jobs": jobs}
+
+    def shutdown(self, timeout: float = 5) -> None:
+        with self.lock:
+            if not self.closed:
+                self.closed = True
+                self.pending.put(None)
+            thread = self.thread
+        if thread:
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                raise RuntimeError("The parsing worker has not finished; queued requests remain saved on disk.")
+
+    def _run(self) -> None:
+        while True:
+            key = self.pending.get()
+            if key is None:
+                self.pending.task_done()
+                return
+            with self.lock:
+                job = self.jobs[key]
+                job["status"] = "processing"
+                job["started_at"] = now_iso()
+            workspace, paper_dir, paper_id = job["workspace"], job["paper_dir"], job["paper_id"]
+            error = ""
+            try:
+                save_processing_fields(workspace, paper_id, paper_dir, {
+                    "processing_status": "processing", "processing_background": "processing",
+                    "processing_started_at": job["started_at"],
+                })
+                processor = process_paper_skim if job["mode"] == "skim" else process_paper_deep
+                metadata = processor(workspace, paper_id, paper_dir, job["options"])
+                for requested, enrich, label in (
+                    (job["refresh_citations"], refresh_paper_citations, "citation"),
+                    (job["refresh_videos"], refresh_paper_videos, "video"),
+                ):
+                    if requested:
+                        try:
+                            enrich(workspace, paper_id, paper_dir)
+                        except Exception as exc:  # noqa: BLE001
+                            print(f"Background {label} lookup failed for {paper_id}: {exc}", file=sys.stderr)
+                save_processing_fields(workspace, paper_id, paper_dir, {
+                    "processing_background": "done", "processing_finished_at": now_iso(),
+                })
+                with self.lock:
+                    job["title"] = metadata.get("title") or job["title"]
+            except Exception as exc:  # noqa: BLE001
+                error = str(exc)
                 try:
-                    metadata = refresh_paper_citations(workspace, paper_id, paper_dir)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Background citation lookup failed for {paper_id}: {exc}", file=sys.stderr)
-            if refresh_videos:
-                try:
-                    metadata = refresh_paper_videos(workspace, paper_id, paper_dir)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"Background video lookup failed for {paper_id}: {exc}", file=sys.stderr)
-            metadata.update({"processing_background": "done", "updated_at": now_iso()})
-            write_json(paper_dir / "metadata.json", metadata)
-            sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-        except Exception as exc:  # noqa: BLE001
-            print(f"Background paper processing failed for {paper_id}: {exc}", file=sys.stderr)
-            metadata = read_json(paper_dir / "metadata.json", {})
-            metadata.update({"processing_status": "failed", "processing_error": str(exc), "processing_background": "failed", "updated_at": now_iso()})
-            write_json(paper_dir / "metadata.json", metadata)
-            sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-        finally:
-            with BACKGROUND_PROCESSING_LOCK:
-                BACKGROUND_PROCESSING_TASKS.discard(task_key)
+                    save_processing_fields(workspace, paper_id, paper_dir, {
+                        "processing_status": "failed", "processing_error": error,
+                        "processing_background": "failed", "processing_finished_at": now_iso(),
+                    })
+                except Exception as save_error:  # noqa: BLE001
+                    error += f"; could not persist the failure: {save_error}"
+                print(f"Background paper processing failed for {paper_id}: {error}", file=sys.stderr)
+            finally:
+                with self.lock:
+                    job.update(status="failed" if error else "ready", error=error, finished_at=now_iso())
+                self.pending.task_done()
 
-    timer = threading.Timer(0.5, worker)
-    timer.name = f"paper-reader-process-{paper_id}"
-    timer.daemon = True
-    timer.start()
-    return True
+
+def processing_job_manager() -> PaperProcessingJobManager:
+    global PROCESSING_JOBS
+    with PROCESSING_JOBS_GUARD:
+        if PROCESSING_JOBS is None:
+            PROCESSING_JOBS = PaperProcessingJobManager()
+        return PROCESSING_JOBS
+
+
+def start_background_paper_processing(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *, mode: str = "deep", refresh_citations: bool = False, refresh_videos: bool = False) -> bool:
+    return processing_job_manager().submit(workspace, paper_id, paper_dir, options, mode=mode,
+                                           refresh_citations=refresh_citations, refresh_videos=refresh_videos)
 
 
 RESUMABLE_PROCESSING_STATUSES = {
@@ -2270,6 +3253,7 @@ def should_resume_processing(paper_dir: Path, metadata: dict[str, Any]) -> tuple
 
 def resume_interrupted_processing_tasks(workspace: Path) -> list[str]:
     resumed: list[str] = []
+    pending = []
     library = load_library_raw(workspace)
     for paper in library.get("papers", []):
         paper_id = str(paper.get("id") or "").strip()
@@ -2283,8 +3267,16 @@ def resume_interrupted_processing_tasks(workspace: Path) -> list[str]:
             metadata = {}
         should_resume, mode = should_resume_processing(paper_dir, metadata)
         if not should_resume:
+            if metadata.get("processing_request"):
+                processing_job_manager().restore_finished(workspace, paper_id, paper_dir, metadata)
             continue
-        started = start_background_paper_processing(workspace, paper_id, paper_dir, {}, mode=mode, refresh_citations=True, refresh_videos=True)
+        request = metadata.get("processing_request") or {}
+        pending.append((str(request.get("queued_at") or metadata.get("updated_at") or ""), paper_id, paper_dir, mode, request))
+    for queued_at, paper_id, paper_dir, mode, request in sorted(pending, key=lambda item: (item[0], item[1])):
+        started = processing_job_manager().submit(
+            workspace, paper_id, paper_dir, request.get("options") or {}, mode=mode, queued_at=queued_at,
+            refresh_citations=bool(request.get("refresh_citations")), refresh_videos=bool(request.get("refresh_videos")),
+        )
         if started:
             resumed.append(paper_id)
     return resumed
@@ -2361,12 +3353,24 @@ def migrate_candidate_to_library(workspace: Path, candidate_id: str, data: dict[
     return {"ok": True, "paper_id": paper_id, "metadata": read_json(paper_dir / "metadata.json", metadata), "processing_background": "started" if background_started else "already_running", "migrated_annotations": len(candidate_annotations.get("annotations", [])), "candidate": candidate_summary(candidate, workspace)}
 
 
-def load_library_raw(workspace: Path) -> dict[str, Any]:
-    ensure_workspace(workspace)
+def read_library_index(workspace: Path) -> dict[str, Any]:
+    """Read the web index without initialization, per-paper discovery, or caching.
+
+    Mutation APIs update library.json; external index edits are visible on the
+    next request. External per-paper edits do not rescan/update this index;
+    paper GET and CLI load_library still read those per-paper files.
+    """
     library = read_json(workspace / "library.json", {"version": TOOL_VERSION, "papers": []})
+    if not isinstance(library, dict):
+        library = {"version": TOOL_VERSION, "papers": []}
     if "papers" not in library or not isinstance(library["papers"], list):
         library["papers"] = []
     return library
+
+
+def load_library_raw(workspace: Path) -> dict[str, Any]:
+    ensure_workspace(workspace)
+    return read_library_index(workspace)
 
 
 def load_library(workspace: Path) -> dict[str, Any]:
@@ -2385,7 +3389,7 @@ def load_library(workspace: Path) -> dict[str, Any]:
         tags = normalize_tag_paths(metadata.get("tags", paper.get("tags", [])))
         if tags:
             paper["tags"] = tags
-        for key in {"authors", "institutions", "venue", "year", "importance", "importance_tags", "preview_image", "preview_image_alt", "source_pdf_name", "source_type", "source_reference", "source_parent_paper_id", "source_parent_paper_title", "original_path", "processing_error", "translation_status", "translation_error", "translation_backend", "citation_count", "citation_error", "citation_source", "citation_url", "citation_updated_at", "reading_progress_summary", "reading_progress_updated_at", "read_status_source", "title_key", "video_links", "video_search_status", "video_search_error", "video_search_updated_at", "youtube_quota", "project", "projects", "tag_colors", "project_colors"}:
+        for key in {"authors", "institutions", "venue", "year", "importance", "importance_tags", "preview_image", "preview_image_alt", "source_pdf_name", "source_type", "source_reference", "source_parent_paper_id", "source_parent_paper_title", "source_url", "source_page_url", "pdf_url", "open_access_pdf_url", "semantic_scholar_url", "arxiv_id", "reference_pdf_error", "original_path", "processing_error", "translation_status", "translation_error", "translation_backend", "citation_count", "citation_error", "citation_source", "citation_url", "citation_updated_at", "reading_progress_summary", "reading_progress_updated_at", "read_status_source", "title_key", "video_links", "video_search_status", "video_search_error", "video_search_updated_at", "youtube_quota", "project", "projects", "tag_colors", "project_colors"}:
             value = metadata.get(key)
             existing_value = paper.get(key)
             empty_existing = key not in paper or existing_value is None or existing_value == "" or (isinstance(existing_value, list) and not existing_value) or (isinstance(existing_value, dict) and not existing_value)
@@ -2401,19 +3405,20 @@ def save_library(workspace: Path, library: dict[str, Any]) -> None:
 
 
 def upsert_paper_record(workspace: Path, record: dict[str, Any]) -> None:
-    library = load_library_raw(workspace)
-    papers = library["papers"]
-    for index, existing in enumerate(papers):
-        if existing.get("id") == record.get("id"):
-            merged = {**existing, **record, "updated_at": now_iso()}
-            papers[index] = merged
-            save_library(workspace, library)
-            return
-    record.setdefault("created_at", now_iso())
-    record.setdefault("updated_at", now_iso())
-    papers.append(record)
-    papers.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
-    save_library(workspace, library)
+    with write_lock_for(workspace / "library.json"):
+        library = load_library_raw(workspace)
+        papers = library["papers"]
+        for index, existing in enumerate(papers):
+            if existing.get("id") == record.get("id"):
+                merged = {**existing, **record, "updated_at": now_iso()}
+                papers[index] = merged
+                save_library(workspace, library)
+                return
+        record.setdefault("created_at", now_iso())
+        record.setdefault("updated_at", now_iso())
+        papers.append(record)
+        papers.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+        save_library(workspace, library)
 
 
 def find_paper_record(workspace: Path, paper_id: str) -> dict[str, Any] | None:
@@ -2425,14 +3430,15 @@ def find_paper_record(workspace: Path, paper_id: str) -> dict[str, Any] | None:
 
 
 def remove_paper_record(workspace: Path, paper_id: str) -> bool:
-    library = load_library_raw(workspace)
-    papers = library.get("papers", [])
-    next_papers = [paper for paper in papers if paper.get("id") != paper_id]
-    if len(next_papers) == len(papers):
-        return False
-    library["papers"] = next_papers
-    save_library(workspace, library)
-    return True
+    with write_lock_for(workspace / "library.json"):
+        library = load_library_raw(workspace)
+        papers = library.get("papers", [])
+        next_papers = [paper for paper in papers if paper.get("id") != paper_id]
+        if len(next_papers) == len(papers):
+            return False
+        library["papers"] = next_papers
+        save_library(workspace, library)
+        return True
 
 
 def sync_library_from_metadata(workspace: Path, paper_id: str, paper_dir: Path, metadata: dict[str, Any], *, generate_pdf_preview: bool = True) -> None:
@@ -2480,17 +3486,26 @@ def sync_library_from_metadata(workspace: Path, paper_id: str, paper_dir: Path, 
             "translation_status": metadata.get("translation_status", "not_started"),
             "translation_error": metadata.get("translation_error", ""),
             "translation_backend": metadata.get("translation_backend", ""),
+            "translated_segments": metadata.get("translated_segments"),
             "agent_analysis_status": metadata.get("agent_analysis_status", ""),
             "paper_brief_status": metadata.get("paper_brief_status", ""),
             "paper_brief_error": metadata.get("paper_brief_error", ""),
             "paper_brief_updated_at": metadata.get("paper_brief_updated_at", ""),
             "paper_brief_title": metadata.get("paper_brief_title", ""),
             "title_source": metadata.get("title_source", ""),
+            "feishu": metadata.get("feishu", {}),
+            "feishu_attachment": metadata.get("feishu_attachment", {}),
+            "source_pdf_sha256": metadata.get("source_pdf_sha256", ""),
             "citation_count": metadata.get("citation_count", ""),
             "citation_error": metadata.get("citation_error", ""),
             "citation_source": metadata.get("citation_source", ""),
             "citation_url": metadata.get("citation_url", ""),
             "citation_updated_at": metadata.get("citation_updated_at", ""),
+            "pdf_url": metadata.get("pdf_url", ""),
+            "open_access_pdf_url": metadata.get("open_access_pdf_url", ""),
+            "semantic_scholar_url": metadata.get("semantic_scholar_url", ""),
+            "arxiv_id": metadata.get("arxiv_id", ""),
+            "reference_pdf_error": metadata.get("reference_pdf_error", ""),
             "video_links": metadata.get("video_links", []),
             "video_search_status": metadata.get("video_search_status", "not_started"),
             "video_search_error": metadata.get("video_search_error", ""),
@@ -2503,6 +3518,8 @@ def sync_library_from_metadata(workspace: Path, paper_id: str, paper_dir: Path, 
             "source_reference": metadata.get("source_reference", ""),
             "source_parent_paper_id": metadata.get("source_parent_paper_id", ""),
             "source_parent_paper_title": metadata.get("source_parent_paper_title", ""),
+            "source_url": metadata.get("source_url", ""),
+            "source_page_url": metadata.get("source_page_url", ""),
             "source_pdf_name": metadata.get("source_pdf_name", ""),
             "original_path": metadata.get("original_path", ""),
             "created_at": metadata.get("created_at", ""),
@@ -3749,6 +4766,31 @@ def is_reference_section_path(section_path: Any) -> bool:
     return any(normalized_reference_section_title(item) in REFERENCE_SECTION_TITLES for item in section_items)
 
 
+def truncate_reference_body_at_next_marker(body: str, number: str) -> str:
+    try:
+        next_number = int(str(number).strip()) + 1
+    except ValueError:
+        return body
+    marker_pattern = re.compile(rf"{re.escape(str(next_number))}\.\s+")
+    for match in marker_pattern.finditer(body):
+        tail = body[match.end() : match.end() + 100]
+        if re.match(r"[A-Z][A-Za-z'’.-]+,\s*(?:[A-Z]\.?)+", tail):
+            return body[: match.start()].strip(" .;,")
+        if re.match(r"[A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){0,5}\s+\((?:19|20)\d{2}\)", tail):
+            return body[: match.start()].strip(" .;,")
+    return body
+
+
+def reference_cache_matches_parsed(parsed: dict[str, Any], cached: dict[str, Any]) -> bool:
+    parsed_title = str(parsed.get("title") or "").strip()
+    cached_title = str(cached.get("title") or cached.get("matched_title") or "").strip()
+    if not parsed_title or not cached_title:
+        return True
+    if str(cached.get("source") or "") in {"", "parsed_reference"}:
+        return True
+    return reference_title_match_score(parsed_title, cached_title) >= 0.72
+
+
 def parse_reference_entry(segment: dict[str, Any]) -> dict[str, Any] | None:
     raw = segment.get("markdown", "")
     clean = strip_reference_markup(raw)
@@ -3756,12 +4798,19 @@ def parse_reference_entry(segment: dict[str, Any]) -> dict[str, Any] | None:
     if not match:
         return None
     number = match.group(1) or match.group(2)
-    body = match.group(3).strip()
+    body = truncate_reference_body_at_next_marker(match.group(3).strip(), number)
+    leading_url_match = re.match(r"^(https?://\S+)\s+(.+)$", body)
+    leading_url = leading_url_match.group(1).rstrip(".,);]") if leading_url_match else ""
+    leading_url_tail = leading_url_match.group(2).strip(" .") if leading_url_match else ""
     year_match = re.search(r"\b(19|20)\d{2}\b", body)
     year = year_match.group(0) if year_match else ""
     authors = body[: year_match.start()].strip(" .") if year_match else ""
+    authors = re.sub(r"[\s(]+$", "", authors)
+    if leading_url:
+        authors = ""
     after_year = body[year_match.end() :].strip(" .") if year_match else body
-    doi_match = re.search(r"(?:doi:|https?://doi\.org/)(10\.\d{4,9}/\S+)", body, flags=re.I)
+    after_year = re.sub(r"^[)\].,;:\s]+", "", after_year)
+    doi_match = re.search(r"(?:doi:\s*|https?://(?:dx\.)?doi\.org/)?(10\.\d{4,9}/[^\s\"<>]+)", body, flags=re.I)
     doi = doi_match.group(1).rstrip(".,);]") if doi_match else ""
     url_match = re.search(r"https?://\S+", body)
     url = url_match.group(0).rstrip(".,);]") if url_match else (f"https://doi.org/{doi}" if doi else "")
@@ -3769,12 +4818,15 @@ def parse_reference_entry(segment: dict[str, Any]) -> dict[str, Any] | None:
     title = ""
     if after_year:
         split_match = re.split(
-            r"\.\s+(?:In\s+|Proceedings\s+|ACM\b|IEEE\b|arXiv\b|Design Science\b|doi:|https?://|Technical Report\b)",
+            r"\.\s+(?:In\s+|Proc\b|Proceedings\s+|ACM\b|IEEE\b|arXiv\b|Design Science\b|doi:|https?://|Technical Report\b)",
             after_year,
             maxsplit=1,
             flags=re.I,
         )
         title = split_match[0].strip(" .")
+    if leading_url_tail and (not title or title.startswith(("http://", "https://"))):
+        title = re.sub(r"\b(?:19|20)\d{2}\b.*$", "", leading_url_tail).strip(" .,-") or leading_url_tail
+        title = re.sub(r"\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s*$", "", title, flags=re.I).strip(" .,-")
     if not title:
         title = body[:180].strip(" .")
     venue = ""
@@ -3791,7 +4843,9 @@ def parse_reference_entry(segment: dict[str, Any]) -> dict[str, Any] | None:
         "year": year,
         "venue": venue,
         "doi": doi,
-        "url": url,
+        "url": url or leading_url,
+        "pdf_url": leading_url if leading_url.lower().split("?", 1)[0].endswith(".pdf") else "",
+        "open_access_pdf_url": leading_url if leading_url.lower().split("?", 1)[0].endswith(".pdf") else "",
         "abstract": "",
         "abstract_zh": "",
         "source": "parsed_reference",
@@ -3810,6 +4864,9 @@ def load_reference_index(paper_dir: Path) -> dict[str, Any]:
     cache = read_json(paper_dir / "reference_cards.json", {"version": 1, "references": {}})
     for number, cached in cache.get("references", {}).items():
         parsed = references.get(str(number), {"id": str(number), "number": str(number)})
+        if not reference_cache_matches_parsed(parsed, cached):
+            references[str(number)] = parsed
+            continue
         references[str(number)] = {**parsed, **cached, "id": str(number), "number": str(number)}
     return {"version": 1, "references": references}
 
@@ -3845,6 +4902,163 @@ def http_json(url: str, timeout: int = 10) -> dict[str, Any]:
         return json.loads(response.read().decode("utf-8"))
 
 
+def http_text(url: str, timeout: int = 10) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "paper-reader-agent/0.1"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 - user-triggered scholarly metadata lookup
+        return response.read().decode("utf-8", errors="replace")
+
+
+REFERENCE_TITLE_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "for",
+    "in",
+    "of",
+    "on",
+    "the",
+    "to",
+    "with",
+}
+
+
+def normalize_reference_title_for_match(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", html.unescape(str(value or ""))).casefold()
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def reference_title_tokens(value: Any) -> set[str]:
+    return {token for token in normalize_reference_title_for_match(value).split() if len(token) > 2 and token not in REFERENCE_TITLE_STOPWORDS}
+
+
+def reference_title_match_score(query_title: Any, candidate_title: Any) -> float:
+    query = normalize_reference_title_for_match(query_title)
+    candidate = normalize_reference_title_for_match(candidate_title)
+    if not query or not candidate:
+        return 0.0
+    query_key = normalize_title_key(query)
+    candidate_key = normalize_title_key(candidate)
+    if query_key == candidate_key or normalize_title_key_without_leading_articles(query) == normalize_title_key_without_leading_articles(candidate):
+        return 1.0
+    if query_key and candidate_key and (query_key in candidate_key or candidate_key in query_key):
+        key_balance = min(len(query_key), len(candidate_key)) / max(1, max(len(query_key), len(candidate_key)))
+        if key_balance >= 0.72:
+            return 0.93
+    ratio = difflib.SequenceMatcher(None, query, candidate).ratio()
+    query_tokens = reference_title_tokens(query)
+    candidate_tokens = reference_title_tokens(candidate)
+    if not query_tokens or not candidate_tokens:
+        return ratio
+    containment = len(query_tokens & candidate_tokens) / max(1, min(len(query_tokens), len(candidate_tokens)))
+    overlap = len(query_tokens & candidate_tokens) / max(1, len(query_tokens | candidate_tokens))
+    token_balance = min(len(query_tokens), len(candidate_tokens)) / max(1, max(len(query_tokens), len(candidate_tokens)))
+    containment_score = containment * 0.92 if token_balance >= 0.55 else 0.0
+    return max(ratio, containment_score, overlap)
+
+
+def best_title_matched_item(items: list[dict[str, Any]], query_title: str, title_key: str) -> dict[str, Any] | None:
+    best_item: dict[str, Any] | None = None
+    best_score = 0.0
+    for item in items:
+        candidate_title = item.get(title_key) or ""
+        if isinstance(candidate_title, list):
+            candidate_title = candidate_title[0] if candidate_title else ""
+        score = reference_title_match_score(query_title, candidate_title)
+        if score > best_score:
+            best_item = item
+            best_score = score
+    if best_item and best_score >= 0.72:
+        best_item = {**best_item, "_title_match_score": best_score}
+        return best_item
+    return None
+
+
+def crossref_card(data: dict[str, Any]) -> dict[str, Any]:
+    titles = data.get("title") if isinstance(data.get("title"), list) else []
+    containers = data.get("container-title") if isinstance(data.get("container-title"), list) else []
+    authors = []
+    for author in data.get("author") or []:
+        name = " ".join(str(author.get(key) or "").strip() for key in ("given", "family")).strip()
+        if name:
+            authors.append(name)
+    date_parts = (data.get("published-print") or data.get("published-online") or data.get("issued") or {}).get("date-parts") or []
+    year = str((date_parts[0] or [""])[0] or "") if date_parts else ""
+    doi = str(data.get("DOI") or "").strip()
+    return {
+        "title": titles[0] if titles else "",
+        "matched_title": titles[0] if titles else "",
+        "title_match_score": data.get("_title_match_score", ""),
+        "authors": ", ".join(authors),
+        "year": year,
+        "venue": containers[0] if containers else "",
+        "doi": doi,
+        "url": f"https://doi.org/{doi}" if doi else str(data.get("URL") or ""),
+        "source": "crossref",
+    }
+
+
+def lookup_crossref_card(title: str) -> dict[str, Any]:
+    query = urllib.parse.urlencode({"query.title": title, "rows": "5"})
+    data = http_json(f"https://api.crossref.org/works?{query}")
+    items = (data.get("message") or {}).get("items") or []
+    best = best_title_matched_item(items, title, "title")
+    return crossref_card(best) if best else {}
+
+
+def arxiv_text(entry: ET.Element, name: str) -> str:
+    node = entry.find(f"{{http://www.w3.org/2005/Atom}}{name}")
+    return re.sub(r"\s+", " ", node.text or "").strip() if node is not None else ""
+
+
+def arxiv_card(entry: ET.Element) -> dict[str, Any]:
+    title = arxiv_text(entry, "title")
+    summary = clean_abstract(arxiv_text(entry, "summary"))
+    authors = []
+    for author in entry.findall("{http://www.w3.org/2005/Atom}author"):
+        name = author.find("{http://www.w3.org/2005/Atom}name")
+        if name is not None and name.text:
+            authors.append(re.sub(r"\s+", " ", name.text).strip())
+    entry_id = arxiv_text(entry, "id")
+    arxiv_id = entry_id.rstrip("/").rsplit("/", 1)[-1] if entry_id else ""
+    pdf_url = ""
+    for link in entry.findall("{http://www.w3.org/2005/Atom}link"):
+        if link.attrib.get("title") == "pdf" or link.attrib.get("type") == "application/pdf":
+            pdf_url = link.attrib.get("href", "")
+            break
+    if arxiv_id and not pdf_url:
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    year = ""
+    published = arxiv_text(entry, "published") or arxiv_text(entry, "updated")
+    if published:
+        year = normalize_year(published[:4])
+    return {
+        "title": title,
+        "matched_title": title,
+        "authors": ", ".join(authors),
+        "year": year,
+        "venue": "arXiv",
+        "url": entry_id,
+        "pdf_url": pdf_url,
+        "open_access_pdf_url": pdf_url,
+        "arxiv_id": arxiv_id,
+        "abstract": summary,
+        "source": "arxiv",
+    }
+
+
+def lookup_arxiv_card(title: str) -> dict[str, Any]:
+    query_title = str(title or "").strip()
+    if not query_title:
+        return {}
+    query = urllib.parse.urlencode({"search_query": f'ti:"{query_title}"', "start": "0", "max_results": "5"})
+    text = http_text(f"https://export.arxiv.org/api/query?{query}", timeout=12)
+    root = ET.fromstring(text)
+    entries = [arxiv_card(entry) for entry in root.findall("{http://www.w3.org/2005/Atom}entry")]
+    best = best_title_matched_item(entries, query_title, "title")
+    return best if best else {}
+
+
 def enrich_reference_online(card: dict[str, Any]) -> dict[str, Any]:
     title = str(card.get("title") or "").strip()
     doi = str(card.get("doi") or "").strip()
@@ -3853,17 +5067,19 @@ def enrich_reference_online(card: dict[str, Any]) -> dict[str, Any]:
         if doi:
             url = "https://api.semanticscholar.org/graph/v1/paper/" + urllib.parse.quote(
                 f"DOI:{doi}", safe=""
-            ) + "?fields=title,abstract,authors,year,venue,externalIds,url"
+            ) + "?fields=title,abstract,authors,year,venue,externalIds,url,openAccessPdf"
             data = http_json(url)
-            enriched = semantic_scholar_card(data)
+            candidate = semantic_scholar_card(data)
+            if not title or reference_title_match_score(title, candidate.get("title") or "") >= 0.72:
+                enriched = candidate
         elif title:
             query = urllib.parse.urlencode(
-                {"query": title, "limit": "1", "fields": "title,abstract,authors,year,venue,externalIds,url"}
+                {"query": title, "limit": "5", "fields": "title,abstract,authors,year,venue,externalIds,url,openAccessPdf"}
             )
             data = http_json(f"https://api.semanticscholar.org/graph/v1/paper/search?{query}")
-            items = data.get("data") or []
-            if items:
-                enriched = semantic_scholar_card(items[0])
+            item = best_title_matched_item(data.get("data") or [], title, "title")
+            if item:
+                enriched = semantic_scholar_card(item)
     except Exception:  # noqa: BLE001
         enriched = {}
     if not enriched and (doi or title):
@@ -3873,11 +5089,27 @@ def enrich_reference_online(card: dict[str, Any]) -> dict[str, Any]:
             else:
                 query = urllib.parse.urlencode({"search": title, "per-page": "1"})
             data = http_json(f"https://api.openalex.org/works?{query}")
-            items = data.get("results") or []
-            if items:
-                enriched = openalex_card(items[0])
+            item = best_title_matched_item(data.get("results") or [], title, "display_name")
+            if item:
+                enriched = openalex_card(item)
         except Exception:  # noqa: BLE001
             enriched = {}
+    if title and not enriched.get("pdf_url"):
+        try:
+            arxiv = lookup_arxiv_card(title)
+            for key, value in arxiv.items():
+                if value and not enriched.get(key):
+                    enriched[key] = value
+        except Exception:  # noqa: BLE001
+            pass
+    if title and not enriched.get("doi"):
+        try:
+            crossref = lookup_crossref_card(title)
+            for key, value in crossref.items():
+                if value and not enriched.get(key):
+                    enriched[key] = value
+        except Exception:  # noqa: BLE001
+            pass
     merged = {**card}
     for key, value in enriched.items():
         if value and not merged.get(key):
@@ -3890,13 +5122,22 @@ def enrich_reference_online(card: dict[str, Any]) -> dict[str, Any]:
 def semantic_scholar_card(data: dict[str, Any]) -> dict[str, Any]:
     external = data.get("externalIds") or {}
     doi = external.get("DOI") or ""
+    open_access = data.get("openAccessPdf") if isinstance(data.get("openAccessPdf"), dict) else {}
+    arxiv_id = external.get("ArXiv") or ""
+    pdf_url = open_access.get("url") or (f"https://arxiv.org/pdf/{arxiv_id}.pdf" if arxiv_id else "")
     return {
         "title": data.get("title") or "",
+        "matched_title": data.get("title") or "",
+        "title_match_score": data.get("_title_match_score", ""),
         "authors": ", ".join(author.get("name", "") for author in data.get("authors", []) if author.get("name")),
         "year": str(data.get("year") or ""),
         "venue": data.get("venue") or "",
         "doi": doi,
         "url": data.get("url") or (f"https://doi.org/{doi}" if doi else ""),
+        "semantic_scholar_url": data.get("url") or "",
+        "pdf_url": pdf_url,
+        "open_access_pdf_url": open_access.get("url") or "",
+        "arxiv_id": arxiv_id,
         "abstract": clean_abstract(data.get("abstract") or ""),
         "source": "semantic_scholar",
     }
@@ -3910,13 +5151,18 @@ def openalex_card(data: dict[str, Any]) -> dict[str, Any]:
             authors.append(author["display_name"])
     doi_url = data.get("doi") or ""
     doi = doi_url.replace("https://doi.org/", "")
+    primary_location = data.get("primary_location") if isinstance(data.get("primary_location"), dict) else {}
     return {
         "title": data.get("display_name") or "",
+        "matched_title": data.get("display_name") or "",
+        "title_match_score": data.get("_title_match_score", ""),
         "authors": ", ".join(authors),
         "year": str(data.get("publication_year") or ""),
-        "venue": (data.get("primary_location") or {}).get("source", {}).get("display_name") or "",
+        "venue": (primary_location.get("source") or {}).get("display_name") or "",
         "doi": doi,
         "url": doi_url or data.get("id") or "",
+        "pdf_url": primary_location.get("pdf_url") or "",
+        "open_access_pdf_url": primary_location.get("pdf_url") or "",
         "abstract": clean_abstract(abstract_from_openalex_index(data.get("abstract_inverted_index"))),
         "source": "openalex",
     }
@@ -4220,6 +5466,13 @@ METADATA_UPDATE_FIELDS = {
     "discussion",
     "doi",
     "url",
+    "pdf_url",
+    "open_access_pdf_url",
+    "semantic_scholar_url",
+    "arxiv_id",
+    "source_url",
+    "source_page_url",
+    "reference_pdf_error",
     "importance",
     "importance_tags",
     "preview_image",
@@ -4256,7 +5509,16 @@ METADATA_UPDATE_FIELDS = {
 
 
 def apply_paper_metadata_update(workspace: Path, paper_id: str, paper_dir: Path, data: dict[str, Any], *, generate_pdf_preview: bool = False) -> dict[str, Any]:
+    with write_lock_for(paper_dir / "metadata.json"):
+        return _apply_paper_metadata_update(workspace, paper_id, paper_dir, data, generate_pdf_preview=generate_pdf_preview)
+
+
+def _apply_paper_metadata_update(workspace: Path, paper_id: str, paper_dir: Path, data: dict[str, Any], *, generate_pdf_preview: bool = False) -> dict[str, Any]:
     metadata = read_json(paper_dir / "metadata.json", {})
+    if metadata.get("feishu", {}).get("record_id"):
+        overrides = set(metadata.get("feishu_local_overrides") or [])
+        overrides.update(key for key in feishu_metadata.FIELD_MAPPING if key in data and data[key] != metadata.get(key))
+        metadata["feishu_local_overrides"] = sorted(overrides)
     if "importance" in data:
         metadata.update(importance_fields(data.get("importance")))
     for key, value in data.items():
@@ -4287,6 +5549,253 @@ def apply_paper_metadata_update(workspace: Path, paper_id: str, paper_dir: Path,
     write_json(paper_dir / "metadata.json", metadata)
     sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=generate_pdf_preview)
     return metadata
+
+
+def feishu_config() -> dict[str, Any]:
+    base_token = env_value("PAPER_READER_FEISHU_BASE_TOKEN")
+    table_id = env_value("PAPER_READER_FEISHU_TABLE_ID")
+    return {
+        "enabled": bool(base_token and table_id),
+        "auto_sync": env_value("PAPER_READER_FEISHU_AUTO_SYNC", default="0").lower() in {"1", "true", "yes"},
+        "base_token": base_token, "table_id": table_id,
+        "publication_enabled": bool(base_token and table_id),
+        "fields": {key: value[0] for key, value in feishu_metadata.FIELD_MAPPING.items()},
+    }
+
+
+def feishu_settings() -> tuple[str, str, str]:
+    config = feishu_config()
+    if not config["enabled"]:
+        raise ValueError("Configure PAPER_READER_FEISHU_BASE_TOKEN and PAPER_READER_FEISHU_TABLE_ID first.")
+    feishu_metadata.validate_ids(config["base_token"], config["table_id"])
+    return config["base_token"], config["table_id"], env_value("PAPER_READER_LARK_CLI")
+
+
+def publication_settings() -> dict[str, Any]:
+    from reading_archive import TABLE_COLUMN_NAMES
+
+    base_token, table_id, executable = feishu_settings()
+    return {
+        "mode": "table",
+        "base_token": base_token, "table_id": table_id, "executable": executable,
+        "text_fields": {
+            key: env_value(variable, default=TABLE_COLUMN_NAMES[key])
+            for key, variable in (
+                ("my-notes", "PAPER_READER_FEISHU_NOTES_FIELD"),
+                ("ai-discussions", "PAPER_READER_FEISHU_DISCUSSIONS_FIELD"),
+                ("accepted-definitions", "PAPER_READER_FEISHU_DEFINITIONS_FIELD"),
+                ("other-material", "PAPER_READER_FEISHU_MATERIALS_FIELD"),
+            )
+        },
+        "archive_field": env_value("PAPER_READER_FEISHU_ARCHIVE_FIELD", default="阅读档案"),
+        "backup_field": env_value("PAPER_READER_FEISHU_BACKUP_FIELD", default="阅读数据备份"),
+        "parent_token": env_value("PAPER_READER_FEISHU_ARCHIVE_PARENT"),
+    }
+
+
+def sync_feishu_metadata(workspace: Path, paper_id: str, paper_dir: Path, data: dict[str, Any], *,
+                        source_record: dict[str, Any] | None = None) -> dict[str, Any]:
+    base_token, table_id, executable = feishu_settings()
+    automatic = bool(data.get("automatic"))
+    before = read_json(paper_dir / "metadata.json", {}, strict=True)
+    link = before.get("feishu") or {}
+    record_id = str(data.get("record_id") or link.get("record_id") or "")
+    if automatic and data.get("record_id") and data["record_id"] != link.get("record_id"):
+        raise ValueError("Automatic synchronization cannot select an arbitrary Feishu record.")
+    if link.get("record_id") and (link.get("base_token") != base_token or link.get("table_id") != table_id):
+        raise ValueError("This paper is linked to a different Feishu table. Confirm a new association before changing it.")
+    if not record_id:
+        search = feishu_metadata.search_records(base_token, table_id, before.get("title") or paper_id, executable=executable)
+        matches = [record for record in search["records"]
+                   if feishu_metadata.title_key(record["title"]) == feishu_metadata.title_key(before.get("title"))]
+        if len(matches) != 1 or search["has_more"]:
+            return {"ok": True, "status": "needs_match", "candidates": search["records"], "has_more": search["has_more"]}
+        record_id = matches[0]["record_id"]
+    source = source_record if source_record is not None else feishu_metadata.read_record(base_token, table_id, record_id, executable=executable)
+    if source.get("record_id") != record_id:
+        raise ValueError("The Feishu snapshot does not belong to the selected record.")
+    with write_lock_for(paper_dir / "metadata.json"):
+        if not paper_dir.is_dir():
+            raise FileNotFoundError("Paper was removed during Feishu synchronization.")
+        metadata = read_json(paper_dir / "metadata.json", {}, strict=True)
+        current_link = metadata.get("feishu") or {}
+        if current_link != link:
+            raise ValueError("The Feishu association changed while fetching. Retry using the current association.")
+        if automatic and not link and metadata.get("title") != before.get("title"):
+            raise ValueError("The local title changed while matching. Retry with the current title.")
+        cache = read_json(paper_dir / "feishu_metadata.json", {}, strict=True)
+        if cache and cache.get("record_id") != record_id:
+            raise ValueError("An existing Feishu snapshot belongs to another record; automatic replacement is disabled.")
+        original = cache.get("previous_metadata") or {key: metadata.get(key) for key in feishu_metadata.FIELD_MAPPING}
+        overrides = set(metadata.get("feishu_local_overrides") or [])
+        if metadata.get("title_locked") or metadata.get("title_source") == "user":
+            overrides.add("title")
+        changed_during_fetch = {key for key in feishu_metadata.FIELD_MAPPING if metadata.get(key) != before.get(key)}
+        overrides.update(changed_during_fetch)
+        applied = []
+        for key, value in source["metadata"].items():
+            if value.strip() and key not in overrides:
+                if metadata.get(key) != value:
+                    applied.append(key)
+                metadata[key] = value
+        if source["metadata"]["title"].strip() and "title" not in overrides:
+            metadata["title_source"] = "feishu"
+            metadata["title_key"] = normalize_title_key(metadata["title"])
+        metadata["feishu"] = {
+            "base_token": base_token, "table_id": table_id, "record_id": record_id,
+            "synced_at": now_iso(), "field_sources": source["field_sources"],
+            "url": f"https://feishu.cn/base/{base_token}?table={table_id}&record={record_id}",
+        }
+        metadata["feishu_local_overrides"] = sorted(overrides)
+        snapshot = {**source, "base_token": base_token, "table_id": table_id,
+                    "synced_at": metadata["feishu"]["synced_at"], "previous_metadata": original}
+        write_json(paper_dir / "feishu_metadata.json", snapshot)
+        if applied or not link:
+            metadata["updated_at"] = now_iso()
+        write_json(paper_dir / "metadata.json", metadata)
+        sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    return {"ok": True, "status": "synced", "metadata": metadata, "feishu_metadata": snapshot,
+            "applied_fields": applied, "local_overrides": sorted(overrides)}
+
+
+def linked_feishu_paper(workspace: Path, base_token: str, table_id: str, record_id: str) -> dict[str, Any] | None:
+    matches = [paper for paper in read_library_index(workspace).get("papers", [])
+               if all((paper.get("feishu") or {}).get(key) == value for key, value in {
+                   "base_token": base_token, "table_id": table_id, "record_id": record_id,
+               }.items())]
+    if len(matches) > 1:
+        raise ValueError("More than one local paper is linked to this Feishu record. Resolve the duplicate before importing.")
+    return matches[0] if matches else None
+
+
+def preview_feishu_record(workspace: Path, reference: str) -> dict[str, Any]:
+    base_token, table_id, executable = feishu_settings()
+    record_id = feishu_metadata.resolve_record_reference(base_token, table_id, reference, executable=executable)
+    source = feishu_metadata.read_intake_record(base_token, table_id, record_id, executable=executable)
+    paper = linked_feishu_paper(workspace, base_token, table_id, record_id)
+    return {"ok": True, "record": source, "local_paper": paper}
+
+
+def feishu_intake_response(workspace: Path, paper_id: str, metadata: dict[str, Any], *,
+                           reused: bool, local_source: bool) -> dict[str, Any]:
+    paper = next((item for item in read_library_index(workspace).get("papers", []) if item.get("id") == paper_id), None)
+    if paper is None:
+        raise RuntimeError("The imported paper is missing from the local index. Keep its files and recover the index before retrying.")
+    return {"ok": True, "paper_id": paper_id, "metadata": metadata, "reused": reused,
+            "used_local_pdf": local_source, "paper": paper,
+            "feishu_metadata": read_json(paper_record_dir(workspace, paper) / "feishu_metadata.json", {}, strict=True)}
+
+
+def register_feishu_pdf(workspace: Path, source: dict[str, Any], attachment: dict[str, Any], pdf_path: Path, *,
+                        local_source: bool, linked: dict[str, Any] | None) -> dict[str, Any]:
+    base_token, table_id, _executable = feishu_settings()
+    with pdf_path.open("rb") as stream:
+        if not pdf_bytes_are_recognizable(stream.read(1024)):
+            raise ValueError("The selected file is not a PDF. No existing reading data was replaced.")
+    digest = file_hash(pdf_path)
+    record_id = source["record_id"]
+    title = source["metadata"].get("title") or Path(attachment["name"]).stem
+    cloud_title_key = feishu_metadata.title_key(source["metadata"].get("title"))
+    target_id = f"feishu-{record_id}"
+    candidates = [paper for paper in read_library_index(workspace).get("papers", [])
+                  if paper.get("source_pdf_sha256") == digest or str(paper.get("id", "")).endswith(f"-{digest[:12]}")
+                  or paper.get("id") == target_id or (linked and paper.get("id") == linked["id"])
+                  or (cloud_title_key and feishu_metadata.title_key(paper.get("title")) == cloud_title_key)]
+    identical = [paper for paper in candidates
+                 if (paper_record_dir(workspace, paper) / "original.pdf").is_file()
+                 and file_hash(paper_record_dir(workspace, paper) / "original.pdf") == digest]
+    if len(identical) > 1:
+        raise ValueError("This PDF matches multiple local papers. Resolve the duplicate before linking another record.")
+    existing = identical[0] if identical else None
+    if linked and (not existing or existing["id"] != linked["id"]):
+        linked_dir = paper_record_dir(workspace, linked)
+        if (linked_dir / "original.pdf").exists() or nonempty_segment_count(linked_dir):
+            raise ValueError("The selected PDF differs from the linked local source. Existing annotations were not replaced.")
+        existing = linked
+    if not existing:
+        duplicate = next((paper for paper in candidates
+                          if cloud_title_key and feishu_metadata.title_key(paper.get("title")) == cloud_title_key), None)
+        if duplicate:
+            raise ValueError("A local paper has the same title, but its PDF identity is not verified. Use its metadata panel to confirm the association first.")
+        target_dir = workspace / "papers" / target_id
+        if target_dir.exists():
+            raise ValueError("An unindexed import directory already exists for this record. Recover it before retrying; no files were replaced.")
+        result = register_paper_in_library(
+            workspace, pdf_path, paper_id=target_id, title=title, title_source="feishu" if cloud_title_key else "filename",
+            pdf_digest=digest, match_title=False, generate_pdf_preview=False, enrich_citation=False,
+        )
+        if result.get("duplicate") or not result.get("ok"):
+            raise ValueError("This PDF conflicts with an existing paper. No replacement was performed.")
+        paper_id = result["paper_id"]
+        paper_dir = workspace / "papers" / paper_id
+    else:
+        paper_id = existing["id"]
+        paper_dir = paper_record_dir(workspace, existing)
+        metadata = read_json(paper_dir / "metadata.json", {}, strict=True)
+        link = metadata.get("feishu") or {}
+        if link and any(link.get(key) != value for key, value in {
+            "base_token": base_token, "table_id": table_id, "record_id": record_id,
+        }.items()):
+            raise ValueError("This local PDF is linked to another Feishu record. Re-association must be explicit.")
+        if not (paper_dir / "original.pdf").exists():
+            shutil.copy2(pdf_path, paper_dir / "original.pdf")
+    fields = {
+        "source_pdf": "original.pdf", "source_pdf_sha256": digest,
+        "feishu_attachment": {
+            **attachment, "sha256": digest,
+            "verification": "user_selected_local_pdf" if local_source else "downloaded_feishu_attachment",
+        },
+    }
+    if not existing:
+        fields.update(source_pdf_name=attachment["name"], original_path=str(pdf_path if local_source else paper_dir / "original.pdf"))
+    save_processing_fields(workspace, paper_id, paper_dir, fields)
+    sync_feishu_metadata(workspace, paper_id, paper_dir, {"record_id": record_id}, source_record=source)
+    metadata = prepare_pdf_brief_then_background(workspace, paper_id, paper_dir, {}, mode="deep")
+    return feishu_intake_response(workspace, paper_id, metadata, reused=bool(existing), local_source=local_source)
+
+
+def intake_feishu_paper(workspace: Path, data: dict[str, Any]) -> dict[str, Any]:
+    base_token, table_id, executable = feishu_settings()
+    record_id = str(data.get("record_id") or "").strip()
+    feishu_metadata.validate_ids(base_token, table_id, record_id)
+    if not record_id:
+        raise ValueError("Select a Feishu record before queuing a paper.")
+    source = feishu_metadata.read_intake_record(base_token, table_id, record_id, executable=executable)
+    attachment = next((item for item in source["attachments"] if item["file_token"] == data.get("file_token")), None)
+    if attachment is None:
+        raise ValueError("Select one of this record's current PDF attachments. Refresh the preview if it changed.")
+    local_path = str(data.get("local_pdf_path") or "").strip()
+    with write_lock_for(workspace / "feishu-intake"):
+        linked = linked_feishu_paper(workspace, base_token, table_id, record_id)
+        if linked:
+            paper_id = linked["id"]
+            paper_dir = paper_record_dir(workspace, linked)
+            metadata = read_json(paper_dir / "metadata.json", {}, strict=True)
+            previous = metadata.get("feishu_attachment") or {}
+            if previous and previous.get("file_token") != attachment["file_token"]:
+                raise ValueError("Feishu has a different PDF attachment now. The existing local source and notes were kept; do not replace them implicitly.")
+            pdf_path = paper_dir / "original.pdf"
+            if not local_path and previous and pdf_path.is_file():
+                if file_hash(pdf_path) != previous.get("sha256"):
+                    raise ValueError("The local PDF changed since import. Verify it before reusing the Feishu association.")
+                sync_feishu_metadata(workspace, paper_id, paper_dir, {"record_id": record_id}, source_record=source)
+                metadata = prepare_pdf_brief_then_background(workspace, paper_id, paper_dir, {}, mode="deep")
+                return feishu_intake_response(workspace, paper_id, metadata, reused=True, local_source=True)
+        if local_path:
+            pdf_path = Path(local_path).expanduser().resolve(strict=True)
+            if not pdf_path.is_file() or pdf_path.suffix.lower() != ".pdf":
+                raise ValueError("Choose an existing local PDF file, not a folder.")
+            if attachment.get("size") and pdf_path.stat().st_size != attachment["size"]:
+                raise ValueError("The local PDF size does not match the selected cloud attachment. Download the cloud PDF or choose the correct local file.")
+            return register_feishu_pdf(workspace, source, attachment, pdf_path, local_source=True, linked=linked)
+        with tempfile.TemporaryDirectory(prefix="paper-reader-feishu-") as temporary:
+            pdf_path = feishu_metadata.download_record_attachment(
+                base_token, table_id, record_id, attachment["file_token"], Path(temporary) / "attachment.pdf",
+                executable=executable,
+            )
+            if attachment.get("size") and pdf_path.stat().st_size != attachment["size"]:
+                raise ValueError("The downloaded PDF size differs from the selected attachment. Refresh the preview and retry.")
+            return register_feishu_pdf(workspace, source, attachment, pdf_path, local_source=False, linked=linked)
 
 
 def aggregate_notes(workspace: Path) -> list[dict[str, Any]]:
@@ -4367,6 +5876,78 @@ def reference_paper_id(card: dict[str, Any]) -> str:
     return f"{slugify(str(card.get('title') or 'reference'), 'reference')}-{digest}"
 
 
+def reference_pdf_url(card: dict[str, Any]) -> str:
+    for key in ("pdf_url", "open_access_pdf_url", "arxiv_pdf_url"):
+        value = str(card.get(key) or "").strip()
+        if value.startswith(("http://", "https://")):
+            return value
+    value = str(card.get("url") or "").strip()
+    if value.startswith(("http://", "https://")) and value.lower().split("?", 1)[0].endswith(".pdf"):
+        return value
+    return ""
+
+
+def merge_reference_metadata(metadata: dict[str, Any], card: dict[str, Any], *, parent_paper_id: str = "", parent_title: str = "") -> dict[str, Any]:
+    title = card.get("title") or metadata.get("title") or f"Reference {card.get('number', '')}".strip()
+    metadata.setdefault("id", metadata.get("id", ""))
+    metadata.update(
+        {
+            "title": metadata.get("title") or title,
+            "title_key": metadata.get("title_key") or normalize_title_key(title),
+            "authors": metadata.get("authors") or card.get("authors", ""),
+            "venue": metadata.get("venue") or card.get("venue", ""),
+            "year": metadata.get("year") or card.get("year", ""),
+            "abstract": metadata.get("abstract") or card.get("abstract", ""),
+            "abstract_zh": metadata.get("abstract_zh") or card.get("abstract_zh", ""),
+            "source_reference": metadata.get("source_reference") or card.get("raw", ""),
+            "source_parent_paper_id": metadata.get("source_parent_paper_id") or parent_paper_id,
+            "source_parent_paper_title": metadata.get("source_parent_paper_title") or parent_title,
+            "doi": metadata.get("doi") or card.get("doi", ""),
+            "url": metadata.get("url") or card.get("url", ""),
+            "semantic_scholar_url": metadata.get("semantic_scholar_url") or card.get("semantic_scholar_url", ""),
+            "pdf_url": metadata.get("pdf_url") or reference_pdf_url(card),
+            "open_access_pdf_url": metadata.get("open_access_pdf_url") or card.get("open_access_pdf_url", ""),
+            "arxiv_id": metadata.get("arxiv_id") or card.get("arxiv_id", ""),
+        }
+    )
+    return metadata
+
+
+def attach_reference_pdf_to_paper(workspace: Path, paper_id: str, paper_dir: Path, metadata: dict[str, Any], card: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    pdf_url = reference_pdf_url(card)
+    if not pdf_url:
+        return metadata, {"pdf_attached": False, "pdf_url": "", "pdf_error": ""}
+    if (paper_dir / "original.pdf").exists():
+        metadata.update({"pdf_url": metadata.get("pdf_url") or pdf_url, "updated_at": now_iso()})
+        return metadata, {"pdf_attached": True, "pdf_url": pdf_url, "pdf_error": "", "pdf_existing": True}
+    try:
+        filename, content = download_pdf_bytes(pdf_url, {"Referer": str(card.get("url") or card.get("semantic_scholar_url") or pdf_url)})
+    except Exception as exc:  # noqa: BLE001
+        metadata.update({"pdf_url": pdf_url, "reference_pdf_error": str(exc), "updated_at": now_iso()})
+        write_json(paper_dir / "metadata.json", metadata)
+        sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+        return metadata, {"pdf_attached": False, "pdf_url": pdf_url, "pdf_error": str(exc)}
+    (paper_dir / "original.pdf").write_bytes(content)
+    metadata.update(
+        {
+            "source_pdf": "original.pdf",
+            "source_pdf_name": filename,
+            "source_type": "reference_pdf",
+            "pdf_url": pdf_url,
+            "source_url": pdf_url,
+            "source_page_url": card.get("url") or card.get("semantic_scholar_url") or "",
+            "reference_pdf_error": "",
+            "processing_mode": metadata.get("processing_mode", "library-only"),
+            "reading_mode": metadata.get("reading_mode", metadata.get("processing_mode", "library-only")),
+            "processing_status": metadata.get("processing_status", "not_processed"),
+            "updated_at": now_iso(),
+        }
+    )
+    write_json(paper_dir / "metadata.json", metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    return metadata, {"pdf_attached": True, "pdf_url": pdf_url, "pdf_error": ""}
+
+
 def add_reference_to_library(
     workspace: Path,
     card: dict[str, Any],
@@ -4379,6 +5960,25 @@ def add_reference_to_library(
     title = card.get("title") or f"Reference {card.get('number', '')}".strip()
     duplicate = find_duplicate_paper_by_title(workspace, title, exclude_paper_id=paper_id)
     if duplicate:
+        duplicate_id = str(duplicate.get("id") or "")
+        duplicate_dir = paper_record_dir(workspace, duplicate)
+        if duplicate_id and duplicate_dir.exists() and duplicate_can_accept_pdf(workspace, duplicate) and reference_pdf_url(card):
+            metadata = read_json(duplicate_dir / "metadata.json", {})
+            parent_record = find_paper_record(workspace, parent_paper_id) or {}
+            metadata = merge_reference_metadata(metadata, card, parent_paper_id=parent_paper_id, parent_title=parent_record.get("title") or parent_paper_id)
+            if str(importance or "").strip():
+                metadata.update(importance_fields(importance))
+            if tags:
+                metadata["tags"] = normalize_tag_paths([*normalize_tag_paths(metadata.get("tags", [])), *tags])
+            clean_projects = normalize_project_list([*metadata_projects(metadata), *(projects or [])])
+            metadata["projects"] = clean_projects
+            metadata["project"] = clean_projects[0] if clean_projects else ""
+            write_json(duplicate_dir / "metadata.json", metadata)
+            metadata, pdf_info = attach_reference_pdf_to_paper(workspace, duplicate_id, duplicate_dir, metadata, card)
+            if pdf_info.get("pdf_attached"):
+                metadata = prepare_pdf_brief_then_background(workspace, duplicate_id, duplicate_dir, {}, mode="deep")
+                pdf_info["processing_background"] = "started"
+            return {"paper_id": duplicate_id, "metadata": metadata, "attached_to_existing": True, **pdf_info}
         return {**duplicate_paper_response(workspace, title, str(card.get("raw") or "reference"), duplicate), "paper_id": duplicate.get("id", "")}
     paper_dir = workspace / "papers" / paper_id
     paper_dir.mkdir(parents=True, exist_ok=True)
@@ -4387,21 +5987,12 @@ def add_reference_to_library(
     clean_projects = normalize_project_list(projects or [])
     parent_record = find_paper_record(workspace, parent_paper_id) or {}
     parent_title = parent_record.get("title") or parent_paper_id
-    metadata = {
+    metadata = merge_reference_metadata(
+        {
         "id": paper_id,
         "title": title,
         "title_key": normalize_title_key(title),
         "title_source": "reference",
-        "authors": card.get("authors", ""),
-        "venue": card.get("venue", ""),
-        "year": card.get("year", ""),
-        "abstract": abstract,
-        "abstract_zh": abstract_zh,
-        "source_reference": card.get("raw", ""),
-        "source_parent_paper_id": parent_paper_id,
-        "source_parent_paper_title": parent_title,
-        "doi": card.get("doi", ""),
-        "url": card.get("url", ""),
         "source_type": "reference",
         "status": "unread",
         "read_status": "unread",
@@ -4412,7 +6003,11 @@ def add_reference_to_library(
         "agent_analysis_status": "reference_card",
         "paper_brief_status": "needs_pdf",
         "updated_at": now_iso(),
-    }
+        },
+        card,
+        parent_paper_id=parent_paper_id,
+        parent_title=parent_title,
+    )
     write_json(paper_dir / "metadata.json", metadata)
     blocks = [f"# {title}"]
     if card.get("authors"):
@@ -4428,10 +6023,97 @@ def add_reference_to_library(
     write_json(paper_dir / "outline.json", {"outline": outline, "core_locations": []})
     if not (paper_dir / "annotations.json").exists():
         write_json(paper_dir / "annotations.json", {"annotations": []})
-    write_text_atomic(paper_dir / "reader.md", make_reader_markdown(segments, "reference-card"))
+    write_reader_bundle(paper_dir, metadata, segments, "reference-card")
     export_notes_and_annotated(paper_dir)
     sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
-    return {"paper_id": paper_id, "metadata": metadata}
+    metadata, pdf_info = attach_reference_pdf_to_paper(workspace, paper_id, paper_dir, metadata, card)
+    if not pdf_info.get("pdf_attached") and not pdf_info.get("pdf_url"):
+        lookup_result = find_and_attach_pdf_to_existing_paper(workspace, paper_id, paper_dir, force=True)
+        metadata = lookup_result.get("metadata") or metadata
+        pdf_info = {
+            "pdf_attached": lookup_result.get("pdf_attached", False),
+            "pdf_url": lookup_result.get("pdf_url", ""),
+            "pdf_error": lookup_result.get("pdf_error", ""),
+            "pdf_existing": lookup_result.get("pdf_existing", False),
+        }
+    if pdf_info.get("pdf_attached"):
+        metadata = prepare_pdf_brief_then_background(workspace, paper_id, paper_dir, {}, mode="deep")
+        pdf_info["processing_background"] = "started"
+    return {"paper_id": paper_id, "metadata": metadata, **pdf_info}
+
+
+def metadata_card_for_pdf_lookup(metadata: dict[str, Any]) -> dict[str, Any]:
+    card = {
+        "title": metadata.get("title") or "",
+        "authors": metadata.get("authors") or metadata.get("author") or "",
+        "year": metadata.get("year") or metadata.get("publication_year") or "",
+        "venue": metadata.get("venue") or metadata.get("journal") or "",
+        "doi": metadata.get("doi") or "",
+        "url": metadata.get("url") or "",
+        "pdf_url": metadata.get("pdf_url") or "",
+        "open_access_pdf_url": metadata.get("open_access_pdf_url") or "",
+        "semantic_scholar_url": metadata.get("semantic_scholar_url") or "",
+        "arxiv_id": metadata.get("arxiv_id") or "",
+        "abstract": metadata.get("abstract") or "",
+        "abstract_zh": metadata.get("abstract_zh") or "",
+        "raw": metadata.get("source_reference") or "",
+        "source": metadata.get("citation_source") or metadata.get("source_type") or "metadata",
+    }
+    source_reference = str(metadata.get("source_reference") or "").strip()
+    parsed = parse_reference_entry({"id": "source_reference", "markdown": source_reference}) if source_reference else None
+    if parsed:
+        current_score = reference_title_match_score(parsed.get("title"), card.get("title"))
+        if current_score < 0.72 or len(str(parsed.get("title") or "")) < len(str(card.get("title") or "")):
+            for key in ("title", "authors", "year", "venue", "doi", "url", "raw"):
+                if parsed.get(key):
+                    card[key] = parsed[key]
+    return card
+
+
+def merge_enriched_card_into_metadata(metadata: dict[str, Any], card: dict[str, Any]) -> dict[str, Any]:
+    current_title = str(metadata.get("title") or "").strip()
+    card_title = str(card.get("matched_title") or card.get("title") or "").strip()
+    if card_title and (
+        not current_title
+        or str(metadata.get("title_source") or "") in {"", "reference", "metadata", "library"}
+        or reference_title_match_score(current_title, card_title) >= 0.72
+    ):
+        metadata["title"] = card_title
+        metadata["title_key"] = normalize_title_key(card_title)
+        metadata["title_source"] = "online_metadata"
+    for key in ("authors", "year", "venue", "doi", "url", "semantic_scholar_url", "pdf_url", "open_access_pdf_url", "arxiv_id", "abstract", "abstract_zh"):
+        value = card.get(key)
+        if value and (key in {"pdf_url", "open_access_pdf_url", "semantic_scholar_url", "arxiv_id"} or not metadata.get(key)):
+            metadata[key] = value
+    metadata["metadata_lookup_source"] = card.get("source") or metadata.get("metadata_lookup_source") or "online_metadata"
+    metadata["metadata_lookup_updated_at"] = now_iso()
+    metadata["updated_at"] = now_iso()
+    return metadata
+
+
+def find_and_attach_pdf_to_existing_paper(workspace: Path, paper_id: str, paper_dir: Path, *, force: bool = False) -> dict[str, Any]:
+    metadata = read_json(paper_dir / "metadata.json", {})
+    card = metadata_card_for_pdf_lookup(metadata)
+    if force or not reference_pdf_url(card):
+        card = enrich_reference_online(card)
+    metadata = merge_enriched_card_into_metadata(metadata, card)
+    write_json(paper_dir / "metadata.json", metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    if (paper_dir / "original.pdf").exists():
+        metadata.update({"reference_pdf_error": "", "updated_at": now_iso()})
+        write_json(paper_dir / "metadata.json", metadata)
+        sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+        return {"ok": True, "paper_id": paper_id, "metadata": metadata, "pdf_attached": True, "pdf_existing": True, "pdf_url": reference_pdf_url(card), "pdf_error": "", "card": card}
+    metadata, pdf_info = attach_reference_pdf_to_paper(workspace, paper_id, paper_dir, metadata, card)
+    if pdf_info.get("pdf_attached"):
+        metadata = prepare_pdf_brief_then_background(workspace, paper_id, paper_dir, {}, mode="deep")
+        pdf_info["processing_background"] = "started"
+    elif not pdf_info.get("pdf_url"):
+        metadata.update({"reference_pdf_error": "No open PDF URL found from Semantic Scholar, OpenAlex, Crossref, or arXiv.", "updated_at": now_iso()})
+        write_json(paper_dir / "metadata.json", metadata)
+        sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+        pdf_info["pdf_error"] = metadata["reference_pdf_error"]
+    return {"ok": True, "paper_id": paper_id, "metadata": metadata, "card": card, **pdf_info}
 
 
 def find_mineru() -> str | None:
@@ -4585,8 +6267,6 @@ def normalize_html_tables(markdown: str) -> str:
 def normalize_math_fragment(text: str) -> str:
     fragment = str(text or "")
     fragment = re.sub(r"\\\s+([A-Za-z]+)", r"\\\1", fragment)
-    fragment = re.sub(r"(?<=[A-Za-z0-9])\s+(?=[A-Za-z0-9])", "", fragment)
-    fragment = re.sub(r"\s*([_\^=,+\-*/(){}\[\]])\s*", r"\1", fragment)
     fragment = re.sub(r"\{\s*\}", "{}", fragment)
     fragment = re.sub(r"\\(left|right)\s*", r"\\\1", fragment)
     return fragment.strip()
@@ -4913,7 +6593,23 @@ def inline_markdown_to_html(text: str) -> str:
     escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
     escaped = re.sub(r"\*([^*]+)\*", r"<em>\1</em>", escaped)
     escaped = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"<a href=\"\2\" target=\"_blank\" rel=\"noreferrer\">\1</a>", escaped)
-    return escaped
+    return autolink_plain_urls_and_dois(escaped)
+
+
+def autolink_plain_urls_and_dois(html_text: str) -> str:
+    def link_token(token: str) -> str:
+        trailing = ""
+        while token and token[-1] in ".,);]":
+            trailing = token[-1] + trailing
+            token = token[:-1]
+        href = token if re.match(r"https?://", token, flags=re.I) else f"https://doi.org/{token}"
+        return f'<a href="{html.escape(href)}" target="_blank" rel="noreferrer">{html.escape(token)}</a>{html.escape(trailing)}'
+
+    def link_plain_part(part: str) -> str:
+        return re.sub(r"(?<![\w/])(https?://[^\s<]+|10\.\d{4,9}/[^\s<]+)", lambda match: link_token(match.group(1)), part)
+
+    parts = re.split(r"(<a\b[^>]*>.*?</a>|<[^>]+>)", html_text, flags=re.I)
+    return "".join(part if part.startswith("<") else link_plain_part(part) for part in parts)
 
 
 def markdown_block_to_html(block: str, kind: str, level: int | None) -> str:
@@ -5026,13 +6722,343 @@ def make_reader_markdown(segments: list[dict[str, Any]], source_name: str) -> st
         lines.append("")
         lines.append(segment["markdown"].rstrip())
         lines.append("")
-        if segment.get("translation") or translation_source_for_segment(segment):
+        translation = translation_text_for_segment(segment)
+        if translation.strip() or translation_source_for_segment(segment):
             lines.append(f"<!-- zh:{segment_id} -->")
-            if segment.get("translation"):
-                lines.append(f"> 中文：{segment['translation']}")
+            if translation.strip():
+                lines.append(f"> 中文：{translation}")
             lines.append(f"<!-- /zh:{segment_id} -->")
             lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def source_block_type(segment: dict[str, Any]) -> str:
+    kind = str(segment.get("kind") or "paragraph")
+    markdown = str(segment.get("markdown") or "")
+    plain = markdown_plain_text(markdown)
+    if kind == "table" or re.search(r"<\s*table[\s>]", markdown, flags=re.I):
+        return "table"
+    if re.search(r"!\[[^\]]*\]\([^)]+\)", markdown):
+        return "figure"
+    if re.match(r"^(?:fig(?:ure)?\.?|table)\s*\d+\b", plain, flags=re.I):
+        return "caption"
+    if kind in {"heading", "list", "quote", "code"}:
+        return kind
+    return "paragraph"
+
+
+def source_block_prefix(block_type: str) -> str:
+    if block_type == "figure":
+        return "F"
+    if block_type == "table":
+        return "T"
+    if block_type == "caption":
+        return "C"
+    return "S"
+
+
+def source_block_page_hint(markdown: str) -> int | None:
+    text = str(markdown or "")
+    for pattern in (
+        r"<!--\s*page\s*[:=]\s*(\d+)\s*-->",
+        r"^#{1,6}\s+Page\s+(\d+)\b",
+        r"\bp(?:age)?[._ -]?(\d{1,4})\b",
+    ):
+        match = re.search(pattern, text, flags=re.I | re.M)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def source_refs_from_text(text: str) -> list[str]:
+    refs: list[str] = []
+    for prefix, pattern in (("F", r"\bfig(?:ure)?\.?\s*(\d+)"), ("T", r"\btable\s*(\d+)")):
+        for match in re.finditer(pattern, str(text or ""), flags=re.I):
+            ref = f"{prefix}{int(match.group(1)):03d}"
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
+def image_info_from_markdown(markdown: str) -> dict[str, str]:
+    match = re.search(r"!\[([^\]]*)\]\(([^)]+)\)", str(markdown or ""))
+    if not match:
+        return {}
+    return {"alt": match.group(1).strip(), "image_path": match.group(2).strip()}
+
+
+def caption_number_from_text(text: str, label: str) -> str:
+    pattern = r"\bfig(?:ure)?\.?\s*(\d+)" if label == "figure" else r"\btable\s*(\d+)"
+    match = re.search(pattern, str(text or ""), flags=re.I)
+    return match.group(1) if match else ""
+
+
+def extract_math_fragments_for_source_map(text: str) -> list[dict[str, str]]:
+    raw = str(text or "")
+    patterns = [
+        (r"\$\$([\s\S]+?)\$\$", "display"),
+        (r"\\\[([\s\S]+?)\\\]", "display"),
+        (r"\\\(([^\n]+?)\\\)", "inline"),
+        (r"(?<!\\)\$([^$\n]+?)(?<!\\)\$", "inline"),
+        (r"\\begin\{(equation\*?|align\*?|gather\*?|multline\*?)\}([\s\S]+?)\\end\{\1\}", "display"),
+    ]
+    fragments: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for pattern, mode in patterns:
+        for match in re.finditer(pattern, raw, flags=re.I):
+            expression = match.group(2) if match.lastindex and match.lastindex >= 2 else match.group(1)
+            expression = str(expression or "").strip()
+            if not expression or expression in seen:
+                continue
+            seen.add(expression)
+            fragments.append({"mode": mode, "latex": expression[:1200]})
+    return fragments[:24]
+
+
+def build_source_map(metadata: dict[str, Any], segments: list[dict[str, Any]], source_name: str) -> dict[str, Any]:
+    counters = {"S": 0, "C": 0, "F": 0, "T": 0}
+    blocks: list[dict[str, Any]] = []
+    pages: dict[int, list[str]] = {}
+    figures: list[dict[str, Any]] = []
+    tables: list[dict[str, Any]] = []
+    current_page: int | None = None
+    previous_text_id = ""
+    for order, segment in enumerate(segments, start=1):
+        markdown = str(segment.get("markdown") or "")
+        block_type = source_block_type(segment)
+        prefix = source_block_prefix(block_type)
+        counters[prefix] += 1
+        source_id = f"{prefix}{counters[prefix]:03d}"
+        page_hint = source_block_page_hint(markdown)
+        if page_hint is not None:
+            current_page = page_hint
+        confidence = "high" if current_page is not None else "medium"
+        math_fragments = extract_math_fragments_for_source_map(markdown)
+        block: dict[str, Any] = {
+            "id": source_id,
+            "segment_id": str(segment.get("id") or ""),
+            "page": current_page,
+            "type": block_type,
+            "order": order,
+            "section_path": segment.get("section_path", []),
+            "original_text": markdown,
+            "translation": str(segment.get("translation") or ""),
+            "bbox": [],
+            "confidence": confidence,
+            "refs": source_refs_from_text(markdown),
+            "insert_after": previous_text_id if block_type in {"figure", "table", "caption"} else "",
+        }
+        if math_fragments:
+            block["math"] = math_fragments
+        blocks.append(block)
+        if current_page is not None:
+            pages.setdefault(current_page, []).append(source_id)
+        if block_type not in {"figure", "table", "caption"}:
+            previous_text_id = source_id
+        if block_type == "figure":
+            info = image_info_from_markdown(markdown)
+            figures.append(
+                {
+                    "id": source_id,
+                    "page": current_page,
+                    "caption_id": "",
+                    "image_path": info.get("image_path", ""),
+                    "alt": info.get("alt", ""),
+                    "insert_after": block.get("insert_after", ""),
+                    "confidence": confidence,
+                }
+            )
+        elif block_type == "table":
+            tables.append(
+                {
+                    "id": source_id,
+                    "page": current_page,
+                    "caption_id": "",
+                    "insert_after": block.get("insert_after", ""),
+                    "caption_number": caption_number_from_text(markdown, "table"),
+                    "confidence": confidence,
+                }
+            )
+    return {
+        "version": 1,
+        "generated_at": now_iso(),
+        "paper": {
+            "title": str(metadata.get("title") or ""),
+            "venue": str(metadata.get("venue") or ""),
+            "source_type": str(metadata.get("source_type") or ("pdf" if metadata.get("source_pdf") else "raw-md")),
+            "language": "en",
+            "source_path": source_name,
+        },
+        "blocks": blocks,
+        "pages": [{"page": page, "block_ids": ids} for page, ids in sorted(pages.items())],
+        "figures": figures,
+        "tables": tables,
+    }
+
+
+TERMINOLOGY_STOPWORDS = {
+    "A", "An", "And", "As", "At", "By", "For", "From", "In", "Into", "Is", "It", "Of", "On", "Or", "The", "This", "To", "With",
+    "Abstract", "Acknowledgments", "Conclusion", "Discussion", "Figure", "Introduction", "Method", "Methods", "References", "Results", "Table",
+}
+
+
+def candidate_terms_from_text(text: str) -> list[str]:
+    clean = re.sub(r"https?://\S+|10\.\d{4,9}/\S+", " ", str(text or ""))
+    terms: list[str] = []
+    terms.extend(match.group(0) for match in re.finditer(r"\b[A-Z]{2,}(?:-[A-Z0-9]+)?\b", clean))
+    for match in re.finditer(r"\b[A-Z][A-Za-z0-9-]+(?:\s+(?:[A-Z][A-Za-z0-9-]+|[a-z][A-Za-z0-9-]+)){1,4}\b", clean):
+        term = match.group(0).strip()
+        first = term.split()[0]
+        if first in TERMINOLOGY_STOPWORDS:
+            continue
+        if len(term) < 5 or len(term) > 80:
+            continue
+        terms.append(term)
+    result: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        key = term.casefold()
+        if key in seen or term in TERMINOLOGY_STOPWORDS:
+            continue
+        seen.add(key)
+        result.append(term)
+    return result
+
+
+def build_terminology_ledger(segments: list[dict[str, Any]], limit: int = 80) -> dict[str, Any]:
+    ledger: dict[str, dict[str, Any]] = {}
+    for segment in segments:
+        if segment.get("kind") in {"heading", "table", "code"}:
+            continue
+        segment_id = str(segment.get("id") or "")
+        for term in candidate_terms_from_text(markdown_plain_text(segment.get("markdown", ""))):
+            key = term.casefold()
+            entry = ledger.setdefault(
+                key,
+                {
+                    "term": term,
+                    "canonical_zh": "",
+                    "source_terms": [term],
+                    "forbidden_aliases": [],
+                    "notes": "",
+                    "count": 0,
+                    "segment_ids": [],
+                },
+            )
+            entry["count"] += 1
+            if segment_id and segment_id not in entry["segment_ids"] and len(entry["segment_ids"]) < 10:
+                entry["segment_ids"].append(segment_id)
+    terms = sorted(ledger.values(), key=lambda item: (-int(item.get("count") or 0), str(item.get("term") or "")))[:limit]
+    return {"version": 1, "generated_at": now_iso(), "terms": terms}
+
+
+def make_translation_notes(source_map: dict[str, Any], terminology: dict[str, Any], source_name: str) -> str:
+    blocks = source_map.get("blocks") if isinstance(source_map.get("blocks"), list) else []
+    untranslated = [block for block in blocks if block.get("type") not in {"heading", "figure"} and not str(block.get("translation") or "").strip()]
+    low_confidence = [block for block in blocks if block.get("confidence") != "high"]
+    math_blocks = [block for block in blocks if block.get("math")]
+    media_blocks = [block for block in blocks if block.get("type") in {"figure", "table", "caption"}]
+    term_count = len(terminology.get("terms") if isinstance(terminology, dict) else [])
+    lines = [
+        "# Translation / Extraction Notes",
+        "",
+        f"Generated: {source_map.get('generated_at') or now_iso()}",
+        f"Source: {source_name}",
+        "",
+        "## Current Status",
+        "",
+        f"- Source blocks: {len(blocks)}",
+        f"- Untranslated substantive blocks: {len(untranslated)}",
+        f"- Figure/table/caption blocks: {len(media_blocks)}",
+        f"- Blocks containing delimited LaTeX/math: {len(math_blocks)}",
+        f"- Candidate terminology entries: {term_count}",
+        "",
+        "## Notes",
+        "",
+        "- `source_map.json` keeps stable source IDs alongside the existing `p-0001` reader anchors.",
+        "- Page numbers and bounding boxes are recorded when the extractor exposes them; otherwise confidence is marked `medium` so the PDF remains the ground truth.",
+        "- Browser rendering uses local KaTeX for delimited LaTeX. OCR math that lacks Markdown/LaTeX delimiters may still need manual source checking.",
+        "- Keep this file as the audit trail for skipped, uncertain, or manually repaired content.",
+    ]
+    if low_confidence:
+        lines.extend(["", "## Blocks Needing Source Check", ""])
+        for block in low_confidence[:40]:
+            quote = markdown_plain_text(block.get("original_text", ""))[:140]
+            lines.append(f"- {block.get('id')} / {block.get('segment_id')}: {quote}")
+        if len(low_confidence) > 40:
+            lines.append(f"- ... {len(low_confidence) - 40} more blocks")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def make_source_grounded_paper_markdown(metadata: dict[str, Any], segments: list[dict[str, Any]], source_map: dict[str, Any], terminology: dict[str, Any], source_name: str) -> str:
+    title = str(metadata.get("title") or source_map.get("paper", {}).get("title") or "Untitled Paper")
+    blocks = source_map.get("blocks") if isinstance(source_map.get("blocks"), list) else []
+    by_segment_id = {str(segment.get("id") or ""): block for segment, block in zip(segments, blocks)}
+    lines = [
+        "<!-- Generated by paper-reader-agent as a Nature Reader style companion. -->",
+        f"# {title}",
+        "",
+        f"Source: {source_name}",
+        "",
+        "## Page / Section Index",
+        "",
+    ]
+    headings = [segment for segment in segments if segment.get("kind") == "heading"]
+    if headings:
+        for segment in headings[:80]:
+            block = by_segment_id.get(str(segment.get("id") or ""), {})
+            title_text = re.sub(r"^#{1,6}\s+", "", str(segment.get("markdown") or "")).strip()
+            lines.append(f"- [{block.get('id') or segment.get('id')}] {title_text}")
+    else:
+        lines.append("- No stable headings were detected.")
+    terms = terminology.get("terms") if isinstance(terminology, dict) else []
+    lines.extend(["", "## Terminology Ledger", "", "| Term | 中文 | Source blocks |", "|---|---|---|"])
+    if terms:
+        for term in terms[:40]:
+            source_ids = ", ".join(str(item) for item in term.get("segment_ids", [])[:5])
+            lines.append(f"| {str(term.get('term') or '').replace('|', '/')} | {str(term.get('canonical_zh') or '').replace('|', '/')} | {source_ids} |")
+    else:
+        lines.append("|  |  |  |")
+    lines.extend(["", "## Full Text", ""])
+    for segment in segments:
+        segment_id = str(segment.get("id") or "")
+        block = by_segment_id.get(segment_id, {})
+        source_id = str(block.get("id") or segment_id)
+        page = block.get("page")
+        source_label = f"p.{page} {source_id}" if page else source_id
+        original = str(segment.get("markdown") or "").rstrip()
+        translation = translation_text_for_segment(segment)
+        lines.append(f'<a id="{source_id}"></a>')
+        lines.append("")
+        lines.append(f"**Source:** {source_label} · `{segment_id}`")
+        lines.append("")
+        lines.append("**Original:**")
+        lines.append("")
+        lines.append(original or "_[empty source block]_")
+        lines.append("")
+        if translation or translation_source_for_segment(segment):
+            lines.append("**中文:**")
+            lines.append("")
+            lines.append(translation or "_[Not translated yet]_")
+            lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_source_artifacts(paper_dir: Path, metadata: dict[str, Any], segments: list[dict[str, Any]], source_name: str) -> None:
+    source_map = build_source_map(metadata, segments, source_name)
+    terminology = build_terminology_ledger(segments)
+    write_json(paper_dir / "source_map.json", source_map)
+    write_json(paper_dir / "terminology_ledger.json", terminology)
+    write_text_atomic(paper_dir / "translation_notes.md", make_translation_notes(source_map, terminology, source_name))
+    write_text_atomic(paper_dir / "paper.md", make_source_grounded_paper_markdown(metadata, segments, source_map, terminology, source_name))
+
+
+def write_reader_bundle(paper_dir: Path, metadata: dict[str, Any], segments: list[dict[str, Any]], source_name: str) -> None:
+    write_text_atomic(paper_dir / "reader.md", make_reader_markdown(segments, source_name))
+    write_source_artifacts(paper_dir, metadata, segments, source_name)
 
 
 def load_segments(paper_dir: Path) -> list[dict[str, Any]]:
@@ -5062,6 +7088,18 @@ def clean_annotation_range(value: Any) -> dict[str, int] | None:
     return {"start": start, "end": end}
 
 
+def merge_records_by_id(existing: Any, incoming: list[Any]) -> list[Any]:
+    """Replace a submitted collection, retaining extension fields on its IDs."""
+    original = {
+        str(item["id"]): item for item in existing
+        if isinstance(item, dict) and item.get("id")
+    } if isinstance(existing, list) else {}
+    return [
+        {**original.get(str(item.get("id") or ""), {}), **item} if isinstance(item, dict) else item
+        for item in incoming
+    ]
+
+
 def default_thinking() -> dict[str, Any]:
     return {
         "version": 1,
@@ -5079,6 +7117,7 @@ def load_thinking(paper_dir: Path) -> dict[str, Any]:
     data.setdefault("version", 1)
     explain = data.get("explain") if isinstance(data.get("explain"), dict) else {}
     data["explain"] = {
+        **explain,
         "content": str(explain.get("content") or ""),
         "updated_at": str(explain.get("updated_at") or ""),
         "source": str(explain.get("source") or ""),
@@ -5097,9 +7136,11 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
     now = now_iso()
     explain = data.get("explain") if isinstance(data.get("explain"), dict) else {}
     cleaned: dict[str, Any] = {
-        "version": 1,
+        **data,
+        "version": data.get("version", 1),
         "updated_at": now,
         "explain": {
+            **explain,
             "content": str(explain.get("content") or ""),
             "updated_at": str(explain.get("updated_at") or now),
             "source": str(explain.get("source") or ""),
@@ -5116,15 +7157,14 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
         prompt = str(block.get("prompt") or "")
         mode = str(block.get("mode") or "").strip().lower()
         model = str(block.get("model") or "").strip()
-        is_agent_block = mode in {"source", "free"} or bool(model)
+        is_agent_block = mode in {"source", "free", "reading_narrative"} or bool(model)
         raw_title = str(block.get("title") or "").strip()
         if is_agent_block and raw_title in {"AI output", "Source-grounded answer", "Free reflection answer", "Source-grounded", "Free reflection"}:
             raw_title = ""
         title = raw_title or ("" if is_agent_block else "AI output")
-        if not content.strip() and not prompt.strip() and not title.strip():
-            continue
-        block_id = str(block.get("id") or f"tb-{index + 1}").strip()
+        block_id = str(block.get("id") or f"tb-{index + 1}")
         cleaned_block = {
+            **block,
             "id": block_id,
             "type": str(block.get("type") or "ai_output"),
             "title": title,
@@ -5132,7 +7172,7 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
             "created_at": str(block.get("created_at") or now),
             "updated_at": str(block.get("updated_at") or now),
         }
-        if mode in {"source", "free"}:
+        if mode in {"source", "free", "reading_narrative"}:
             cleaned_block["mode"] = mode
         if prompt.strip():
             cleaned_block["prompt"] = prompt
@@ -5153,6 +7193,7 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
         project_context = block.get("project_context") if isinstance(block.get("project_context"), dict) else {}
         if project_context:
             cleaned_block["project_context"] = {
+                **project_context,
                 "project": str(project_context.get("project") or "").strip(),
                 "card_count": int(project_context.get("card_count") or 0),
                 "source_path": str(project_context.get("source_path") or "").strip(),
@@ -5160,25 +7201,21 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
         status = str(block.get("status") or "").strip()
         if status:
             cleaned_block["status"] = status
-        source_refs = clean_source_refs(block.get("source_refs"))
-        if source_refs:
-            cleaned_block["source_refs"] = source_refs
-        selection_refs = clean_selection_refs(block.get("selection_refs"))
-        if selection_refs:
-            cleaned_block["selection_refs"] = selection_refs
+        # Stored references include original selections/ranges. Context
+        # truncation helpers are for generation, not persisting reader edits.
         cleaned["blocks"].append(cleaned_block)
-    block_ids = {block["id"] for block in cleaned["blocks"]}
     for item in data.get("annotations") if isinstance(data.get("annotations"), list) else []:
         if not isinstance(item, dict):
             continue
-        block_id = str(item.get("block_id") or "").strip()
-        if block_id not in block_ids and block_id != PAPER_BRIEF_BLOCK_ID:
-            continue
+        # An external edit or partial save may leave a missing block; keep the
+        # human record and its original target instead of silently deleting it.
+        block_id = str(item.get("block_id") or item.get("thinking_block_id") or "")
         cleaned_item: dict[str, Any] = {
-            "id": str(item.get("id") or f"ta-{hashlib.sha1((block_id + now).encode('utf-8')).hexdigest()[:10]}"),
+            **item,
+            "id": str(item.get("id") or f"ta-{uuid.uuid4().hex[:12]}"),
             "block_id": block_id,
             "type": str(item.get("type") or "range"),
-            "target": "thinking",
+            "target": str(item.get("target") or "thinking"),
             "color": str(item.get("color") or "yellow"),
             "quote": str(item.get("quote") or ""),
             "note": str(item.get("note") or ""),
@@ -5189,23 +7226,22 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
         if isinstance(tags, str):
             tags = [tags]
         if isinstance(tags, list):
-            cleaned_item["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()]
+            cleaned_item["tags"] = list(tags)
         presentation_flow_id = str(item.get("presentation_flow_id") or "").strip()
         if presentation_flow_id:
             cleaned_item["presentation_flow_id"] = presentation_flow_id
         range_value = clean_annotation_range(item.get("range"))
         if range_value:
-            cleaned_item["range"] = range_value
+            cleaned_item["range"] = {**item["range"], **range_value}
         cleaned["annotations"].append(cleaned_item)
-    for index, item in enumerate(data.get("report_thoughts") if isinstance(data.get("report_thoughts"), list) else []):
+    for item in data.get("report_thoughts") if isinstance(data.get("report_thoughts"), list) else []:
         if not isinstance(item, dict):
             continue
-        note = str(item.get("note") or "").strip()
-        if not note:
-            continue
+        note = str(item.get("note") or "")
         cleaned["report_thoughts"].append(
             {
-                "id": str(item.get("id") or f"rt-{hashlib.sha1((note + now + str(index)).encode('utf-8')).hexdigest()[:10]}"),
+                **item,
+                "id": str(item.get("id") or f"rt-{uuid.uuid4().hex[:12]}"),
                 "group": str(item.get("group") or "sensemaking-gap"),
                 "note": note,
                 "created_at": str(item.get("created_at") or now),
@@ -5213,6 +7249,44 @@ def clean_thinking(data: dict[str, Any]) -> dict[str, Any]:
             }
         )
     return cleaned
+
+
+def save_thinking_update(paper_dir: Path, data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("thinking must be an object")
+    for key in ("annotations", "blocks", "report_thoughts"):
+        if key in data and (
+            not isinstance(data[key], list) or any(not isinstance(item, dict) for item in data[key])
+        ):
+            raise ValueError(f"{key} must be a list of objects")
+    if "explain" in data and not isinstance(data["explain"], dict):
+        raise ValueError("explain must be an object")
+    existing = read_json(paper_dir / "thinking.json", default_thinking(), strict=True)
+    if not isinstance(existing, dict):
+        raise ValueError("thinking.json must contain an object")
+    incoming = {**data}
+    for key in ("annotations", "blocks", "report_thoughts"):
+        if key in incoming:
+            incoming[key] = merge_records_by_id(existing.get(key), incoming[key])
+    if "explain" in incoming and isinstance(existing.get("explain"), dict):
+        incoming["explain"] = {**existing["explain"], **incoming["explain"]}
+    cleaned = clean_thinking(incoming)
+    saved = {**existing, **incoming, "updated_at": cleaned["updated_at"]}
+    saved.setdefault("version", 1)
+    # Omitted sections are untouched, particularly original AI blocks when
+    # only user annotations change. Explicit empty lists still delete records.
+    for key in ("annotations", "blocks", "report_thoughts", "explain"):
+        if key in incoming:
+            if key == "explain":
+                saved[key] = {**cleaned[key], **incoming[key]}
+            else:
+                saved[key] = [
+                    {**defaults, **record, "id": record.get("id") or defaults["id"]}
+                    for record, defaults in zip(incoming[key], cleaned[key])
+                ]
+    write_json(paper_dir / "thinking.json", saved)
+    schedule_export_notes_and_annotated(paper_dir)
+    return saved
 
 
 def default_takeaway_doc() -> dict[str, Any]:
@@ -5363,13 +7437,168 @@ def load_takeaway_doc(paper_dir: Path) -> dict[str, Any]:
     return clean_takeaway_doc(data) if data.get("blocks") else default_takeaway_doc()
 
 
-def export_notes_and_annotated(paper_dir: Path) -> None:
-    metadata = read_json(paper_dir / "metadata.json", {})
-    title = metadata.get("title") or paper_dir.name
-    segments = load_segments(paper_dir)
-    annotations = annotations_by_segment(paper_dir)
+def publication_service() -> feishu_publish.PublicationService:
+    global PUBLICATION_SERVICE
+    with PUBLICATION_SERVICE_GUARD:
+        if PUBLICATION_SERVICE is None:
+            PUBLICATION_SERVICE = feishu_publish.PublicationService(
+                snapshot_reader=load_reading_data, json_reader=read_json,
+                json_writer=write_json, text_writer=write_text_atomic,
+            )
+        return PUBLICATION_SERVICE
 
-    notes_lines = [f"# Reading Notes: {title}", ""]
+
+def load_reading_data(paper_dir: Path, paper_id: str | None = None, *, include_teacher: bool = True) -> dict[str, Any]:
+    """Versioned, lossless JSON-document snapshot; never normalizes or writes.
+
+    Missing files are omitted, not synthesized. Invalid JSON fails the export
+    rather than silently losing records. This is reading data, not a PDF backup.
+    """
+    missing = object()
+    files: dict[str, Any] = {}
+    names = [
+        "metadata.json", "segments.json", "annotations.json", "thinking.json",
+        "reading_progress.json", "outline.json", "takeaway_doc.json", "translation_state.json",
+    ]
+    if include_teacher:
+        names.append("reading_teacher.json")
+    for name in names:
+        value = read_json(paper_dir / name, missing, strict=True)
+        if value is not missing:
+            files[name] = value
+    return {
+        "format": "paper-reader-reading-data",
+        "version": 1,
+        "paper_id": paper_id or paper_dir.name,
+        "sources": {
+            "segments.json": "Original source segments and stored translations, not user notes.",
+            "annotations.json#/annotations": "User highlights and notes on source/translation segments; accepted AI definitions retain explicit origin fields.",
+            "thinking.json#/annotations": "User annotations on stored thinking/AI text; quotes are not necessarily user-authored.",
+            "thinking.json#/report_thoughts": "Original user notes/questions.",
+            "thinking.json#/blocks": "Stored thinking blocks including original AI outputs and prompts; type/mode/model/source are retained.",
+            "thinking.json#/chat": "Stored chat records, if present; roles/sources are retained without inferring authorship or classifying prose.",
+            "thinking.json#/messages": "Stored message records, if present; roles/sources are retained without inferring authorship or classifying prose.",
+            "thinking.json#/explain": "Original AI Paper Brief, separate from user notes.",
+            "takeaway_doc.json": "Stored mixed-origin takeaway records; authorship is not reinterpreted.",
+            "translation_state.json": "Persisted translation job progress, separate from original metadata and user annotations.",
+            "reading_teacher.json": "Local AI teaching suggestions and their source/context snapshots, not user-authored notes.",
+        },
+        "files": files,
+    }
+
+
+def make_notes_markdown(reading_data: dict[str, Any]) -> str:
+    """Render every stored record mechanically, including orphaned highlights."""
+    files = reading_data["files"]
+    metadata = files.get("metadata.json")
+    title = (metadata.get("title") if isinstance(metadata, dict) else "") or reading_data["paper_id"]
+    segments = files.get("segments.json")
+    segment_lookup = {
+        str(segment.get("id")): segment for segment in segments if isinstance(segment, dict)
+    } if isinstance(segments, list) else {}
+    lines = [
+        f"# Reading Notes: {title}", "",
+        "Mechanical export: quotations, notes/questions and stored prompts are verbatim. "
+        "Original AI content is kept in separate sections; no new interpretation is generated.",
+        "JSON files remain authoritative. Record fields preserve IDs, targets, ranges and extensions; "
+        "missing source targets do not discard annotations.", "",
+    ]
+
+    def fenced(text: str, language: str) -> str:
+        longest = max((len(run) for run in re.findall(r"`+", text)), default=0)
+        fence = "`" * max(3, longest + 1)
+        suffix = "" if text.endswith("\n") else "\n"
+        return f"{fence}{language}\n{text}{suffix}{fence}"
+
+    def add_record(record: Any, source: str, label: str) -> None:
+        lines.extend([f"### {label}", "", f"- Record source: `{source}`", ""])
+        if not isinstance(record, dict):
+            lines.extend([fenced(json.dumps(record, ensure_ascii=False, indent=2), "json"), ""])
+            return
+        segment_id = record.get("segment_id")
+        if isinstance(segment_id, str) and segment_id:
+            lines.extend([f"- Source link: [reader.md](reader.md#{urllib.parse.quote(segment_id, safe='')})", ""])
+        text_fields = {
+            "quote": "Original quote", "note": "Original note/question",
+            "prompt": "Stored prompt/question", "content": "Stored content", "text": "Stored text",
+            "message": "Stored message",
+        }
+        if is_teacher_definition(record):
+            text_fields["note"] = "Accepted AI definition (AI-origin; reader edits retained)"
+        prose = {key: value for key, value in record.items() if key in text_fields and isinstance(value, str) and value}
+        nested_messages = record.get("messages")
+        fields = {
+            key: value for key, value in record.items()
+            if key not in prose and not (key == "messages" and isinstance(nested_messages, list))
+        }
+        lines.extend(["Record fields:", "", fenced(json.dumps(fields, ensure_ascii=False, indent=2), "json"), ""])
+        for key, value in prose.items():
+            lines.extend([f"#### {text_fields[key]} (verbatim)", "", fenced(value, "text"), ""])
+        if source.startswith("annotations.json#") and not record.get("quote") and segment_id:
+            segment = segment_lookup.get(str(segment_id), {})
+            target = record.get("target") or "source"
+            context = segment.get("translation" if target == "translation" else "markdown") if target in {"source", "translation"} else None
+            if isinstance(context, str) and context:
+                lines.extend(["#### Target segment context (not a recorded quote)", "", fenced(context, "text"), ""])
+        if isinstance(nested_messages, list):
+            add_records("Stored messages (recorded roles/sources; not classified)", nested_messages, f"{source}/messages")
+
+    def add_records(heading: str, records: Any, source: str) -> None:
+        lines.extend([f"## {heading}", ""])
+        if isinstance(records, list):
+            for index, record in enumerate(records):
+                add_record(record, f"{source}/{index}", f"Record {index + 1}")
+        elif records is not None:
+            add_record(records, source, "Stored value")
+
+    annotations = files.get("annotations.json", {})
+    add_records(
+        "Paper annotations",
+        annotations.get("annotations", []) if isinstance(annotations, dict) else annotations,
+        "annotations.json#/annotations" if isinstance(annotations, dict) else "annotations.json#",
+    )
+    thinking = files.get("thinking.json", {})
+    if isinstance(thinking, dict):
+        add_records("Thinking annotations (user records on stored thinking/AI text)", thinking.get("annotations", []), "thinking.json#/annotations")
+        add_records("Report thoughts (original user notes/questions)", thinking.get("report_thoughts", []), "thinking.json#/report_thoughts")
+        add_records("Stored thinking blocks (includes original AI outputs; not user annotations)", thinking.get("blocks", []), "thinking.json#/blocks")
+        for key in ("chat", "messages"):
+            if key in thinking:
+                add_records(f"Stored {key} (recorded roles/sources; not classified)", thinking[key], f"thinking.json#/{key}")
+        if thinking.get("explain"):
+            lines.extend(["## Original AI Paper Brief (not user notes)", ""])
+            add_record(thinking["explain"], "thinking.json#/explain", "Stored Paper Brief")
+    elif "thinking.json" in files:
+        add_records("Stored thinking data", thinking, "thinking.json#")
+    takeaway = files.get("takeaway_doc.json", {})
+    add_records(
+        "Stored takeaway records (mixed origin; not reinterpreted)",
+        takeaway.get("blocks", []) if isinstance(takeaway, dict) else takeaway,
+        "takeaway_doc.json#/blocks" if isinstance(takeaway, dict) else "takeaway_doc.json#",
+    )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def export_notes_and_annotated(paper_dir: Path) -> None:
+    # Serialize snapshot + writes, not just each output file: an older slow
+    # export must not overwrite a newer save's derived Markdown.
+    with write_lock_for(paper_dir / ".notes-export"):
+        write_notes_and_annotated(paper_dir)
+
+
+def write_notes_and_annotated(paper_dir: Path) -> None:
+    reading_data = load_reading_data(paper_dir, include_teacher=False)
+    files = reading_data["files"]
+    metadata = files.get("metadata.json") or {}
+    title = metadata.get("title") or paper_dir.name
+    segments = files.get("segments.json") or []
+    annotation_data = files.get("annotations.json") or {}
+    records = annotation_data.get("annotations", []) if isinstance(annotation_data, dict) else annotation_data
+    annotations: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        if isinstance(record, dict) and record.get("segment_id"):
+            annotations.setdefault(record["segment_id"], []).append(record)
+
     annotated_lines = [f"# Annotated Reading Copy: {title}", ""]
     for segment in segments:
         segment_id = segment["id"]
@@ -5380,39 +7609,20 @@ def export_notes_and_annotated(paper_dir: Path) -> None:
             annotated_lines.append(f"<!-- highlight:{segment_id} color={color} -->")
         annotated_lines.append(f'<a id="{segment_id}"></a>')
         annotated_lines.append(segment["markdown"].rstrip())
-        if segment.get("translation"):
+        translation = translation_text_for_segment(segment)
+        if translation.strip():
             annotated_lines.append("")
-            annotated_lines.append(f"> 中文：{segment['translation']}")
+            annotated_lines.append(f"> 中文：{translation}")
         for annotation in segment_annotations:
-            note = (annotation.get("note") or "").strip()
+            note = annotation.get("note") or ""
             if not note:
                 continue
-            quote = (annotation.get("quote") or "").strip()
             annotated_lines.append("")
             annotated_lines.append("> [!NOTE]")
             for line in note.splitlines():
                 annotated_lines.append(f"> {line}")
-            notes_lines.append(f"## {segment_id}")
-            notes_lines.append("")
-            notes_lines.append(f"- Link: [reader.md#{segment_id}](reader.md#{segment_id})")
-            notes_lines.append(f"- Color: {annotation.get('color') or 'none'}")
-            if annotation.get("target"):
-                notes_lines.append(f"- Target: {annotation.get('target')}")
-            if annotation.get("tags"):
-                notes_lines.append(f"- Tags: {', '.join(annotation.get('tags', []))}")
-            if annotation.get("presentation_flow_id"):
-                notes_lines.append(f"- Presentation Flow: {annotation.get('presentation_flow_id')}")
-            if annotation.get("range"):
-                range_value = annotation.get("range")
-                notes_lines.append(f"- Range: {range_value.get('start')}-{range_value.get('end')}")
-            notes_lines.append("")
-            excerpt = quote or segment["markdown"][:1200]
-            notes_lines.append("> " + excerpt.replace("\n", "\n> "))
-            notes_lines.append("")
-            notes_lines.append(note)
-            notes_lines.append("")
         annotated_lines.append("")
-    write_text_atomic(paper_dir / "notes.md", "\n".join(notes_lines).rstrip() + "\n")
+    write_text_atomic(paper_dir / "notes.md", make_notes_markdown(reading_data))
     write_text_atomic(paper_dir / "annotated.md", "\n".join(annotated_lines).rstrip() + "\n")
 
 
@@ -5442,7 +7652,7 @@ def schedule_export_notes_and_annotated(paper_dir: Path, delay: float = 0.35) ->
 def guess_title_from_segments(segments: list[dict[str, Any]], fallback: str) -> str:
     for segment in segments:
         if segment.get("kind") == "heading" and segment.get("level") == 1:
-            title = extract_heading_text(segment.get("markdown", ""))
+            title = feishu_metadata.clean_title(extract_heading_text(segment.get("markdown", "")))
             if title:
                 return title
     return fallback
@@ -6022,21 +8232,41 @@ def update_paper_brief_from_pdf(workspace: Path, paper_dir: Path, metadata: dict
     except Exception as exc:  # noqa: BLE001
         if file_id and env_value("PAPER_READER_KIMI_DELETE_FILES", default="1").strip().lower() not in {"0", "false", "no"}:
             deleted = kimi_delete_file(file_id)
+        segments = load_segments(paper_dir)
+        outline_data = read_json(paper_dir / "outline.json", {"outline": []})
+        outline = outline_data.get("outline", []) if isinstance(outline_data, dict) else []
+        if not segments and (paper_dir / "raw.md").exists():
+            raw_md = (paper_dir / "raw.md").read_text(encoding="utf-8")
+            segments, outline = build_segments(raw_md)
+        brief = build_paper_explanation(metadata, segments, outline, source_name)
+        thinking["explain"] = {
+            "content": brief,
+            "updated_at": now_iso(),
+            "source": "local-pdf-fallback",
+            "prompt": prompt,
+            "fallback_reason": str(exc),
+        }
+        cleaned = clean_thinking(thinking)
+        write_json(paper_dir / "thinking.json", cleaned)
+        write_text_atomic(paper_dir / "explanation_prompt.md", prompt.strip() + "\n")
         metadata.update(
             {
-                "paper_brief_status": "failed",
-                "paper_brief_source": "kimi-pdf",
+                "paper_brief_status": "ready",
+                "paper_brief_source": "local-pdf-fallback",
                 "paper_brief_model": kimi_model(),
+                "paper_brief_prompt_id": DEFAULT_CHROME_BRIEF_PROMPT_ID,
+                "paper_brief_source_name": source_name,
                 "paper_brief_kimi_file_id": file_id,
                 "paper_brief_kimi_file_deleted": deleted,
-                "paper_brief_error": str(exc),
+                "paper_brief_error": f"Kimi PDF brief failed; used local fallback: {exc}",
                 "paper_brief_updated_at": now_iso(),
+                "agent_analysis_status": "paper_brief_ready",
                 "updated_at": now_iso(),
             }
         )
         write_json(paper_dir / "metadata.json", metadata)
         sync_library_from_metadata(workspace, str(metadata.get("id") or paper_dir.name), paper_dir, metadata)
-        raise
+        return cleaned
 
 
 def segment_number(segment_id: str) -> int:
@@ -6251,8 +8481,8 @@ def generate_chat_reply(metadata: dict[str, Any], segments: list[dict[str, Any]]
 
 
 def append_chat_output_block(paper_id: str, paper_dir: Path, data: dict[str, Any]) -> dict[str, Any]:
-    message = str(data.get("message") or "").strip()
-    if not message:
+    message = str(data.get("message") or "")
+    if not message.strip():
         raise ValueError("message is required")
     mode = str(data.get("mode") or "source").strip().lower()
     if mode not in {"source", "free"}:
@@ -6312,6 +8542,234 @@ def append_chat_output_block(paper_id: str, paper_dir: Path, data: dict[str, Any
     thinking["blocks"].insert(0, block)
     cleaned = clean_thinking(thinking)
     write_json(paper_dir / "thinking.json", cleaned)
+    schedule_export_notes_and_annotated(paper_dir)
+    return {"thinking": cleaned, "block": next((item for item in cleaned["blocks"] if item["id"] == block["id"]), block)}
+
+
+def thinking_block_lookup(thinking: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(block.get("id") or ""): block for block in thinking.get("blocks", []) if isinstance(block, dict)}
+
+
+def annotation_sort_key(item: dict[str, Any]) -> tuple[int, str]:
+    segment_id = str(item.get("segment_id") or item.get("block_id") or "")
+    return (segment_number(segment_id), str(item.get("updated_at") or item.get("created_at") or ""))
+
+
+def reading_narrative_evidence_context(paper_id: str, paper_dir: Path, segments: list[dict[str, Any]], thinking: dict[str, Any], max_items: int = 72) -> tuple[str, list[dict[str, str]]]:
+    segment_lookup = {str(segment.get("id") or ""): segment for segment in segments if isinstance(segment, dict)}
+    paper_annotations = read_json(paper_dir / "annotations.json", {"annotations": []}).get("annotations", [])
+    blocks = thinking_block_lookup(thinking)
+    evidence: list[dict[str, Any]] = []
+
+    for annotation in paper_annotations if isinstance(paper_annotations, list) else []:
+        if not isinstance(annotation, dict):
+            continue
+        quote = str(annotation.get("quote") or "").strip()
+        note = str(annotation.get("note") or "").strip()
+        segment_id = str(annotation.get("segment_id") or "").strip()
+        if not quote and not note:
+            continue
+        segment_text = markdown_plain_text(segment_lookup.get(segment_id, {}).get("markdown", ""))[:900]
+        evidence.append(
+            {
+                "source": "paper-highlight",
+                "annotation_id": str(annotation.get("id") or ""),
+                "segment_id": segment_id,
+                "label": segment_id or str(annotation.get("id") or "highlight"),
+                "quote": quote[:900],
+                "note": note[:1000],
+                "tags": annotation.get("tags", []),
+                "color": str(annotation.get("color") or ""),
+                "context": segment_text,
+                "updated_at": str(annotation.get("updated_at") or annotation.get("created_at") or ""),
+            }
+        )
+
+    for annotation in thinking.get("annotations", []) if isinstance(thinking.get("annotations"), list) else []:
+        if not isinstance(annotation, dict):
+            continue
+        quote = str(annotation.get("quote") or "").strip()
+        note = str(annotation.get("note") or "").strip()
+        block_id = str(annotation.get("block_id") or "").strip()
+        if not quote and not note:
+            continue
+        block = blocks.get(block_id, {})
+        block_title = "Paper Brief" if block_id == PAPER_BRIEF_BLOCK_ID else str(block.get("title") or block.get("prompt") or "AI output")
+        evidence.append(
+            {
+                "source": "thinking-note",
+                "annotation_id": str(annotation.get("id") or ""),
+                "block_id": block_id,
+                "label": block_title,
+                "quote": quote[:900],
+                "note": note[:1000],
+                "tags": annotation.get("tags", []),
+                "color": str(annotation.get("color") or ""),
+                "context": markdown_plain_text(str(block.get("content") or ""))[:900],
+                "updated_at": str(annotation.get("updated_at") or annotation.get("created_at") or ""),
+            }
+        )
+
+    evidence.sort(key=annotation_sort_key)
+    note_items = [item for item in evidence if item.get("note")]
+    highlight_items = [item for item in evidence if not item.get("note")]
+    selected = (note_items + highlight_items)[:max_items]
+    lines: list[str] = []
+    source_refs: list[dict[str, str]] = []
+    for index, item in enumerate(selected, start=1):
+        label = str(item.get("label") or item.get("segment_id") or item.get("block_id") or f"evidence-{index}")
+        tags = item.get("tags") if isinstance(item.get("tags"), list) else []
+        lines.append(f"### E{index}: {item.get('source')} · {label}")
+        if item.get("note"):
+            lines.append(f"My note: {item['note']}")
+        if item.get("quote"):
+            lines.append(f"Highlight: {item['quote']}")
+        if tags:
+            lines.append("Tags: " + ", ".join(str(tag) for tag in tags if str(tag).strip()))
+        if item.get("context"):
+            lines.append(f"Nearby paper/context text: {item['context']}")
+        lines.append("")
+        source_refs.append(
+            {
+                "paper_id": paper_id,
+                "annotation_id": str(item.get("annotation_id") or ""),
+                "segment_id": str(item.get("segment_id") or ""),
+                "block_id": str(item.get("block_id") or ""),
+                "source": str(item.get("source") or ""),
+                "label": label,
+                "quote": str(item.get("quote") or item.get("note") or "")[:900],
+            }
+        )
+    return "\n".join(lines).strip() or "暂无用户高亮或 note。", source_refs
+
+
+def takeaway_doc_context(takeaway_doc: dict[str, Any], max_chars: int = 6500) -> str:
+    lines: list[str] = []
+    for block in takeaway_doc.get("blocks", []) if isinstance(takeaway_doc.get("blocks"), list) else []:
+        text = str(block.get("text") or "").strip()
+        if not text:
+            continue
+        indent = max(0, int(block.get("indent") or 0))
+        prefix = "#" * max(1, min(3, int(block.get("level") or 2))) if block.get("type") == "heading" else "-"
+        lines.append(f"{'  ' * indent}{prefix} {text}")
+    result = "\n".join(lines).strip()
+    return result[:max_chars].rstrip() + ("\n..." if len(result) > max_chars else "")
+
+
+def outline_context_for_narrative(outline_data: dict[str, Any], max_items: int = 18) -> str:
+    outline = outline_data.get("outline") if isinstance(outline_data.get("outline"), list) else []
+    titles = []
+    for item in outline:
+        if not isinstance(item, dict):
+            continue
+        title = str(item.get("title") or "").strip()
+        if title and not should_skip_presentation_heading(title):
+            titles.append(title)
+        if len(titles) >= max_items:
+            break
+    return " -> ".join(titles)
+
+
+def generate_reading_narrative(
+    metadata: dict[str, Any],
+    segments: list[dict[str, Any]],
+    thinking: dict[str, Any],
+    takeaway_doc: dict[str, Any],
+    outline_data: dict[str, Any],
+    evidence_context: str,
+    project_context: str,
+) -> tuple[str, str, str]:
+    title = str(metadata.get("title") or "Untitled Paper")
+    project = ", ".join(metadata_projects(metadata)) or "unknown"
+    paper_brief = str(thinking.get("explain", {}).get("content") or "").strip()[:9000]
+    takeaway = takeaway_doc_context(takeaway_doc)
+    outline = outline_context_for_narrative(outline_data)
+    if not cloud_llm_enabled():
+        raise RuntimeError("Kimi API key is not configured. Set PAPER_READER_KIMI_API_KEY or MOONSHOT_API_KEY and restart the app.")
+    messages = [
+        {
+            "role": "system",
+            "content": "你是用户的 HCI/AI 论文阅读合作者。你的任务不是重写摘要，而是把用户的 highlights/notes 整合成一篇可回看、可转发、能服务项目推进的 reading narrative。必须忠于用户留下的 note 和高亮；不要把没有证据的猜测写成确定结论。中文为主，关键术语保留英文。",
+        },
+        {
+            "role": "user",
+            "content": f"""请为这篇论文生成一篇 Reading Narrative。
+
+论文：{title}
+项目：{project}
+作者/年份/ venue：{metadata.get('authors') or 'unknown'} / {metadata.get('year') or metadata.get('publication_year') or 'unknown'} / {metadata.get('venue') or metadata.get('journal') or 'unknown'}
+
+论文结构：
+{outline or '暂无稳定 outline'}
+
+Paper Brief（只作为背景，不要照抄）：
+{paper_brief or '暂无 Paper Brief'}
+
+用户 highlights / notes（最高优先级；请把它当成“用户真正关心什么”的证据）：
+{evidence_context}
+
+当前 Takeaway Report 草稿（可能很硬；只用来理解用户已经归类过哪些点）：
+{takeaway or '暂无 Takeaway Report'}
+
+项目背景 Context Cards（如果有，请说明这篇论文对项目哪里有用；没有就不要硬编）：
+{project_context or '暂无 project context'}
+
+输出要求：
+1. 写成一篇可以直接贴到群里的 narrative，不要是字段表；长度约 900-1500 中文字。
+2. 开头先用 2-3 句话讲“我今天读到的核心是什么，以及为什么它和我的项目有关”。
+3. 中间要有“我之后回看这篇论文应该重点看哪里”，用 3-6 条 bullet，每条都说明为什么值得回看，并尽量带段落锚点如 [p-0123] 或高亮证据。
+4. 要有“它能怎么进入我的项目/论文”：区分 motivation、related work、method/design inspiration、discussion/limitation，不能每类都硬写，只有有证据才写。
+5. 必须保留用户自己的宝贵思考：如果 note 里有第一人称、疑问、可借鉴、担心、类比，请优先转述；不要把它磨平成普通摘要。
+6. 对证据不足的地方要说“这只是启发，不适合直接作为 claim”。
+7. 不要输出“以下是/总之/综上”这种模板话；语气像研究伙伴给组里讲今天读了什么。
+8. 每个重要判断后尽量附原文段落锚点或 evidence 编号，例如 [p-0031] / [E4]。""",
+        },
+    ]
+    content, model = agent_chat(messages, max_tokens=3600, temperature=0.35)
+    return content.strip() + "\n", model, "llm"
+
+
+def append_reading_narrative_block(workspace: Path, paper_id: str, paper_dir: Path, data: dict[str, Any]) -> dict[str, Any]:
+    metadata = normalized_metadata(paper_dir, read_json(paper_dir / "metadata.json", {}))
+    segments = load_segments(paper_dir)
+    thinking = load_thinking(paper_dir)
+    takeaway_doc = load_takeaway_doc(paper_dir)
+    outline_data = read_json(paper_dir / "outline.json", {"outline": [], "presentation_flow": []})
+    evidence_context, source_refs = reading_narrative_evidence_context(paper_id, paper_dir, segments, thinking)
+    project_context = ""
+    project_context_info: dict[str, Any] = {}
+    if bool(data.get("use_project_context", True)):
+        paper_projects = metadata_projects(metadata)
+        project = normalize_project_name(data.get("project") or (paper_projects[0] if paper_projects else "")) or "collaborative"
+        context = load_project_context(workspace, project)
+        project_context = project_context_summary_for_prompt(context)
+        project_context_info = {
+            "project": project,
+            "card_count": len(context.get("cards", [])),
+            "source_path": context.get("source_path", ""),
+        }
+    content, model_label, context_mode = generate_reading_narrative(metadata, segments, thinking, takeaway_doc, outline_data, evidence_context, project_context)
+    now = now_iso()
+    prompt = "Generate a source-grounded reading narrative from my highlights, notes, Takeaway Report, Paper Brief, and project context."
+    block = {
+        "id": f"tb-narrative-{hashlib.sha1((paper_id + now).encode('utf-8')).hexdigest()[:12]}",
+        "type": "ai_output",
+        "title": "Reading Narrative",
+        "content": content,
+        "prompt": prompt,
+        "mode": "reading_narrative",
+        "model": model_label,
+        "context_mode": context_mode,
+        "context_chars": len(evidence_context) + len(project_context),
+        "project_context": project_context_info,
+        "source_refs": source_refs[:16],
+        "created_at": now,
+        "updated_at": now,
+    }
+    thinking.setdefault("blocks", [])
+    thinking["blocks"].insert(0, block)
+    cleaned = clean_thinking(thinking)
+    write_json(paper_dir / "thinking.json", cleaned)
     return {"thinking": cleaned, "block": next((item for item in cleaned["blocks"] if item["id"] == block["id"]), block)}
 
 
@@ -6321,6 +8779,7 @@ def delete_thinking_block(paper_dir: Path, block_id: str) -> dict[str, Any]:
     thinking["annotations"] = [item for item in thinking.get("annotations", []) if str(item.get("block_id") or "") != block_id]
     cleaned = clean_thinking(thinking)
     write_json(paper_dir / "thinking.json", cleaned)
+    schedule_export_notes_and_annotated(paper_dir)
     return cleaned
 
 
@@ -6505,16 +8964,27 @@ def register_paper_in_library(
     duplicate_policy: str = "ask",
     replace_paper_id: str | None = None,
     pdf_digest: str | None = None,
-    generate_pdf_preview: bool = True,
-    enrich_citation: bool = True,
+    generate_pdf_preview: bool = False,
+    enrich_citation: bool = False,
+    title_source: str | None = None,
+    match_title: bool = True,
 ) -> dict[str, Any]:
     if not pdf_path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
     digest = str(pdf_digest or "").strip().lower()[:12] or file_hash(pdf_path, limit=None)[:12]
     candidate_title = title or pdf_path.stem
-    duplicate = find_duplicate_paper_by_title(workspace, candidate_title, exclude_paper_id=paper_id)
+    duplicate = find_duplicate_paper_by_title(workspace, candidate_title, exclude_paper_id=paper_id) if match_title else None
+    auto_attached_to = ""
     if duplicate and duplicate_policy != "replace":
-        return duplicate_paper_response(workspace, candidate_title, pdf_path.name, duplicate)
+        if duplicate_can_accept_pdf(workspace, duplicate):
+            auto_attached_to = str(duplicate.get("id") or "")
+            replace_paper_id = auto_attached_to
+            duplicate_policy = "replace"
+            duplicate_dir = paper_record_dir(workspace, duplicate)
+            duplicate_metadata = read_json(duplicate_dir / "metadata.json", {}) if duplicate_dir.exists() else {}
+            candidate_title = duplicate_metadata.get("title") or duplicate.get("title") or candidate_title
+        else:
+            return duplicate_paper_response(workspace, candidate_title, pdf_path.name, duplicate)
     next_paper_id = replace_paper_id or paper_id or f"{slugify(pdf_path.stem)}-{digest}"
     paper_dir = workspace / "papers" / next_paper_id
     backup_dir = backup_paper_before_replace(paper_dir) if duplicate_policy == "replace" and paper_dir.exists() else ""
@@ -6528,11 +8998,11 @@ def register_paper_in_library(
             "id": next_paper_id,
             "title": candidate_title or metadata.get("title") or pdf_path.stem,
             "title_key": normalize_title_key(candidate_title or metadata.get("title") or pdf_path.stem),
-            "title_source": "user" if title else metadata.get("title_source", "filename"),
+            "title_source": title_source or ("user" if title else metadata.get("title_source", "filename")),
             "source_pdf": "original.pdf",
             "source_pdf_name": pdf_path.name,
             "original_path": str(pdf_path),
-            "source_type": metadata.get("source_type", "pdf"),
+            "source_type": "pdf" if auto_attached_to else metadata.get("source_type", "pdf"),
             "created_at": metadata.get("created_at") or now_iso(),
             "created_or_refreshed_at": metadata.get("created_or_refreshed_at") or now_iso(),
             "updated_at": now_iso(),
@@ -6568,7 +9038,7 @@ def register_paper_in_library(
     if not (paper_dir / "reader.md").exists():
         write_text_atomic(paper_dir / "reader.md", f"# {metadata['title']}\n\nThis paper is in Library only. Choose 略读 or 精读 from the Library page.\n")
     sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata, generate_pdf_preview=generate_pdf_preview)
-    return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir}
+    return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir, "attached_to_existing": bool(auto_attached_to), "auto_attached_to": auto_attached_to}
 
 
 def register_uploaded_pdf(
@@ -6583,8 +9053,8 @@ def register_uploaded_pdf(
     project_colors: dict[str, str] | None = None,
     duplicate_policy: str = "ask",
     replace_paper_id: str | None = None,
-    generate_pdf_preview: bool = True,
-    enrich_citation: bool = True,
+    generate_pdf_preview: bool = False,
+    enrich_citation: bool = False,
 ) -> dict[str, Any]:
     if not content:
         raise ValueError(f"Empty PDF upload: {filename}")
@@ -6592,8 +9062,17 @@ def register_uploaded_pdf(
     stem = Path(filename).stem or "paper"
     candidate_title = title or stem
     duplicate = find_duplicate_paper_by_title(workspace, candidate_title, exclude_paper_id=paper_id)
+    auto_attached_to = ""
     if duplicate and duplicate_policy != "replace":
-        return duplicate_paper_response(workspace, candidate_title, filename, duplicate)
+        if duplicate_can_accept_pdf(workspace, duplicate):
+            auto_attached_to = str(duplicate.get("id") or "")
+            replace_paper_id = auto_attached_to
+            duplicate_policy = "replace"
+            duplicate_dir = paper_record_dir(workspace, duplicate)
+            duplicate_metadata = read_json(duplicate_dir / "metadata.json", {}) if duplicate_dir.exists() else {}
+            candidate_title = duplicate_metadata.get("title") or duplicate.get("title") or candidate_title
+        else:
+            return duplicate_paper_response(workspace, candidate_title, filename, duplicate)
     next_paper_id = replace_paper_id or paper_id or f"{slugify(stem)}-{digest}"
     paper_dir = workspace / "papers" / next_paper_id
     backup_dir = backup_paper_before_replace(paper_dir) if duplicate_policy == "replace" and paper_dir.exists() else ""
@@ -6610,7 +9089,7 @@ def register_uploaded_pdf(
             "source_pdf": "original.pdf",
             "source_pdf_name": filename,
             "original_path": "",
-            "source_type": metadata.get("source_type", "pdf"),
+            "source_type": "pdf" if auto_attached_to else metadata.get("source_type", "pdf"),
             "created_at": metadata.get("created_at") or now_iso(),
             "created_or_refreshed_at": metadata.get("created_or_refreshed_at") or now_iso(),
             "updated_at": now_iso(),
@@ -6646,7 +9125,7 @@ def register_uploaded_pdf(
     if not (paper_dir / "reader.md").exists():
         write_text_atomic(paper_dir / "reader.md", f"# {metadata['title']}\n\nThis paper is in Library only. Choose 略读 or 精读 from the Library page.\n")
     sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata, generate_pdf_preview=generate_pdf_preview)
-    return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir}
+    return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir, "attached_to_existing": bool(auto_attached_to), "auto_attached_to": auto_attached_to}
 
 
 def register_metadata_only_paper(
@@ -6700,6 +9179,10 @@ def register_metadata_only_paper(
             "abstract": metadata_fields.get("abstract") or metadata.get("abstract", ""),
             "doi": metadata_fields.get("doi") or metadata.get("doi", ""),
             "url": metadata_fields.get("url") or metadata.get("url", ""),
+            "pdf_url": metadata_fields.get("pdf_url") or metadata_fields.get("open_access_pdf_url") or metadata.get("pdf_url", ""),
+            "open_access_pdf_url": metadata_fields.get("open_access_pdf_url") or metadata.get("open_access_pdf_url", ""),
+            "semantic_scholar_url": metadata_fields.get("semantic_scholar_url") or metadata.get("semantic_scholar_url", ""),
+            "arxiv_id": metadata_fields.get("arxiv_id") or metadata.get("arxiv_id", ""),
             "importance": metadata_fields.get("importance") or metadata.get("importance", ""),
             "tags": tags if tags is not None else metadata.get("tags", []),
             "projects": projects if projects is not None else metadata.get("projects", []),
@@ -6710,7 +9193,6 @@ def register_metadata_only_paper(
             "replacement_backup_dir": backup_dir or metadata.get("replacement_backup_dir", ""),
         }
     )
-    metadata = metadata_with_citation(metadata)
     write_json(paper_dir / "metadata.json", metadata)
     if not (paper_dir / "segments.json").exists():
         write_json(paper_dir / "segments.json", [])
@@ -6719,8 +9201,8 @@ def register_metadata_only_paper(
     if not (paper_dir / "annotations.json").exists():
         write_json(paper_dir / "annotations.json", {"annotations": []})
     if not (paper_dir / "reader.md").exists():
-        write_text_atomic(paper_dir / "reader.md", f"# {clean_title}\n\nNo PDF attached yet. Attach a PDF to parse Markdown, Paper Brief, Paper Map, and Takeaway Report.\n")
-    sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata)
+        write_text_atomic(paper_dir / "reader.md", f"# {clean_title}\n\nNo PDF attached yet. Attach a PDF to parse its source Markdown.\n")
+    sync_library_from_metadata(workspace, next_paper_id, paper_dir, metadata, generate_pdf_preview=False)
     return {"ok": True, "paper_id": next_paper_id, "metadata": metadata, "replaced": bool(backup_dir), "backup_dir": backup_dir}
 
 
@@ -6801,6 +9283,7 @@ def process_paper_skim(workspace: Path, paper_id: str, paper_dir: Path, options:
         if not pdf_path.exists():
             update_explanation_from_pdf(paper_dir, metadata, segments, outline, source_name)
         write_text_atomic(paper_dir / "reader.md", skim_summary)
+        write_source_artifacts(paper_dir, metadata, [], source_name)
         metadata = metadata_with_citation(metadata)
     except Exception as exc:  # noqa: BLE001
         metadata.update({"processing_status": "failed", "processing_error": str(exc), "updated_at": now_iso()})
@@ -6813,23 +9296,49 @@ def process_paper_skim(workspace: Path, paper_id: str, paper_dir: Path, options:
     return metadata
 
 
+def reusable_parsed_source(paper_dir: Path, metadata: dict[str, Any], segments: list[dict[str, Any]]) -> bool:
+    if not any(str(item.get("markdown") or "").strip() for item in segments):
+        return False
+    if metadata.get("source_type") not in {"reference", "metadata"} or (paper_dir / "raw.md").is_file() or metadata.get("source_parse_complete"):
+        return True
+    # Reference-card placeholders are not parsed PDF text, but never replace
+    # a source already targeted by annotations or saved translations, including
+    # equations hidden only in the reading copy.
+    annotations = read_json(paper_dir / "annotations.json", {})
+    return any(
+        isinstance(item.get("translation"), str) and strip_translation_images(item["translation"]).strip()
+        for item in segments
+    ) or bool(annotations.get("annotations") if isinstance(annotations, dict) else annotations)
+
+
+def save_processing_fields(workspace: Path, paper_id: str, paper_dir: Path, fields: dict[str, Any]) -> dict[str, Any]:
+    with write_lock_for(paper_dir / "metadata.json"):
+        if not (paper_dir / "metadata.json").is_file():
+            raise FileNotFoundError("Paper metadata is missing; the queued job will not recreate a removed paper.")
+        metadata = read_json(paper_dir / "metadata.json", {}, strict=True)
+        metadata.update({**fields, "updated_at": now_iso()})
+        write_json(paper_dir / "metadata.json", metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    return metadata
+
+
 def process_paper_deep(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Source-only parsing. Briefs, takeaways and translation are separate jobs."""
     options = options or {}
     metadata = read_json(paper_dir / "metadata.json", {})
-    metadata.update({"processing_mode": "deep", "reading_mode": "deep", "processing_status": "processing", "processing_error": "", "updated_at": now_iso()})
-    write_json(paper_dir / "metadata.json", metadata)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+    existing = translation_segments(paper_dir)
+    if reusable_parsed_source(paper_dir, metadata, existing):
+        metadata = save_processing_fields(workspace, paper_id, paper_dir, {"processing_mode": "deep", "reading_mode": "deep", "processing_status": "ready", "processing_error": "", "processing_background": "done"})
+        resume_translation_waiting_for_source(paper_id, paper_dir)
+        return metadata
+    save_processing_fields(workspace, paper_id, paper_dir, {"processing_mode": "deep", "reading_mode": "deep", "processing_status": "processing", "processing_error": ""})
     pdf_path = paper_dir / "original.pdf"
     raw_md_path = paper_dir / "raw.md"
-    if pdf_path.exists():
-        try:
-            update_paper_brief_from_pdf(workspace, paper_dir, metadata, pdf_path.name, force=bool(options.get("force_brief")))
-            metadata = read_json(paper_dir / "metadata.json", metadata)
-        except Exception as exc:  # noqa: BLE001
-            print(f"PDF Paper Brief generation failed for {paper_id}: {exc}", file=sys.stderr)
-            metadata = read_json(paper_dir / "metadata.json", metadata)
     try:
-        if pdf_path.exists():
+        if raw_md_path.is_file():
+            raw_md = raw_md_path.read_text(encoding="utf-8")
+            source_name = pdf_path.name if pdf_path.exists() else raw_md_path.name
+        elif pdf_path.is_file():
             mineru_output = paper_dir / "mineru_output"
             generated_md = run_mineru(
                 pdf_path,
@@ -6843,99 +9352,51 @@ def process_paper_deep(workspace: Path, paper_id: str, paper_dir: Path, options:
             raw_md = generated_md.read_text(encoding="utf-8")
             copy_markdown_assets(generated_md, paper_dir)
             source_name = pdf_path.name
-        elif raw_md_path.exists():
-            raw_md = raw_md_path.read_text(encoding="utf-8")
-            source_name = raw_md_path.name
         else:
             raise RuntimeError("No original.pdf or raw.md found for deep processing.")
-        write_text_atomic(raw_md_path, raw_md)
         segments, outline = build_segments(raw_md)
-        title = update_title_from_segments(metadata, segments, paper_id)
-        existing_outline = read_json(paper_dir / "outline.json", {"outline": [], "core_locations": []})
-        metadata.update(
-            {
-                "title": title,
-                "source_pdf": "original.pdf" if pdf_path.exists() else metadata.get("source_pdf", ""),
-                "source_pdf_name": pdf_path.name if pdf_path.exists() else metadata.get("source_pdf_name", ""),
-                "created_or_refreshed_at": now_iso(),
-                "status": metadata.get("status", "new"),
-                "venue": metadata.get("venue", ""),
-                "year": normalize_year(metadata.get("year", "")),
-                "authors": metadata.get("authors", ""),
-                "institutions": metadata.get("institutions", ""),
-                "abstract": metadata.get("abstract", ""),
-                "research_question": metadata.get("research_question", ""),
-                "method": metadata.get("method", ""),
-                "result": metadata.get("result", ""),
-                "discussion": metadata.get("discussion", ""),
-                "importance": metadata.get("importance", ""),
-                "read_status": metadata.get("read_status", "unread"),
-                "tags": metadata.get("tags", []),
-                "agent_analysis_status": metadata.get("agent_analysis_status", "needs_agent"),
-                "processing_status": "ready",
-                "processing_background": "done",
-                "updated_at": now_iso(),
-            }
-        )
-        write_json(paper_dir / "segments.json", segments)
-        presentation_flow = existing_outline.get("presentation_flow") or build_presentation_flow(metadata, segments, outline)
-        outline_data = {"outline": outline, "core_locations": existing_outline.get("core_locations", []), "presentation_flow": presentation_flow}
-        write_json(paper_dir / "outline.json", outline_data)
-        ensure_takeaway_doc_skeleton(paper_dir, outline_data)
-        if not (paper_dir / "annotations.json").exists():
-            write_json(paper_dir / "annotations.json", {"annotations": []})
-        write_text_atomic(paper_dir / "reader.md", make_reader_markdown(segments, source_name))
-        if not pdf_path.exists():
-            update_explanation_from_pdf(paper_dir, metadata, segments, outline, source_name)
-        metadata = metadata_with_citation(metadata)
+        if not segments:
+            raise RuntimeError("PDF/Markdown parsing produced no source segments.")
+        created_source = False
+        with write_lock_for(paper_dir / "segments.json"):
+            metadata = read_json(paper_dir / "metadata.json", {})
+            latest = translation_segments(paper_dir)
+            if reusable_parsed_source(paper_dir, metadata, latest):
+                segments = latest
+            else:
+                write_text_atomic(raw_md_path, raw_md)
+                write_json(paper_dir / "segments.json", segments)
+                existing_outline = read_json(paper_dir / "outline.json", {})
+                write_json(paper_dir / "outline.json", {**existing_outline, "outline": outline, "core_locations": existing_outline.get("core_locations", [])})
+                if not (paper_dir / "annotations.json").exists():
+                    write_json(paper_dir / "annotations.json", {"annotations": []})
+                created_source = True
+        if created_source:
+            write_reader_bundle(paper_dir, metadata, segments, source_name)
+            if not (paper_dir / "notes.md").exists() and not (paper_dir / "annotated.md").exists():
+                export_notes_and_annotated(paper_dir)
+        metadata = read_json(paper_dir / "metadata.json", {})
+        title = metadata.get("title") if metadata.get("title_source") == "user" else update_title_from_segments(metadata, segments, paper_id)
+        metadata = save_processing_fields(workspace, paper_id, paper_dir, {
+            "title": title or paper_id, "title_source": metadata.get("title_source", "paper"), "source_parse_complete": True,
+            "source_pdf": "original.pdf" if pdf_path.exists() else metadata.get("source_pdf", ""),
+            "processing_status": "ready", "processing_background": "done", "processing_error": "",
+            "created_or_refreshed_at": now_iso(),
+        })
     except Exception as exc:  # noqa: BLE001
-        metadata.update({"processing_status": "failed", "processing_error": str(exc), "updated_at": now_iso()})
-        write_json(paper_dir / "metadata.json", metadata)
-        sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+        save_processing_fields(workspace, paper_id, paper_dir, {"processing_status": "failed", "processing_error": str(exc)})
         raise
-    write_json(paper_dir / "metadata.json", metadata)
-    export_notes_and_annotated(paper_dir)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+    resume_translation_waiting_for_source(paper_id, paper_dir)
     return metadata
 
 
-def prepare_pdf_brief_then_background(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *, mode: str = "deep", refresh_citations: bool = True, refresh_videos: bool = True) -> dict[str, Any]:
+def prepare_pdf_brief_then_background(workspace: Path, paper_id: str, paper_dir: Path, options: dict[str, Any] | None = None, *, mode: str = "deep", refresh_citations: bool = False, refresh_videos: bool = False) -> dict[str, Any]:
+    """Legacy helper name retained for callers; now queues source-first parsing."""
     metadata = read_json(paper_dir / "metadata.json", {})
-    source_name = str(metadata.get("source_pdf_name") or "original.pdf")
-    metadata.update(
-        {
-            "processing_mode": mode,
-            "reading_mode": mode,
-            "processing_status": "paper_brief_processing",
-            "processing_background": "waiting_for_brief",
-            "processing_error": "",
-            "paper_brief_status": "generating",
-            "updated_at": now_iso(),
-        }
-    )
-    write_json(paper_dir / "metadata.json", metadata)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
-    if (paper_dir / "original.pdf").exists():
-        try:
-            update_paper_brief_from_pdf(workspace, paper_dir, metadata, source_name, force=bool((options or {}).get("force_brief")))
-        except Exception as exc:  # noqa: BLE001
-            print(f"PDF Paper Brief generation failed for {paper_id}: {exc}", file=sys.stderr)
-    metadata = read_json(paper_dir / "metadata.json", metadata)
-    brief_ready = metadata.get("paper_brief_status") == "ready"
-    metadata.update(
-        {
-            "processing_mode": mode,
-            "reading_mode": mode,
-            "processing_status": "paper_brief_ready" if brief_ready else "processing_queued",
-            "processing_background": "queued",
-            "agent_analysis_status": "paper_brief_ready" if brief_ready else metadata.get("agent_analysis_status", "needs_agent"),
-            "updated_at": now_iso(),
-        }
-    )
-    write_json(paper_dir / "metadata.json", metadata)
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
+    if mode == "deep" and reusable_parsed_source(paper_dir, metadata, translation_segments(paper_dir)):
+        return process_paper_deep(workspace, paper_id, paper_dir, options)
     start_background_paper_processing(workspace, paper_id, paper_dir, options or {}, mode=mode, refresh_citations=refresh_citations, refresh_videos=refresh_videos)
-    return read_json(paper_dir / "metadata.json", metadata)
+    return read_json(paper_dir / "metadata.json", {}, strict=True)
 
 
 def ingest_pdf(args: argparse.Namespace) -> None:
@@ -6957,6 +9418,11 @@ def ingest_pdf(args: argparse.Namespace) -> None:
     paper_id = args.paper_id or f"{slugify(base_name)}-{digest}"
     paper_dir = workspace / "papers" / paper_id
     paper_dir.mkdir(parents=True, exist_ok=True)
+    existing_metadata = read_json(paper_dir / "metadata.json", {})
+    if reusable_parsed_source(paper_dir, existing_metadata, translation_segments(paper_dir)):
+        process_paper_deep(workspace, paper_id, paper_dir)
+        print(f"Reused parsed paper: {paper_id}")
+        return
 
     if pdf_path:
         destination_pdf = paper_dir / "original.pdf"
@@ -7017,26 +9483,14 @@ def ingest_pdf(args: argparse.Namespace) -> None:
     write_json(paper_dir / "metadata.json", metadata)
     existing_outline = read_json(paper_dir / "outline.json", {"outline": [], "core_locations": []})
     write_json(paper_dir / "segments.json", segments)
-    presentation_flow = existing_outline.get("presentation_flow") or build_presentation_flow(metadata, segments, outline)
-    write_json(paper_dir / "outline.json", {"outline": outline, "core_locations": existing_outline.get("core_locations", []), "presentation_flow": presentation_flow})
+    write_json(paper_dir / "outline.json", {**existing_outline, "outline": outline, "core_locations": existing_outline.get("core_locations", [])})
     if not (paper_dir / "annotations.json").exists():
         write_json(paper_dir / "annotations.json", {"annotations": []})
-    write_text_atomic(paper_dir / "reader.md", make_reader_markdown(segments, source_for_hash.name))
-    if pdf_path:
-        try:
-            update_paper_brief_from_pdf(workspace, paper_dir, metadata, source_for_hash.name)
-            metadata = read_json(paper_dir / "metadata.json", metadata)
-        except Exception as exc:  # noqa: BLE001
-            print(f"PDF Paper Brief generation failed for {paper_id}: {exc}", file=sys.stderr)
-            metadata = read_json(paper_dir / "metadata.json", metadata)
-    else:
-        update_explanation_from_pdf(paper_dir, metadata, segments, outline, source_for_hash.name)
-    if pdf_path:
-        metadata = metadata_with_citation(metadata)
-        write_json(paper_dir / "metadata.json", metadata)
-    export_notes_and_annotated(paper_dir)
+    write_reader_bundle(paper_dir, metadata, segments, source_for_hash.name)
+    if not (paper_dir / "notes.md").exists() and not (paper_dir / "annotated.md").exists():
+        export_notes_and_annotated(paper_dir)
 
-    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata)
+    sync_library_from_metadata(workspace, paper_id, paper_dir, metadata, generate_pdf_preview=False)
 
     print(f"Imported paper: {title}")
     print(f"Paper ID: {paper_id}")
@@ -7070,6 +9524,203 @@ def doctor(args: argparse.Namespace) -> None:
             print(f"MinerU version check failed: {exc}")
     workspace = resolve_workspace(args.workspace)
     print(f"Default workspace: {workspace}")
+
+
+def normalized_query_value(value: Any) -> str:
+    return unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+
+
+def paper_record_dir(workspace: Path, paper: dict[str, Any]) -> Path:
+    path = Path(str(paper.get("paper_dir") or ""))
+    return path if path.is_absolute() else workspace / path
+
+
+def paper_record_artifact(workspace: Path, paper: dict[str, Any], field: str, filename: str) -> Path:
+    value = str(paper.get(field) or "").strip()
+    if value:
+        path = Path(value)
+        return path if path.is_absolute() else workspace / path
+    return paper_record_dir(workspace, paper) / filename
+
+
+def load_paper_query_brief(paper_dir: Path) -> str:
+    thinking = read_json(paper_dir / "thinking.json", {})
+    explain = thinking.get("explain") if isinstance(thinking, dict) else None
+    if not isinstance(explain, dict):
+        return ""
+    return str(explain.get("content") or "").strip()
+
+
+def paper_matches_query(paper: dict[str, Any], project: str, tag: str, search: str) -> bool:
+    projects = {normalized_query_value(value) for value in metadata_projects(paper)}
+    if project and normalized_query_value(project) not in projects:
+        return False
+
+    paper_tags = {normalized_query_value(value) for value in normalize_tag_paths(paper.get("tags", []))}
+    requested_tags = {normalized_query_value(value) for value in normalize_tag_paths(tag)} if tag else set()
+    if requested_tags and not paper_tags.intersection(requested_tags):
+        return False
+
+    needle = normalized_query_value(search)
+    if not needle:
+        return True
+    searchable = json.dumps(
+        {
+            "id": paper.get("id", ""),
+            "title": paper.get("title", ""),
+            "authors": paper.get("authors", ""),
+            "venue": paper.get("venue", ""),
+            "year": paper.get("year", ""),
+            "projects": metadata_projects(paper),
+            "tags": normalize_tag_paths(paper.get("tags", [])),
+        },
+        ensure_ascii=False,
+    )
+    return needle in normalized_query_value(searchable)
+
+
+def markdown_link_label(value: Any) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def markdown_artifact_reference(path_value: str, output_path: Path | None) -> str:
+    path = Path(path_value)
+    if not path.exists():
+        return f"`{path}` (missing)"
+    if output_path is None:
+        return f"`{path}`"
+    relative = os.path.relpath(path, output_path.parent).replace("\\", "/")
+    return f"[{markdown_link_label(path.name)}](<{relative}>)"
+
+
+def render_paper_query_markdown(payload: dict[str, Any], output_path: Path | None = None) -> str:
+    summary = payload["summary"]
+    filters = payload["filters"]
+    papers = payload["papers"]
+    lines = [
+        "# Paper Query Results",
+        "",
+        f"- Library papers: {summary['library_papers']}",
+        f"- Matched papers: {summary['matched_papers']}",
+        f"- Returned papers: {summary['returned_papers']}",
+        f"- Briefing available: {summary['briefing_available']}",
+        f"- Briefing missing: {summary['briefing_missing']}",
+        "",
+        "Data source: `library.json` for filtering and each matched paper's `thinking.json` -> `explain.content` for Briefing availability and content.",
+        "",
+        "## Paper Index",
+        "",
+    ]
+    for index, paper in enumerate(papers, 1):
+        lines.append(f"{index}. [{markdown_link_label(paper['title'])}](#paper-{index:03d})")
+
+    for index, paper in enumerate(papers, 1):
+        briefing = paper["briefing"]
+        lines.extend(
+            [
+                "",
+                "---",
+                "",
+                f'<a id="paper-{index:03d}"></a>',
+                f"## {index:03d}. {paper['title']}",
+                "",
+                f"- Paper ID: `{paper['id']}`",
+                f"- Projects: {', '.join(paper['projects']) or '-'}",
+                f"- Tags: {', '.join(paper['tags']) or '-'}",
+                f"- Reader: {markdown_artifact_reference(paper['reader_path'], output_path)}",
+                f"- Notes: {markdown_artifact_reference(paper['notes_path'], output_path)}",
+                f"- Briefing source: {markdown_artifact_reference(briefing['path'], output_path)}",
+                f"- Briefing status: {'available' if briefing['available'] else 'missing'}",
+            ]
+        )
+        if filters["include_briefs"]:
+            lines.extend(["", "### Briefing", ""])
+            lines.append(briefing.get("content") or "> **Briefing unavailable:** `thinking.json` is missing or `explain.content` is empty.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def query_papers_cli(args: argparse.Namespace) -> None:
+    workspace = resolve_workspace(args.workspace)
+    library = load_library_raw(workspace)
+    if args.limit < 0:
+        raise SystemExit("--limit must be zero or greater")
+
+    matched: list[dict[str, Any]] = []
+    for paper in library.get("papers", []):
+        if not paper_matches_query(paper, args.project, args.tag, args.search):
+            continue
+        paper_dir = paper_record_dir(workspace, paper)
+        briefing_path = paper_dir / "thinking.json"
+        briefing_content = load_paper_query_brief(paper_dir)
+        briefing_available = bool(briefing_content)
+        if args.brief == "available" and not briefing_available:
+            continue
+        if args.brief == "missing" and briefing_available:
+            continue
+        reader_path = paper_record_artifact(workspace, paper, "reader_md", "reader.md").resolve()
+        notes_path = paper_record_artifact(workspace, paper, "notes_md", "notes.md").resolve()
+        resolved_briefing_path = briefing_path.resolve()
+        record = {
+            "id": str(paper.get("id") or ""),
+            "title": str(paper.get("title") or paper.get("id") or "").strip(),
+            "projects": metadata_projects(paper),
+            "tags": normalize_tag_paths(paper.get("tags", [])),
+            "year": paper.get("year", ""),
+            "venue": paper.get("venue", ""),
+            "paper_dir": str(paper_dir.resolve()),
+            "reader_path": str(reader_path),
+            "reader_exists": reader_path.exists(),
+            "notes_path": str(notes_path),
+            "notes_exists": notes_path.exists(),
+            "briefing": {
+                "available": briefing_available,
+                "chars": len(briefing_content),
+                "path": str(resolved_briefing_path),
+                "source_exists": resolved_briefing_path.exists(),
+            },
+        }
+        if args.include_briefs:
+            record["briefing"]["content"] = briefing_content
+        matched.append(record)
+
+    matched.sort(key=lambda paper: (normalized_query_value(paper["title"]), paper["id"]))
+    total_matches = len(matched)
+    briefing_available = sum(bool(paper["briefing"]["available"]) for paper in matched)
+    returned = matched[: args.limit] if args.limit else matched
+    payload = {
+        "workspace": str(workspace),
+        "filters": {
+            "project": args.project or "",
+            "tag": args.tag or "",
+            "search": args.search or "",
+            "brief": args.brief,
+            "include_briefs": bool(args.include_briefs),
+            "limit": args.limit,
+        },
+        "summary": {
+            "library_papers": len(library.get("papers", [])),
+            "matched_papers": total_matches,
+            "returned_papers": len(returned),
+            "briefing_available": briefing_available,
+            "briefing_missing": total_matches - briefing_available,
+        },
+        "papers": returned,
+    }
+
+    output_path = None
+    if args.output:
+        requested_path = Path(args.output).expanduser()
+        output_path = requested_path if requested_path.is_absolute() else workspace / requested_path
+    content = render_paper_query_markdown(payload, output_path) if args.format == "markdown" else json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if output_path is None:
+        print(content, end="")
+        return
+    write_text_atomic(output_path, content)
+    print(f"Wrote query results: {output_path}")
+    print(f"Matched papers: {total_matches}")
+    print(f"Returned papers: {len(returned)}")
+    print(f"Briefing available: {briefing_available}")
+    print(f"Briefing missing: {total_matches - briefing_available}")
 
 
 def list_status(args: argparse.Namespace) -> None:
@@ -7144,7 +9795,7 @@ def rebuild_outputs(args: argparse.Namespace) -> None:
             print(f"Skipping paper without segments: {paper_id}")
             continue
         source_name = read_json(paper_dir / "metadata.json", {}).get("source_pdf") or "raw.md"
-        write_text_atomic(paper_dir / "reader.md", make_reader_markdown(segments, source_name))
+        write_reader_bundle(paper_dir, read_json(paper_dir / "metadata.json", {}), segments, source_name)
         export_notes_and_annotated(paper_dir)
         rebuilt += 1
         print(f"Rebuilt: {paper_id}")
@@ -7158,16 +9809,30 @@ class ReaderHandler(BaseHTTPRequestHandler):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
         sys.stderr.write(f"[{timestamp}] {format % args}\n")
 
-    def send_json(self, data: Any, status: int = 200) -> None:
-        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    def send_payload(self, payload: bytes, content_type: str, status: int = 200, *, download_name: str | None = None, etag: str | None = None) -> None:
+        validators = [value.strip().removeprefix("W/") for value in self.headers.get("If-None-Match", "").split(",")]
+        not_modified = bool(etag and (etag in validators or "*" in validators))
         try:
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
+            self.send_response(HTTPStatus.NOT_MODIFIED if not_modified else status)
+            self.send_header("Cache-Control", "no-cache" if etag else "no-store")
+            if etag:
+                self.send_header("ETag", etag)
+            if not not_modified:
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                if download_name:
+                    ascii_name = re.sub(r"[^a-zA-Z0-9._-]", "_", download_name)
+                    encoded_name = urllib.parse.quote(download_name, safe="")
+                    self.send_header("Content-Disposition", f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{encoded_name}")
             self.end_headers()
-            self.wfile.write(payload)
+            if not not_modified:
+                self.wfile.write(payload)
         except CLIENT_DISCONNECT_ERRORS:
             return
+
+    def send_json(self, data: Any, status: int = 200, *, download_name: str | None = None) -> None:
+        payload = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_payload(payload, "application/json; charset=utf-8", status, download_name=download_name)
 
     def send_error(self, code: int, message: str | None = None, explain: str | None = None) -> None:  # noqa: A003
         if self.path.startswith("/api/"):
@@ -7177,27 +9842,25 @@ class ReaderHandler(BaseHTTPRequestHandler):
         safe_explain = str(explain).encode("latin-1", "replace").decode("latin-1") if explain else None
         super().send_error(code, safe_message, safe_explain)
 
-    def send_text_file(self, path: Path, content_type: str | None = None) -> None:
+    def send_text_file(self, path: Path, content_type: str | None = None, *, cache_static: bool = False) -> None:
         if not path.exists() or not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         payload = path.read_bytes()
-        try:
-            self.send_response(200)
-            self.send_header("Content-Type", content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream")
-            self.send_header("Content-Length", str(len(payload)))
-            self.end_headers()
-            self.wfile.write(payload)
-        except CLIENT_DISCONNECT_ERRORS:
-            return
+        etag = f'"{hashlib.sha256(payload).hexdigest()}"' if cache_static else None
+        self.send_payload(payload, content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream", etag=etag)
 
     def get_paper_dir(self, paper_id: str) -> Path | None:
-        library = load_library_raw(self.workspace)
+        library = read_library_index(self.workspace)
         for paper in library.get("papers", []):
-            if paper.get("id") == paper_id:
-                return (self.workspace / paper.get("paper_dir", "")).resolve()
-        direct = (self.workspace / "papers" / paper_id).resolve()
-        if direct.exists():
+            if isinstance(paper, dict) and paper.get("id") == paper_id and paper.get("paper_dir"):
+                registered = (self.workspace / paper["paper_dir"]).resolve()
+                return registered if registered.is_dir() else None
+        papers_root = (self.workspace / "papers").resolve()
+        direct = (papers_root / paper_id).resolve()
+        if not direct.is_relative_to(papers_root) or direct == papers_root:
+            return None
+        if direct.is_dir():
             return direct
         return None
 
@@ -7213,15 +9876,74 @@ class ReaderHandler(BaseHTTPRequestHandler):
     def _do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
+        publication_match = re.fullmatch(r"/api/papers/([^/]+)/feishu-publication", path)
+        if publication_match:
+            paper_dir = self.get_paper_dir(urllib.parse.unquote(publication_match.group(1)))
+            if not paper_dir:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                self.require_publication_origin()
+                status = publication_service().status(paper_dir, publication_settings())
+                self.send_json({"ok": True, "publication": status})
+            except PermissionError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/feishu/search":
+            try:
+                base_token, table_id, executable = feishu_settings()
+                keyword = urllib.parse.parse_qs(parsed.query).get("keyword", [""])[0]
+                result = feishu_metadata.search_records(base_token, table_id, keyword, executable=executable)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"ok": True, **result})
+            return
+        if path == "/api/feishu/preview":
+            try:
+                reference = urllib.parse.parse_qs(parsed.query).get("reference", [""])[0]
+                result = preview_feishu_record(self.workspace, reference)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json(result)
+            return
         if path == "/" or path == "/index.html":
-            self.send_text_file(WEB_DIR / "index.html", "text/html; charset=utf-8")
+            self.send_text_file(WEB_DIR / "index.html", "text/html; charset=utf-8", cache_static=True)
             return
         if path in {"/app.js", "/styles.css"}:
-            self.send_text_file(WEB_DIR / path.lstrip("/"), "application/javascript; charset=utf-8" if path.endswith(".js") else "text/css; charset=utf-8")
+            self.send_text_file(WEB_DIR / path.lstrip("/"), "application/javascript; charset=utf-8" if path.endswith(".js") else "text/css; charset=utf-8", cache_static=True)
+            return
+        if path.startswith("/vendor/"):
+            web_root = WEB_DIR.resolve()
+            target = (web_root / urllib.parse.unquote(path.lstrip("/"))).resolve()
+            try:
+                target.relative_to(web_root)
+            except ValueError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_text_file(target, cache_static=True)
             return
         if path == "/api/library":
-            library = load_library(self.workspace)
-            self.send_json({"workspace": str(self.workspace), "library": library, "tag_dictionary": tag_dictionary(), "project_contexts": read_project_contexts(self.workspace)})
+            library = read_library_index(self.workspace)
+            self.send_json({"workspace": str(self.workspace), "library": library, "tag_dictionary": tag_dictionary(), "project_contexts": read_project_contexts(self.workspace), "translation_config": translation_config(), "feishu_config": feishu_config()})
+            return
+        if path == "/api/translation-queue":
+            try:
+                snapshot = TRANSLATION_JOBS.queue_snapshot(self.workspace) if TRANSLATION_JOBS else {
+                    "ok": True, "concurrency": translation_concurrency(), "active_requests": 0, "jobs": [], "retry_at": None,
+                }
+            except (ValueError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json(snapshot)
+            return
+        if path == "/api/processing-queue":
+            self.send_json(PROCESSING_JOBS.snapshot(self.workspace) if PROCESSING_JOBS else {
+                "ok": True, "concurrency": 1, "active_jobs": 0, "queued_count": 0, "jobs": [],
+            })
             return
         if path == "/api/project-contexts":
             self.send_json({"ok": True, "workspace": str(self.workspace), "project_contexts": read_project_contexts(self.workspace)})
@@ -7230,7 +9952,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "tag_dictionary": tag_dictionary()})
             return
         if path == "/api/papers":
-            library = load_library(self.workspace)
+            library = read_library_index(self.workspace)
             self.send_json({"workspace": str(self.workspace), "papers": library.get("papers", []), "tag_dictionary": tag_dictionary()})
             return
         if path == "/api/candidates":
@@ -7359,6 +10081,55 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 return
             self.send_json({"reference": card})
             return
+        translation_match = re.match(r"^/api/papers/([^/]+)/translation$", path)
+        if translation_match:
+            paper_id = urllib.parse.unquote(translation_match.group(1))
+            paper_dir = self.get_paper_dir(paper_id)
+            if not paper_dir:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            query = urllib.parse.parse_qs(parsed.query)
+            try:
+                after = int(query.get("after", ["-1"])[0])
+            except ValueError:
+                self.send_error(HTTPStatus.BAD_REQUEST, "after must be a revision number")
+                return
+            self.send_json({"ok": True, "paper_id": paper_id, **translation_snapshot(paper_dir, job_id=query.get("job_id", [""])[0], after=after)})
+            return
+        teacher_match = re.fullmatch(r"/api/papers/([^/]+)/reading-teacher", path)
+        if teacher_match:
+            paper_id = urllib.parse.unquote(teacher_match.group(1))
+            paper_dir = self.get_paper_dir(paper_id)
+            if not paper_dir:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                missing = object()
+                data = read_json(paper_dir / "reading_teacher.json", missing, strict=True)
+                teacher = {"available": False, "cards": [], "issues": []} if data is missing else validate_reading_teacher(
+                    data, read_json(paper_dir / "segments.json", [], strict=True), paper_id,
+                )
+            except (ValueError, OSError) as exc:
+                self.send_json({"ok": False, "error": f"Reading teacher unavailable: {exc}"}, status=HTTPStatus.CONFLICT)
+                return
+            self.send_json({"ok": True, "paper_id": paper_id, "teacher": teacher})
+            return
+        export_match = re.match(r"^/api/papers/([^/]+)/(notes-md|reading-data)$", path)
+        if export_match:
+            paper_id = urllib.parse.unquote(export_match.group(1))
+            paper_dir = self.get_paper_dir(paper_id)
+            if not paper_dir:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            # Generate downloads in memory from current source files. GET must
+            # neither rewrite JSON nor depend on a potentially stale notes.md.
+            snapshot = load_reading_data(paper_dir, paper_id, include_teacher=export_match.group(2) == "reading-data")
+            filename = slugify(paper_id)
+            if export_match.group(2) == "notes-md":
+                self.send_payload(make_notes_markdown(snapshot).encode("utf-8"), "text/markdown; charset=utf-8", download_name=f"{filename}-notes.md")
+            else:
+                self.send_json(snapshot, download_name=f"{filename}-reading-data.json")
+            return
         match = re.match(r"^/api/papers/([^/]+)$", path)
         if match:
             paper_id = urllib.parse.unquote(match.group(1))
@@ -7366,12 +10137,28 @@ class ReaderHandler(BaseHTTPRequestHandler):
             if not paper_dir:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            metadata = normalized_metadata(paper_dir, read_json(paper_dir / "metadata.json", {}))
+            metadata = normalized_metadata(paper_dir, read_json(paper_dir / "metadata.json", {}), discover_preview=False)
+            # Advertise the download with a stat only, never PDF parsing.
+            metadata["source_pdf"] = (metadata.get("source_pdf") or "original.pdf") if (paper_dir / "original.pdf").is_file() else ""
+            segments = read_json(paper_dir / "segments.json", [])
+            translation = translation_snapshot(paper_dir, segments=segments)["translation"]
+            metadata.update({
+                "translation_status": translation["status"], "translation_error": translation["error"],
+                "translation_backend": translation["backend"], "translated_segments": translation["completed"],
+                "translation_total": translation["total"],
+            })
             self.send_json(
                 {
                     "metadata": metadata,
+                    "feishu_metadata": read_json(paper_dir / "feishu_metadata.json", {}),
                     "outline": read_json(paper_dir / "outline.json", {"outline": [], "core_locations": []}),
-                    "segments": read_json(paper_dir / "segments.json", []),
+                    "segments": segments,
+                    "teacher_available": (paper_dir / "reading_teacher.json").is_file(),
+                    "translation": translation,
+                    "translation_config": translation_config(),
+                    # No PDF text extraction or rendering on open. Incomplete
+                    # figures use the original PDF endpoint in the reader.
+                    "figure_fallbacks": {},
                     "annotations": read_json(paper_dir / "annotations.json", {"annotations": []}),
                     "reading_progress": load_reading_progress(paper_dir),
                     "thinking": load_thinking(paper_dir),
@@ -7384,6 +10171,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
                         "reader_md": str(paper_dir / "reader.md"),
                         "annotated_md": str(paper_dir / "annotated.md"),
                         "notes_md": str(paper_dir / "notes.md"),
+                        "annotations_json": str(paper_dir / "annotations.json"),
+                        "thinking_json": str(paper_dir / "thinking.json"),
+                        "segments_json": str(paper_dir / "segments.json"),
+                        "reading_progress_json": str(paper_dir / "reading_progress.json"),
                     },
                 }
             )
@@ -7404,7 +10195,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 return
             self.send_text_file(asset_path)
             return
-        file_match = re.match(r"^/api/papers/([^/]+)/(pdf|reader-md|annotated-md|notes-md)$", path)
+        file_match = re.match(r"^/api/papers/([^/]+)/(pdf|reader-md|paper-md|annotated-md|source-map|translation-notes|terminology-ledger)$", path)
         if file_match:
             paper_id = urllib.parse.unquote(file_match.group(1))
             file_kind = file_match.group(2)
@@ -7415,13 +10206,26 @@ class ReaderHandler(BaseHTTPRequestHandler):
             file_map = {
                 "pdf": (paper_dir / "original.pdf", "application/pdf"),
                 "reader-md": (paper_dir / "reader.md", "text/markdown; charset=utf-8"),
+                "paper-md": (paper_dir / "paper.md", "text/markdown; charset=utf-8"),
                 "annotated-md": (paper_dir / "annotated.md", "text/markdown; charset=utf-8"),
-                "notes-md": (paper_dir / "notes.md", "text/markdown; charset=utf-8"),
+                "source-map": (paper_dir / "source_map.json", "application/json; charset=utf-8"),
+                "translation-notes": (paper_dir / "translation_notes.md", "text/markdown; charset=utf-8"),
+                "terminology-ledger": (paper_dir / "terminology_ledger.json", "application/json; charset=utf-8"),
             }
             file_path, content_type = file_map[file_kind]
             self.send_text_file(file_path, content_type)
             return
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def require_publication_origin(self) -> None:
+        host = urllib.parse.urlsplit("http://" + self.headers.get("Host", ""))
+        if host.hostname not in {"localhost", "127.0.0.1", "::1"} or host.username or host.password:
+            raise PermissionError("Open the reader on localhost to publish reading records.")
+        origin = self.headers.get("Origin")
+        if origin:
+            source = urllib.parse.urlsplit(origin)
+            if source.scheme not in {"http", "https"} or source.netloc != host.netloc or source.username or source.password:
+                raise PermissionError("Publication requests must come from this reader's own origin.")
 
     def do_POST(self) -> None:  # noqa: N802
         try:
@@ -7434,6 +10238,85 @@ class ReaderHandler(BaseHTTPRequestHandler):
 
     def _do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        publication_match = re.fullmatch(r"/api/papers/([^/]+)/feishu-publication/(preview|publish)", parsed.path)
+        if publication_match:
+            paper_dir = self.get_paper_dir(urllib.parse.unquote(publication_match.group(1)))
+            if not paper_dir:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                self.require_publication_origin()
+                if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+                    raise ValueError("Publication requires an application/json request.")
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 65536:
+                    raise ValueError("Invalid publication request length.")
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ValueError("Publication expects a JSON object.")
+                if publication_match.group(2) == "preview":
+                    if data:
+                        raise ValueError("Preview uses the current saved paper and its configured destination.")
+                elif (
+                    set(data) != {"preview_id", "confirm"} or data.get("confirm") is not True
+                    or not isinstance(data.get("preview_id"), str) or not data["preview_id"]
+                ):
+                    raise ValueError("Confirm the current preview before publishing; arbitrary destinations are not accepted.")
+                service = publication_service()
+                settings = publication_settings()
+                if publication_match.group(2) == "preview":
+                    self.send_json({"ok": True, "preview": service.preview(paper_dir, settings)})
+                else:
+                    result = service.start(paper_dir, settings, data["preview_id"], True)
+                    self.send_json({"ok": True, "publication": result})
+            except PermissionError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.FORBIDDEN)
+            except feishu_publish.PublicationConflict as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.CONFLICT)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        if parsed.path in {"/api/feishu/intake", "/api/processing-queue/retry"}:
+            try:
+                data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("This action expects a JSON object.")
+                if parsed.path == "/api/feishu/intake":
+                    result = intake_feishu_paper(self.workspace, data)
+                else:
+                    paper_id = str(data.get("paper_id") or "")
+                    paper_dir = self.get_paper_dir(paper_id)
+                    if not paper_dir:
+                        raise ValueError("The queued paper no longer exists in this workspace.")
+                    metadata = read_json(paper_dir / "metadata.json", {}, strict=True)
+                    if metadata.get("processing_status") != "failed":
+                        raise ValueError("Only failed parsing jobs need a retry.")
+                    request = metadata.get("processing_request") or {}
+                    start_background_paper_processing(
+                        self.workspace, paper_id, paper_dir, request.get("options") or {},
+                        mode=request.get("mode") or "deep", refresh_citations=bool(request.get("refresh_citations")),
+                        refresh_videos=bool(request.get("refresh_videos")),
+                    )
+                    result = {"ok": True, "paper_id": paper_id, "metadata": read_json(paper_dir / "metadata.json", {}, strict=True)}
+                self.send_json(result)
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
+        feishu_match = re.fullmatch(r"/api/papers/([^/]+)/feishu-sync", parsed.path)
+        if feishu_match:
+            paper_id = urllib.parse.unquote(feishu_match.group(1))
+            paper_dir = self.get_paper_dir(paper_id)
+            if not paper_dir:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            try:
+                data = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                if not isinstance(data, dict):
+                    raise ValueError("Feishu synchronization expects a JSON object.")
+                self.send_json(sync_feishu_metadata(self.workspace, paper_id, paper_dir, data))
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+            return
         library_add_match = parsed.path == "/api/library/papers"
         library_upload_match = parsed.path == "/api/library/papers/upload"
         library_metadata_match = parsed.path == "/api/library/papers/metadata"
@@ -7446,9 +10329,11 @@ class ReaderHandler(BaseHTTPRequestHandler):
         annotations_match = re.match(r"^/api/papers/([^/]+)/annotations$", parsed.path)
         thinking_match = re.match(r"^/api/papers/([^/]+)/thinking$", parsed.path)
         chat_match = re.match(r"^/api/papers/([^/]+)/chat$", parsed.path)
+        reading_narrative_match = re.match(r"^/api/papers/([^/]+)/reading-narrative$", parsed.path)
         takeaway_match = re.match(r"^/api/papers/([^/]+)/takeaway-doc$", parsed.path)
         explain_match = re.match(r"^/api/papers/([^/]+)/thinking/explain$", parsed.path)
         metadata_match = re.match(r"^/api/papers/([^/]+)/metadata$", parsed.path)
+        find_pdf_match = re.match(r"^/api/papers/([^/]+)/find-pdf$", parsed.path)
         reading_progress_match = re.match(r"^/api/papers/([^/]+)/reading-progress$", parsed.path)
         process_match = re.match(r"^/api/papers/([^/]+)/process$", parsed.path)
         translate_match = re.match(r"^/api/papers/([^/]+)/translate$", parsed.path)
@@ -7466,7 +10351,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
         mindmap_save_match = re.match(r"^/api/mindmaps/([^/]+)$", parsed.path)
         mindmap_search_match = re.match(r"^/api/mindmaps/([^/]+)/paper-search$", parsed.path)
         mindmap_add_paper_match = re.match(r"^/api/mindmaps/([^/]+)/paper-instances$", parsed.path)
-        if not library_add_match and not library_upload_match and not library_metadata_match and not project_context_match and not candidate_brief_match and not candidate_annotations_match and not candidate_metadata_match and not candidate_save_match and not attach_pdf_match and not annotations_match and not thinking_match and not chat_match and not takeaway_match and not explain_match and not metadata_match and not reading_progress_match and not process_match and not translate_match and not citations_match and not videos_match and not reference_add_match and not canvas_boards_match and not canvas_board_match and not canvas_sync_apply_match and not mindmap_create_match and not mindmap_doc_save_match and not mindmap_duplicate_match and not mindmap_doc_add_paper_match and not mindmap_sync_apply_match and not mindmap_save_match and not mindmap_search_match and not mindmap_add_paper_match:
+        if not library_add_match and not library_upload_match and not library_metadata_match and not project_context_match and not candidate_brief_match and not candidate_annotations_match and not candidate_metadata_match and not candidate_save_match and not attach_pdf_match and not annotations_match and not thinking_match and not chat_match and not reading_narrative_match and not takeaway_match and not explain_match and not metadata_match and not find_pdf_match and not reading_progress_match and not process_match and not translate_match and not citations_match and not videos_match and not reference_add_match and not canvas_boards_match and not canvas_board_match and not canvas_sync_apply_match and not mindmap_create_match and not mindmap_doc_save_match and not mindmap_duplicate_match and not mindmap_doc_add_paper_match and not mindmap_sync_apply_match and not mindmap_save_match and not mindmap_search_match and not mindmap_add_paper_match:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         length = int(self.headers.get("Content-Length", "0"))
@@ -7849,16 +10734,13 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 if paper_dir:
                     if should_process_pdf:
                         result["metadata"] = prepare_pdf_brief_then_background(self.workspace, result["paper_id"], paper_dir, data if isinstance(data, dict) else {}, mode="deep")
-                    else:
-                        result["metadata"] = refresh_paper_citations(self.workspace, result["paper_id"], paper_dir)
-                        result["metadata"] = refresh_paper_videos(self.workspace, result["paper_id"], paper_dir)
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
                 return
             self.send_json({"ok": True, **result})
             return
 
-        paper_id = urllib.parse.unquote((annotations_match or thinking_match or chat_match or takeaway_match or explain_match or metadata_match or reading_progress_match or process_match or translate_match or citations_match or videos_match or reference_add_match).group(1))
+        paper_id = urllib.parse.unquote((annotations_match or thinking_match or chat_match or reading_narrative_match or takeaway_match or explain_match or metadata_match or find_pdf_match or reading_progress_match or process_match or translate_match or citations_match or videos_match or reference_add_match).group(1))
         paper_dir = self.get_paper_dir(paper_id)
         if not paper_dir:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -7884,8 +10766,11 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
 
         if thinking_match:
-            cleaned = clean_thinking(data if isinstance(data, dict) else {})
-            write_json(paper_dir / "thinking.json", cleaned)
+            try:
+                cleaned = save_thinking_update(paper_dir, data)
+            except ValueError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
             self.send_json({"ok": True, "thinking": cleaned})
             return
 
@@ -7898,9 +10783,19 @@ class ReaderHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, **result})
             return
 
+        if reading_narrative_match:
+            try:
+                result = append_reading_narrative_block(self.workspace, paper_id, paper_dir, data if isinstance(data, dict) else {})
+            except Exception as exc:  # noqa: BLE001
+                self.send_json({"ok": False, "error": chat_exception_message(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"ok": True, **result})
+            return
+
         if takeaway_match:
             cleaned = clean_takeaway_doc(data if isinstance(data, dict) else {})
             write_json(paper_dir / "takeaway_doc.json", cleaned)
+            schedule_export_notes_and_annotated(paper_dir)
             self.send_json({"ok": True, "takeaway_doc": cleaned})
             return
 
@@ -7910,8 +10805,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 self.send_error(HTTPStatus.BAD_REQUEST, "mode must be skim or deep")
                 return
             try:
-                metadata = process_paper_skim(self.workspace, paper_id, paper_dir, data) if mode == "skim" else process_paper_deep(self.workspace, paper_id, paper_dir, data)
-                metadata = refresh_paper_videos(self.workspace, paper_id, paper_dir)
+                metadata = prepare_pdf_brief_then_background(self.workspace, paper_id, paper_dir, data, mode=mode)
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
                 return
@@ -7919,12 +10813,18 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
 
         if translate_match:
+            if not isinstance(data, dict):
+                self.send_error(HTTPStatus.BAD_REQUEST, "translation request must be an object")
+                return
             try:
-                metadata = translate_paper_full(self.workspace, paper_id, paper_dir, force=bool(data.get("force")))
+                translation = translation_job_manager().submit(paper_id, paper_dir, data)
+            except ValueError as exc:
+                self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+                return
             except Exception as exc:  # noqa: BLE001
                 self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
                 return
-            self.send_json({"ok": True, "metadata": metadata})
+            self.send_json({"ok": True, "translation": translation})
             return
 
         if citations_match:
@@ -7945,6 +10845,15 @@ class ReaderHandler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "metadata": metadata, "youtube_quota": metadata.get("youtube_quota", youtube_quota_state(self.workspace))})
             return
 
+        if find_pdf_match:
+            try:
+                result = find_and_attach_pdf_to_existing_paper(self.workspace, paper_id, paper_dir, force=bool(data.get("force", True)))
+            except Exception as exc:  # noqa: BLE001
+                self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                return
+            self.send_json(result)
+            return
+
         if reading_progress_match:
             try:
                 progress, metadata = update_reading_progress(self.workspace, paper_id, paper_dir, data if isinstance(data, dict) else {})
@@ -7960,8 +10869,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
             if not card:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            for key in {"abstract", "abstract_zh", "title", "authors", "venue", "year", "doi", "url"}:
-                if data.get(key):
+            incoming_title = str(data.get("title") or "").strip()
+            incoming_matches_card = not incoming_title or not card.get("title") or reference_title_match_score(card.get("title"), incoming_title) >= 0.72
+            for key in {"abstract", "abstract_zh", "title", "authors", "venue", "year", "doi", "url", "pdf_url", "open_access_pdf_url", "semantic_scholar_url", "arxiv_id"}:
+                if data.get(key) and (incoming_matches_card or (key == "title" and not card.get("title"))):
                     card[key] = data[key]
             tags = data.get("tags", [])
             if isinstance(tags, str):
@@ -7991,19 +10902,29 @@ class ReaderHandler(BaseHTTPRequestHandler):
             return
 
         annotations_started = time.perf_counter()
-        annotations = data.get("annotations")
-        if not isinstance(annotations, list):
-            self.send_error(HTTPStatus.BAD_REQUEST, "annotations must be a list")
+        if not isinstance(data, dict):
+            self.send_error(HTTPStatus.BAD_REQUEST, "annotations must be an object")
             return
+        annotations = data.get("annotations")
+        if not isinstance(annotations, list) or any(not isinstance(item, dict) for item in annotations):
+            self.send_error(HTTPStatus.BAD_REQUEST, "annotations must be a list of objects")
+            return
+        existing_annotations = read_json(paper_dir / "annotations.json", {"annotations": []}, strict=True)
+        if not isinstance(existing_annotations, dict):
+            self.send_error(HTTPStatus.BAD_REQUEST, "annotations.json must contain an object")
+            return
+        annotations = merge_records_by_id(existing_annotations.get("annotations"), annotations)
         cleaned = []
         for item in annotations:
             if not isinstance(item, dict):
                 continue
-            segment_id = str(item.get("segment_id", "")).strip()
-            if not segment_id:
-                continue
+            segment_id = str(item.get("segment_id", ""))
+            if not segment_id.strip():
+                self.send_error(HTTPStatus.BAD_REQUEST, "Each paper annotation must retain its segment_id")
+                return
             cleaned_item: dict[str, Any] = {
-                "id": str(item.get("id") or f"a-{hashlib.sha1((segment_id + now_iso()).encode('utf-8')).hexdigest()[:10]}"),
+                **item,
+                "id": str(item.get("id") or f"a-{uuid.uuid4().hex[:12]}"),
                 "segment_id": segment_id,
                 "color": str(item.get("color", "yellow")).strip() or "yellow",
                 "quote": str(item.get("quote", "")),
@@ -8014,7 +10935,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
             if isinstance(tags, str):
                 tags = [tags]
             if isinstance(tags, list):
-                cleaned_item["tags"] = [str(tag).strip() for tag in tags if str(tag).strip()]
+                cleaned_item["tags"] = list(tags)
             if item.get("created_at"):
                 cleaned_item["created_at"] = item.get("created_at")
             for key in {"type", "target", "presentation_flow_id"}:
@@ -8034,10 +10955,10 @@ class ReaderHandler(BaseHTTPRequestHandler):
                     cleaned_item[key] = str(item.get(key))
             range_value = clean_annotation_range(item.get("range"))
             if range_value:
-                cleaned_item["range"] = range_value
+                cleaned_item["range"] = {**item["range"], **range_value}
             paired_range = clean_annotation_range(item.get("paired_range"))
             if paired_range:
-                paired = {**paired_range}
+                paired = {**item["paired_range"], **paired_range}
                 if isinstance(item.get("paired_range"), dict) and item["paired_range"].get("target"):
                     paired["target"] = str(item["paired_range"].get("target"))
                 if isinstance(item.get("paired_range"), dict) and item["paired_range"].get("quote"):
@@ -8045,7 +10966,7 @@ class ReaderHandler(BaseHTTPRequestHandler):
                 cleaned_item["paired_range"] = paired
             cleaned.append(cleaned_item)
         cleaned_at = time.perf_counter()
-        write_json(paper_dir / "annotations.json", {"annotations": cleaned, "updated_at": now_iso()})
+        write_json(paper_dir / "annotations.json", {**existing_annotations, "annotations": cleaned, "updated_at": now_iso()})
         written_at = time.perf_counter()
         schedule_export_notes_and_annotated(paper_dir)
         scheduled_at = time.perf_counter()
@@ -8177,6 +11098,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_cmd = sub.add_parser("status", help="List papers in the workspace")
     status_cmd.set_defaults(func=list_status)
+
+    query_cmd = sub.add_parser("query", help="Find papers from library.json and optionally export their Briefings")
+    query_cmd.add_argument("--project", help="Match one project name exactly, case-insensitive")
+    query_cmd.add_argument("--tag", help="Match one normalized paper tag")
+    query_cmd.add_argument("--search", help="Case-insensitive text search across title, id, authors, venue, year, projects, and tags")
+    query_cmd.add_argument("--brief", choices=["any", "available", "missing"], default="any", help="Filter by actual Briefing content availability")
+    query_cmd.add_argument("--include-briefs", action="store_true", help="Include full explain.content bodies; omitted by default to keep output compact")
+    query_cmd.add_argument("--limit", type=int, default=0, help="Maximum returned papers after filtering; zero returns all matches")
+    query_cmd.add_argument("--format", choices=["json", "markdown"], default="json", help="Output format, default: json")
+    query_cmd.add_argument("--output", help="Write output to this path; relative paths are resolved inside the workspace")
+    query_cmd.set_defaults(func=query_papers_cli)
 
     citations_cmd = sub.add_parser("citations", help="Refresh online citation counts for one paper or the whole Library")
     citations_cmd.add_argument("paper_id", nargs="?", help="Paper id to refresh. Omit to refresh all papers")
